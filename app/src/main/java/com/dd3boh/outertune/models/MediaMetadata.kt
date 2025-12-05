@@ -29,6 +29,11 @@ data class MediaMetadata(
     val isLocal: Boolean = false,
     val localPath: String? = null,
     val liked: Boolean = false,
+
+    val bpm: Float? = null,
+    val key: String? = null, // Musical key (e.g., "C#", "8A")
+    val firstBeatMs: Long? = null, // Timestamp of the first beat
+    val waveformPath: String? = null, // Path to cached waveform file
     val composeUidWorkaround: Double = Math.random(), // compose will crash without this hax
 
     var shuffleIndex: Int = -1
@@ -170,4 +175,34 @@ fun SongItem.toMediaMetadata() = MediaMetadata(
     },
     genre = null,
     setVideoId = setVideoId
+)
+
+fun SongEntity.toMediaMetadata() = MediaMetadata(
+    id = id,
+    title = title,
+    artists = emptyList(), // SongEntity usually requires a separate join for artists, setting empty for now or you can handle if you have the data
+    duration = duration,
+    thumbnailUrl = thumbnailUrl,
+    trackNumber = trackNumber,
+    discNumber = discNumber,
+    album = albumId?.let {
+        MediaMetadata.Album(
+            id = it,
+            title = albumName.orEmpty()
+        )
+    },
+    genre = null, // Genre is also a separate relation usually
+    year = year,
+    date = date,
+    dateModified = dateModified,
+    inLibrary = inLibrary,
+    liked = liked,
+    isLocal = isLocal,
+    localPath = localPath,
+
+    // NEW DJ FIELDS MAPPED HERE
+    bpm = bpm,
+    key = key,
+    firstBeatMs = firstBeatMs,
+    waveformPath = waveformPath
 )

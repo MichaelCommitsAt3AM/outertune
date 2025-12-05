@@ -44,10 +44,18 @@ data class SongEntity(
     val discNumber: Int? = null,
     val albumId: String? = null,
     val albumName: String? = null,
-//    val albumArtist // if anyone wants to implement album artists in a sane way, pull requests are welcome.
+
+    // Dj tags
+    @ColumnInfo(name = "bpm") val bpm: Float? = null,
+    @ColumnInfo(name = "key") val key: String? = null,
+    @ColumnInfo(name = "first_beat_ms") val firstBeatMs: Long? = null,
+    @ColumnInfo(name = "waveform_path") val waveformPath: String? = null,
+
+    // val albumArtist // if anyone wants to implement album artists in a sane way, pull requests are welcome.
     val year: Int? = null,
     val date: LocalDateTime? = null, // ID3 tag property
     val dateModified: LocalDateTime? = null, // file property
+
 ) {
 
     fun localToggleLike() = copy(

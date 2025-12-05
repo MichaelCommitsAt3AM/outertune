@@ -12,8 +12,12 @@ material3 = "1.4.0"
 media3 = "1.8.0"
 room = "2.8.3"
 hilt = "2.57.2"
+hilt-work = "1.1.0"
 ktor = "3.3.1"
 ksp = "2.3.1"
+work = "2.9.0"
+amplituda = "2.2.2"  # Waveform extraction
+workManager = "2.9.0" # Background processing
 
 [libraries]
 annotation = { module = "androidx.annotation:annotation", version.ref = "annotation" }
@@ -72,6 +76,11 @@ ktor-client-content-negotiation = { group = "io.ktor", name = "ktor-client-conte
 ktor-client-encoding = { group = "io.ktor", name = "ktor-client-encoding", version.ref = "ktor" }
 ktor-serialization-json = { group = "io.ktor", name = "ktor-serialization-kotlinx-json", version.ref = "ktor" }
 
+
+# DJ feature
+amplituda = { module = "com.github.lincollincol:amplituda", version.ref = "amplituda" }
+androidx-work-runtime-ktx = { group = "androidx.work", name = "work-runtime-ktx", version.ref = "workManager" }
+
 # misc
 aboutlibraries-compose-m3 = { module = "com.mikepenz:aboutlibraries-compose-m3", version.ref = "aboutLibraries" }
 brotli = { group = "org.brotli", name = "dec", version = "0.1.2" }
@@ -81,6 +90,13 @@ desugaring = { group = "com.android.tools", name = "desugar_jdk_libs", version =
 junit = { group = "junit", name = "junit", version = "4.13.2" }
 
 newpipe-extractor = { group = "com.github.TeamNewPipe", name = "NewPipeExtractor", version = "4368f2b9bb7ee5b0340a0bc25375e44fe23ab105" }
+
+# WorkManager
+work-runtime-ktx = { group = "androidx.work", name = "work-runtime-ktx", version.ref = "work" }
+
+# Hilt WorkManager
+hilt-work = { group = "androidx.hilt", name = "hilt-work", version.ref = "hilt-work" }
+hilt-work-compiler = { group = "androidx.hilt", name = "hilt-compiler", version.ref = "hilt-work" }
 
 [plugins]
 aboutlibraries = { id = "com.mikepenz.aboutlibraries.plugin", version.ref = "aboutLibraries" }

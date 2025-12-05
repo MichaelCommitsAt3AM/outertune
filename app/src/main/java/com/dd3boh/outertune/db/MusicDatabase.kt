@@ -39,6 +39,7 @@ import com.dd3boh.outertune.db.entities.SongEntity
 import com.dd3boh.outertune.db.entities.SongGenreMap
 import com.dd3boh.outertune.db.entities.SortedSongAlbumMap
 import com.dd3boh.outertune.db.entities.SortedSongArtistMap
+import com.dd3boh.outertune.db.entities.TransitionEntity
 import com.dd3boh.outertune.extensions.toSQLiteQuery
 import java.time.Instant
 import java.time.LocalDateTime
@@ -50,6 +51,9 @@ class MusicDatabase(
 ) : DatabaseDao by delegate.dao {
     val openHelper: SupportSQLiteOpenHelper
         get() = delegate.openHelper
+
+    // Add this method
+    fun transitionDao(): com.dd3boh.outertune.db.daos.TransitionDao = delegate.transitionDao()
 
     fun query(block: MusicDatabase.() -> Unit) = with(delegate) {
         queryExecutor.execute {
@@ -68,7 +72,7 @@ class MusicDatabase(
     fun close() = delegate.close()
 
     companion object {
-        const val MUSIC_DATABASE_VERSION = 20
+        const val MUSIC_DATABASE_VERSION = 21
     }
 }
 
@@ -92,7 +96,8 @@ class MusicDatabase(
         PlayCountEntity::class,
         Event::class,
         RelatedSongMap::class,
-        RecentActivityEntity::class
+        RecentActivityEntity::class,
+        TransitionEntity::class
     ],
     views = [
         SortedSongArtistMap::class,
@@ -122,6 +127,7 @@ class MusicDatabase(
 @TypeConverters(Converters::class)
 abstract class InternalDatabase : RoomDatabase() {
     abstract val dao: DatabaseDao
+    abstract fun transitionDao(): com.dd3boh.outertune.db.daos.TransitionDao
 
     companion object {
         const val DB_NAME = "song.db"
@@ -134,6 +140,7 @@ abstract class InternalDatabase : RoomDatabase() {
                     .addMigrations(MIGRATION_14_15)
                     .addMigrations(MIGRATION_15_16)
                     .addMigrations(MIGRATION_16_17)
+                    .addMigrations(MIGRATION_20_21)
                     .build()
             )
 
@@ -663,6 +670,41 @@ class Migration12To13 : AutoMigrationSpec {
             }
         }
 
+    }
+}
+
+// 5. ADD THIS MIGRATION OBJECT AT THE BOTTOM OF THE FILE
+val MIGRATION_20_21 = object : Migration(20, 21) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        // 1. Add columns to SongEntity (using the names from your @ColumnInfo)
+        db.execSQL("ALTER TABLE song ADD COLUMN bpm REAL DEFAULT NULL")
+        db.execSQL("ALTER TABLE song ADD COLUMN key TEXT DEFAULT NULL")
+        db.execSQL("ALTER TABLE song ADD COLUMN first_beat_ms INTEGER DEFAULT NULL")
+        db.execSQL("ALTER TABLE song ADD COLUMN waveform_path TEXT DEFAULT NULL")
+
+        // 2. Add columns to PlaylistEntity
+        // We add both Mix Mode flag and the Mix Type enum
+        db.execSQL("ALTER TABLE playlist ADD COLUMN is_mix_mode_active INTEGER NOT NULL DEFAULT 0")
+        db.execSQL("ALTER TABLE playlist ADD COLUMN mix_type INTEGER NOT NULL DEFAULT 0")
+
+        // 3. Create TransitionEntity table
+        // This must match the Entity definition exactly
+        db.execSQL("""
+            CREATE TABLE IF NOT EXISTS `transitions` (
+                `fromSongId` TEXT NOT NULL, 
+                `toSongId` TEXT NOT NULL, 
+                `exitPointMs` INTEGER NOT NULL, 
+                `entryPointMs` INTEGER NOT NULL, 
+                `durationMs` INTEGER NOT NULL, 
+                `durationBeats` INTEGER, 
+                `syncTempo` INTEGER NOT NULL, 
+                `type` INTEGER NOT NULL, 
+                PRIMARY KEY(`fromSongId`, `toSongId`)
+            )
+        """)
+
+        // 4. Create Index for TransitionEntity
+        db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS `index_transitions_fromSongId_toSongId` ON `transitions` (`fromSongId`, `toSongId`)")
     }
 }
 

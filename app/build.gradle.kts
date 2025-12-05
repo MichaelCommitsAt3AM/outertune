@@ -24,6 +24,7 @@ if (keystorePropertiesFile.exists()) {
 android {
     namespace = "com.dd3boh.outertune"
     compileSdk = 36
+    ndkVersion = "27.0.12077973"
 
     defaultConfig {
         applicationId = "com.dd3boh.outertune"
@@ -32,6 +33,29 @@ android {
         versionCode = 70
         versionName = "0.10.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        // ADD THIS BLOCK
+        externalNativeBuild {
+            cmake {
+                // Pass arguments to CMake
+                arguments("-DANDROID_STL=c++_shared")
+                // cppFlags("") // Optional, can leave empty or remove
+            }
+        }
+
+        // ADD THIS BLOCK
+        ndk {
+            // Only compile for these architectures to save build time and APK size
+            abiFilters.addAll(listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64"))
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            // This tells Gradle where your CMake build script is located
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.31.6" // Use the version bundled with your SDK
+        }
     }
 
     signingConfigs {
@@ -246,6 +270,14 @@ dependencies {
     implementation(libs.hilt)
     ksp(libs.hilt.compiler)
 
+    // WorkManager
+    implementation(libs.work.runtime.ktx)
+
+    // Hilt WorkManager integration
+    implementation(libs.hilt.work)
+    //kapt(libs.hilt.work.compiler)  // or
+    ksp(libs.hilt.work.compiler)
+
     coreLibraryDesugaring(libs.desugaring)
 
     implementation(libs.ktor.client.core)
@@ -257,6 +289,10 @@ dependencies {
     implementation(project(":lrclib"))
     implementation(project(":material-color-utilities"))
     implementation(project(":taglib"))
+
+    // Audio Analysis & Waveforms
+    implementation(libs.amplituda)
+    implementation(libs.androidx.work.runtime.ktx)
 
     // misc
     implementation(libs.aboutlibraries.compose.m3)

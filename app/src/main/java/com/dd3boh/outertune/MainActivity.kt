@@ -252,6 +252,13 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         lifecycle.addObserver(controllerViewModel)
         controllerViewModel.addControllerCallback(lifecycle) { controller, _ ->
+            val service = controllerViewModel.getService()
+            if (service == null) {
+                Log.w("MainActivity", "Service not ready yet, will retry on next connection")
+
+                return@addControllerCallback // Exit early, will retry when service is ready
+            }
+
             playerConnection = PlayerConnection(controllerViewModel, database)
         }
         WindowCompat.setDecorFitsSystemWindows(window, false)

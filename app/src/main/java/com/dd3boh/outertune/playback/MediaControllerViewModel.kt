@@ -162,13 +162,30 @@ class MediaControllerViewModel(application: Application) : AndroidViewModel(appl
 
     fun getService(): MusicService? {
         val mediaBrowser = get() ?: return null
-        mediaBrowser.sendCustomCommand(
+
+        val future = mediaBrowser.sendCustomCommand(
             SessionCommand(MusicService.COMMAND_GET_BINDER, Bundle.EMPTY),
             Bundle.EMPTY
-        ).get().extras.run {
-            return (getBinder("music_binder") as MusicService.MusicBinder).service
+        )
+
+        val result = try {
+            future.get(1000, java.util.concurrent.TimeUnit.MILLISECONDS)
+        } catch (e: Exception) {
+            Log.w("MediaCtrlViewModel", "Failed to get binder: ${e.message}")
+            return null
+        }
+
+        // Check if the command was successful before trying to extract the binder
+        if (result.resultCode != SessionResult.RESULT_SUCCESS) {
+            Log.w("MediaCtrlViewModel", "Get binder command failed with result code: ${result.resultCode}")
+            return null
+        }
+
+        return result.extras.getBinder("music_binder")?.let { binder ->
+            (binder as? MusicService.MusicBinder)?.service
         }
     }
+
 
     private class LifecycleHost : LifecycleOwner {
         val lifecycleRegistry = LifecycleRegistry(this)

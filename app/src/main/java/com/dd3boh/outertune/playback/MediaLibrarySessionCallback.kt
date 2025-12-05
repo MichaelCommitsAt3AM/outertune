@@ -81,6 +81,14 @@ class MediaLibrarySessionCallback @Inject constructor(
         customCommand: SessionCommand,
         args: Bundle,
     ): ListenableFuture<SessionResult> {
+        // Check if service is initialized before proceeding
+        if (!::service.isInitialized) {
+            Log.w(TAG, "Service not initialized yet, cannot handle command: ${customCommand.customAction}")
+            return Futures.immediateFuture(
+                SessionResult(SessionResult.RESULT_ERROR_NOT_SUPPORTED)
+            )
+        }
+
         when (customCommand.customAction) {
             MediaSessionConstants.ACTION_TOGGLE_LIKE -> toggleLike()
             MediaSessionConstants.ACTION_TOGGLE_START_RADIO -> toggleStartRadio()
@@ -95,6 +103,7 @@ class MediaLibrarySessionCallback @Inject constructor(
         }
         return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
     }
+
 
     override fun onPlaybackResumption(
         mediaSession: MediaSession,

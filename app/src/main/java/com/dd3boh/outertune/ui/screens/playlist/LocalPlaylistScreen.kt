@@ -88,6 +88,12 @@ import androidx.lifecycle.viewModelScope
 import androidx.media3.exoplayer.offline.Download
 import androidx.media3.exoplayer.offline.DownloadService
 import androidx.navigation.NavController
+import androidx.compose.material.icons.rounded.Link
+import androidx.compose.material.icons.rounded.LinkOff
+import androidx.compose.material3.IconToggleButton
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.height
+import androidx.compose.ui.draw.alpha
 import com.dd3boh.outertune.LocalDatabase
 import com.dd3boh.outertune.LocalDownloadUtil
 import com.dd3boh.outertune.LocalMenuState
@@ -145,6 +151,8 @@ import kotlinx.coroutines.launch
 import sh.calvin.reorderable.ReorderableItem
 import sh.calvin.reorderable.rememberReorderableLazyListState
 import kotlin.math.roundToInt
+import com.dd3boh.outertune.ui.dialog.MixEditorDialog // Ensure you created this in Phase 5
+
 
 @OptIn(ExperimentalMaterial3Api::class, FlowPreview::class)
 @Composable
@@ -184,6 +192,9 @@ fun LocalPlaylistScreen(
         inSelectMode = false
         selection.clear()
     }
+
+    // NEW STATE: Track which songs we are editing
+    var showMixEditor by remember { mutableStateOf<Pair<String, String>?>(null) }
 
     // search
     var isSearching by rememberSaveable { mutableStateOf(false) }
@@ -453,17 +464,22 @@ fun LocalPlaylistScreen(
                 } else {
                     // playlist header
                     if (!isSearching) {
-                        item(
-                            key = "playlist header",
-                            contentType = CONTENT_TYPE_HEADER
-                        ) {
+                        item(key = "playlist header", contentType = CONTENT_TYPE_HEADER) {
                             LocalPlaylistHeader(
                                 playlist = playlist,
-                                songs =  playlistWithSongs.second,
+                                songs = playlistWithSongs.second,
                                 onShowEditDialog = { showEditDialog = true },
                                 onShowRemoveDownloadDialog = { showRemoveDownloadDialog = true },
                                 snackbarHostState = snackbarHostState,
-                                modifier = Modifier // .animateItem()
+                                modifier = Modifier,
+
+                                // PASS NEW PARAMS
+                                isMixModeActive = playlist.playlist.isMixModeActive,
+                                onToggleMixMode = { isActive ->
+                                    database.query {
+                                        update(playlist.playlist.copy(isMixModeActive = isActive))
+                                    }
+                                }
                             )
                         }
                     }
@@ -517,48 +533,85 @@ fun LocalPlaylistScreen(
                 key = { _, song -> song.map.id },
                 contentType = { _, song -> CONTENT_TYPE_SONG },
             ) { index, song ->
-                ReorderableItem(
-                    state = reorderableState,
-                    key = song.map.id,
-                    enabled = editable
-                ) {
-                    SongListItem(
-                        song = song.song,
-                        thumbnailSize = thumbnailSize,
-                        playlistSong = song,
-                        playlist =  playlistWithSongs.first,
-                        navController = navController,
-                        snackbarHostState = snackbarHostState,
+                Column {
+                    ReorderableItem(
+                        state = reorderableState,
+                        key = song.map.id,
+                        enabled = editable
+                    ) {
+                        SongListItem(
+                            song = song.song,
+                            thumbnailSize = thumbnailSize,
+                            playlistSong = song,
+                            playlist = playlistWithSongs.first,
+                            navController = navController,
+                            snackbarHostState = snackbarHostState,
 
-                        isActive = song.song.id == mediaMetadata?.id,
-                        isPlaying = isPlaying,
-                        swipeEnabled = swipeEnabled,
-                        onSelectedChange = {
-                            inSelectMode = true
-                            if (it) {
-                                selection.add(song.song.id)
-                            } else {
-                                selection.remove(song.song.id)
-                            }
-                        },
-                        inSelectMode = inSelectMode,
-                        isSelected = selection.contains(song.song.id),
+                            isActive = song.song.id == mediaMetadata?.id,
+                            isPlaying = isPlaying,
+                            swipeEnabled = swipeEnabled,
+                            onSelectedChange = {
+                                inSelectMode = true
+                                if (it) {
+                                    selection.add(song.song.id)
+                                } else {
+                                    selection.remove(song.song.id)
+                                }
+                            },
+                            inSelectMode = inSelectMode,
+                            isSelected = selection.contains(song.song.id),
 
-                        onPlay = {
-                            playerConnection.playQueue(
-                                ListQueue(
-                                    title =  playlistWithSongs.first!!.playlist.name,
-                                    items = mutableSongs.map { it.song.toMediaMetadata() },
-                                    startIndex = index,
-                                    playlistId =  playlistWithSongs.first?.playlist?.browseId
+                            onPlay = {
+                                playerConnection.playQueue(
+                                    ListQueue(
+                                        title = playlistWithSongs.first!!.playlist.name,
+                                        items = mutableSongs.map { it.song.toMediaMetadata() },
+                                        startIndex = index,
+                                        playlistId = playlistWithSongs.first?.playlist?.browseId
+                                    )
                                 )
-                            )
-                        },
-                        dragHandleModifier = if (sortType == PlaylistSongSortType.CUSTOM && !locked && !isSearching && editable) Modifier.draggableHandle() else null,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .background(MaterialTheme.colorScheme.background),
-                    )
+                            },
+                            dragHandleModifier = if (sortType == PlaylistSongSortType.CUSTOM && !locked && !isSearching && editable) Modifier.draggableHandle() else null,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(MaterialTheme.colorScheme.background),
+                        )
+                    }
+
+                    // NEW: Link Icon Logic
+                    // Show only if Mix Mode is ON and this isn't the last song
+                    if (playlistWithSongs.first?.playlist?.isMixModeActive == true && index < mutableSongs.size - 1) {
+                        val nextSong = mutableSongs[index + 1]
+
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(24.dp), // Small height for the connector
+                            contentAlignment = Alignment.Center
+                        ) {
+                            // Optional: Small vertical line to look like a chain
+                            /*
+                            Box(modifier = Modifier
+                                .width(2.dp)
+                                .fillMaxHeight()
+                                .background(MaterialTheme.colorScheme.outlineVariant))
+                            */
+
+                            IconButton(
+                                onClick = {
+                                    showMixEditor = song.song.id to nextSong.song.id
+                                },
+                                modifier = Modifier.size(24.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.Link,
+                                    contentDescription = "Edit Transition",
+                                    modifier = Modifier.size(16.dp),
+                                    tint = MaterialTheme.colorScheme.primary
+                                )
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -659,6 +712,15 @@ fun LocalPlaylistScreen(
 //                .windowInsetsPadding(LocalPlayerAwareWindowInsets.current.union(WindowInsets.ime))
                 .align(Alignment.BottomCenter)
         )
+
+        // NEW: Show Dialog when state is set
+        if (showMixEditor != null) {
+            MixEditorDialog(
+                songAId = showMixEditor!!.first,
+                songBId = showMixEditor!!.second,
+                onDismiss = { showMixEditor = null }
+            )
+        }
     }
 }
 
@@ -671,6 +733,9 @@ fun LocalPlaylistHeader(
     onShowRemoveDownloadDialog: () -> Unit,
     snackbarHostState: SnackbarHostState,
     modifier: Modifier,
+    // Mix params
+    isMixModeActive: Boolean,
+    onToggleMixMode: (Boolean) -> Unit
 ) {
     Log.v("LocalPlaylistScreen", "P_H_RC-1")
     val playerConnection = LocalPlayerConnection.current ?: return
@@ -886,6 +951,24 @@ fun LocalPlaylistHeader(
                 )
                 Spacer(Modifier.size(ButtonDefaults.IconSpacing))
                 Text(stringResource(R.string.shuffle))
+            }
+
+            // Mix Mode Toggle Button
+            IconToggleButton(
+                checked = isMixModeActive,
+                onCheckedChange = onToggleMixMode,
+                modifier = Modifier
+                    .background(
+                        color = MaterialTheme.colorScheme.secondaryContainer,
+                        shape = androidx.compose.foundation.shape.CircleShape
+                    )
+                    .size(ButtonDefaults.MinHeight) // Match height of other buttons
+            ) {
+                Icon(
+                    imageVector = if (isMixModeActive) Icons.Rounded.Link else Icons.Rounded.LinkOff,
+                    contentDescription = "Toggle Mix Mode",
+                    tint = MaterialTheme.colorScheme.onSecondaryContainer
+                )
             }
         }
     }

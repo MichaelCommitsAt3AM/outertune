@@ -928,6 +928,31 @@ class QueueBoard(
         }
     }
 
+
+    /**
+     * Look ahead to see what the next song is without changing the current position.
+     * Used by DeckManager to pre-load Deck B for mixing.
+     */
+    @Synchronized
+    fun peekNext(): MediaMetadata? {
+        // 1. Get the active queue (if any)
+        val q = getCurrentQueue() ?: return null
+
+        // 2. Get the list of songs (respecting shuffle order)
+        val items = q.getCurrentQueueShuffled()
+
+        // 3. Calculate the index of the next song
+        // Note: queuePos tracks the *current* song's index
+        val nextIndex = q.getQueuePosShuffled() + 1
+
+        // 4. Return the song if it exists, otherwise null (end of playlist)
+        return if (nextIndex < items.size) {
+            items[nextIndex]
+        } else {
+            null
+        }
+    }
+
     companion object {
 
         fun shuffleInPlace(list: List<MediaMetadata>) {

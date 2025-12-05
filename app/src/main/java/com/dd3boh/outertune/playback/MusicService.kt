@@ -89,6 +89,7 @@ import com.dd3boh.outertune.constants.SkipSilenceKey
 import com.dd3boh.outertune.constants.StopMusicOnTaskClearKey
 import com.dd3boh.outertune.constants.minPlaybackDurKey
 import com.dd3boh.outertune.db.MusicDatabase
+import com.dd3boh.outertune.db.daos.TransitionDao
 import com.dd3boh.outertune.db.entities.Event
 import com.dd3boh.outertune.db.entities.FormatEntity
 import com.dd3boh.outertune.db.entities.RelatedSongMap
@@ -101,6 +102,7 @@ import com.dd3boh.outertune.extensions.currentMetadata
 import com.dd3boh.outertune.extensions.findNextMediaItemById
 import com.dd3boh.outertune.extensions.metadata
 import com.dd3boh.outertune.extensions.setOffloadEnabled
+import com.dd3boh.outertune.extensions.toMediaItem
 import com.dd3boh.outertune.lyrics.LyricsHelper
 import com.dd3boh.outertune.models.HybridCacheDataSinkFactory
 import com.dd3boh.outertune.models.MediaMetadata
@@ -138,6 +140,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
@@ -188,12 +191,19 @@ class MusicService : MediaLibraryService(),
     @DownloadCache
     lateinit var downloadCache: SimpleCache
 
-    lateinit var player: ExoPlayer
+    lateinit var deckManager: DeckManager
+    // Helper property to keep existing code working (points to currently hearing player)
+    val player: ExoPlayer
+        get() = deckManager.activeDeck
+
     private lateinit var mediaSession: MediaLibrarySession
 
     // Player components
     @Inject
     lateinit var syncUtils: SyncUtils
+
+    @Inject
+    lateinit var transitionDao: TransitionDao
 
     lateinit var connectivityObserver: NetworkConnectivityObserver
     val waitingForNetworkConnection = MutableStateFlow(false)
@@ -226,37 +236,45 @@ class MusicService : MediaLibraryService(),
         Log.i(TAG, "Starting MusicService")
         super.onCreate()
 
-        player = ExoPlayer.Builder(this)
-            .setMediaSourceFactory(DefaultMediaSourceFactory(createDataSourceFactory()))
-            .setRenderersFactory(createRenderersFactory(isGaplessOffloadAllowed))
-            .setHandleAudioBecomingNoisy(true)
-            .setWakeMode(C.WAKE_MODE_NETWORK)
-            .setAudioAttributes(
-                AudioAttributes.Builder()
-                    .setUsage(C.USAGE_MEDIA)
-                    .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
-                    .build(), true
-            )
-            .setSeekBackIncrementMs(5000)
-            .setSeekForwardIncrementMs(5000)
-            .build()
-            .apply {
-                // listeners
-                addListener(this@MusicService)
-                sleepTimer = SleepTimer(scope, this)
-                addListener(sleepTimer)
-                addAnalyticsListener(PlaybackStatsListener(false, this@MusicService))
+        deckManager = DeckManager(this) {createExoPlayer()}
 
-                // misc
-                setOffloadEnabled(dataStore.get(AudioOffloadKey, false))
-            }
+        // Attach listeners to DeckManager (which attaches to both A and B)
+        deckManager.addListener(this)
 
-        mediaLibrarySessionCallback.apply {
-            service = this@MusicService
-            toggleLike = ::toggleLike
-            toggleStartRadio = ::toggleStartRadio
-            toggleLibrary = ::toggleLibrary
-        }
+        sleepTimer = SleepTimer(scope, player)
+        deckManager.addListener(sleepTimer)
+
+//        player = ExoPlayer.Builder(this)
+//            .setMediaSourceFactory(DefaultMediaSourceFactory(createDataSourceFactory()))
+//            .setRenderersFactory(createRenderersFactory(isGaplessOffloadAllowed))
+//            .setHandleAudioBecomingNoisy(true)
+//            .setWakeMode(C.WAKE_MODE_NETWORK)
+//            .setAudioAttributes(
+//                AudioAttributes.Builder()
+//                    .setUsage(C.USAGE_MEDIA)
+//                    .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
+//                    .build(), true
+//            )
+//            .setSeekBackIncrementMs(5000)
+//            .setSeekForwardIncrementMs(5000)
+//            .build()
+//            .apply {
+//                // listeners
+//                addListener(this@MusicService)
+//                sleepTimer = SleepTimer(scope, this)
+//                addListener(sleepTimer)
+//                addAnalyticsListener(PlaybackStatsListener(false, this@MusicService))
+//
+//                // misc
+//                setOffloadEnabled(dataStore.get(AudioOffloadKey, false))
+//            }
+//
+//        mediaLibrarySessionCallback.apply {
+//            service = this@MusicService
+//            toggleLike = ::toggleLike
+//            toggleStartRadio = ::toggleStartRadio
+//            toggleLibrary = ::toggleLibrary
+//        }
 
         mediaSession = MediaLibrarySession.Builder(this, player, mediaLibrarySessionCallback)
             .setSessionActivity(
@@ -364,10 +382,33 @@ class MusicService : MediaLibraryService(),
                 }
             }
         }
+        startMixPoller()
     }
 
 
 // Library functions
+
+    private fun createExoPlayer(): ExoPlayer {
+        return ExoPlayer.Builder(this)
+            .setMediaSourceFactory(DefaultMediaSourceFactory(createDataSourceFactory()))
+            .setRenderersFactory(createRenderersFactory(isGaplessOffloadAllowed))
+            .setHandleAudioBecomingNoisy(true)
+            .setWakeMode(C.WAKE_MODE_NETWORK)
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(C.USAGE_MEDIA)
+                    .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
+                    .build(), true
+            )
+            .setSeekBackIncrementMs(5000)
+            .setSeekForwardIncrementMs(5000)
+            .build()
+            .apply {
+                // Note: We don't add listeners here anymore,
+                // we add them to DeckManager in onCreate
+                setOffloadEnabled(dataStore.get(AudioOffloadKey, false))
+            }
+    }
 
     private suspend fun recoverSong(mediaId: String, playbackData: YTPlayerUtils.PlaybackData? = null) {
         val song = database.song(mediaId).first()
@@ -814,6 +855,75 @@ class MusicService : MediaLibraryService(),
         }
     }
 
+    private fun startMixPoller() {
+        offloadScope.launch {
+            while (isActive) {
+                // Access player on main thread
+                val playing = withContext(Dispatchers.Main) {
+                    player.isPlaying
+                }
+
+                if (playing) {
+                    // Your mix polling logic here
+                }
+
+                delay(50) // or whatever interval you need
+            }
+        }
+    }
+
+    private var nextSongPreparedId: String? = null // Track what we prepared
+
+    private suspend fun checkMixStatus() {
+        val currentPosition = player.currentPosition
+        val duration = player.duration
+        if (duration < 0) return
+
+        val currentMetadata = player.currentMetadata ?: return
+        val currentId = currentMetadata.id
+
+        // 1. LOOKAHEAD: Prepare next song if we are close to end (e.g., 20s left)
+        // Check if we are in "Mix Mode" for this playlist
+        // Note: You need to read 'isMixModeActive' from DB or Cache here.
+        // For PoC, let's assume TRUE or check a simple flag.
+
+        if (duration - currentPosition < 20_000 && nextSongPreparedId != currentId) {
+            val nextSong = queueBoard.peekNext()
+            if (nextSong != null) {
+                // Check for Manual Transition in DB
+                val transition = transitionDao.getTransition(currentId, nextSong.id)
+
+                if (transition != null) {
+                    Log.d(TAG, "Mixer: Found transition to ${nextSong.title}")
+                    withContext(Dispatchers.Main) {
+                        deckManager.prepareNext(
+                            nextSong.toMediaItem(),
+                            transition.entryPointMs,
+                            null
+                        )
+                    }
+                    nextSongPreparedId = currentId // Mark as handled for this song
+                }
+            }
+        }
+
+        // 2. TRIGGER: Start Mix if we hit the Exit Point
+        // We need to fetch the transition again (or cache it in the step above)
+        val nextSong = queueBoard.peekNext()
+        if (nextSong != null) {
+            val transition = transitionDao.getTransition(currentId, nextSong.id)
+            if (transition != null) {
+                if (currentPosition >= transition.exitPointMs) {
+                    withContext(Dispatchers.Main) {
+                        deckManager.startCrossfade(transition.durationMs)
+                        // Advance QueueBoard index so UI updates
+                        queueBoard.setCurrQueuePosIndex(player.currentMediaItemIndex + 1)
+                    }
+                }
+            }
+        }
+    }
+
 
 // Misc
 
@@ -1089,6 +1199,7 @@ class MusicService : MediaLibraryService(),
         mediaSession.player.stop()
         mediaSession.release()
         mediaSession.player.release()
+        deckManager.release()
         super.onDestroy()
         Log.i(TAG, "Terminated MusicService.")
     }
