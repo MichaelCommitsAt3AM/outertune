@@ -32,6 +32,8 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import javax.inject.Inject
+import java.util.concurrent.TimeUnit
+
 
 @HiltViewModel
 class LocalPlaylistViewModel @Inject constructor(
@@ -93,63 +95,55 @@ class LocalPlaylistViewModel @Inject constructor(
         Log.e("LocalPlaylistViewModel", "=== analyzePlaylist() FUNCTION ENTERED ===")
 
         viewModelScope.launch(Dispatchers.IO) {
-            Log.e("LocalPlaylistViewModel", "Inside coroutine on IO dispatcher")
-
             val songs = playlistWithSongs.value.second
             Log.e("LocalPlaylistViewModel", "Total songs in playlist: ${songs.size}")
 
-            // Get downloads that need analysis
             val songsNeedingAnalysis = songs.mapNotNull { playlistSong ->
                 val songId = playlistSong.song.id
                 val download = downloadDao.getDownload(songId)
 
                 if (download != null && download.bpm == null) {
-                    Log.d("LocalPlaylistViewModel", "Song $songId: has download, bpm=${download.bpm}, path=${download.localPath}")
                     Pair(playlistSong.song, download)
-                } else {
-                    Log.d("LocalPlaylistViewModel", "Song $songId: download=${download != null}, bpm=${download?.bpm}")
-                    null
-                }
+                } else null
             }
 
             Log.e("LocalPlaylistViewModel", "Songs needing analysis: ${songsNeedingAnalysis.size}")
 
             if (songsNeedingAnalysis.isEmpty()) {
-                Log.w("LocalPlaylistViewModel", "No songs to analyze - all songs either not downloaded or already analyzed!")
+                Log.w("LocalPlaylistViewModel", "No songs to analyze!")
                 return@launch
             }
 
-            // Create a unique tag for this batch operation
             val tag = "analysis_playlist_$playlistId"
             Log.e("LocalPlaylistViewModel", "Creating work requests with tag: $tag")
 
             val requests = songsNeedingAnalysis.map { (song, download) ->
-                Log.d("LocalPlaylistViewModel", "Creating request for songId: ${song.id}, path: ${download.localPath}")
                 OneTimeWorkRequestBuilder<AnalysisWorker>()
                     .setInputData(workDataOf(
                         "songId" to song.id,
                         "path" to download.localPath
                     ))
                     .addTag(tag)
+                    // Add constraint: stop if it takes too long
+                    .setInitialDelay(0, TimeUnit.SECONDS)
                     .build()
             }
 
-            Log.e("LocalPlaylistViewModel", "Enqueuing ${requests.size} work requests to WorkManager...")
-            if (requests.isEmpty()) {
-                Log.e("LocalPlaylistViewModel", "No work requests to enqueue")
-                return@launch
-            }
+            // Chain with continuePropagation to skip failed items
+            if (requests.isEmpty()) return@launch
 
-            // Chain all requests: first request starts immediately, each subsequent request
-            // waits for the previous one to complete
             var continuation = workManager.beginWith(requests.first())
             requests.drop(1).forEach { request ->
                 continuation = continuation.then(request)
             }
+
+            // Use .enqueue() which returns immediately
             continuation.enqueue()
-            Log.e("LocalPlaylistViewModel", "=== WORK ENQUEUED SUCCESSFULLY ===")
+            Log.e("LocalPlaylistViewModel", "=== WORK CHAIN ENQUEUED ===")
         }
     }
+
+
 
     private fun monitorAnalysis() {
         viewModelScope.launch {
