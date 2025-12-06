@@ -1,44 +1,48 @@
 cmake_minimum_required(VERSION 3.22.1)
 
-# Name of your native library
 project("outertune-analysis")
 
-# Define where Aubio source is
 set(AUBIO_SRC "${CMAKE_CURRENT_SOURCE_DIR}/aubio/src")
 
-# Include header files
 include_directories(
         "${AUBIO_SRC}"
         "${AUBIO_SRC}/.."
 )
 
-# Filter out unsupported drivers to avoid compilation errors on Android
-list(FILTER AUBIO_SOURCES EXCLUDE REGEX ".*io/source_avcodec.c")
-list(FILTER AUBIO_SOURCES EXCLUDE REGEX ".*io/source_wavread.c")
-list(FILTER AUBIO_SOURCES EXCLUDE REGEX ".*io/sink_wavwrite.c")
-list(FILTER AUBIO_SOURCES EXCLUDE REGEX ".*io/audio_unit.c")
-
-# Collect all Aubio source files (excluding specialized drivers we don't need)
+# Collect all Aubio source files EXCEPT io directory
 file(GLOB_RECURSE AUBIO_SOURCES
-        "${AUBIO_SRC}/*.c"
+        "${AUBIO_SRC}/cvec.c"
+        "${AUBIO_SRC}/fvec.c"
+        "${AUBIO_SRC}/fmat.c"
+        "${AUBIO_SRC}/lvec.c"
+        "${AUBIO_SRC}/vecutils.c"
+        "${AUBIO_SRC}/mathutils.c"
+        "${AUBIO_SRC}/musicutils.c"
+        "${AUBIO_SRC}/temporal/*.c"
+        "${AUBIO_SRC}/spectral/*.c"
+        "${AUBIO_SRC}/pitch/*.c"
+        "${AUBIO_SRC}/onset/*.c"
+        "${AUBIO_SRC}/tempo/*.c"
+        "${AUBIO_SRC}/notes/*.c"
+        "${AUBIO_SRC}/utils/*.c"
+        "${AUBIO_SRC}/synth/wavetable.c"
+        "${AUBIO_SRC}/effects/*.c"
 )
 
-# Define the shared library we will write (JNI wrapper)
+# Log what we're compiling (for debugging)
+list(LENGTH AUBIO_SOURCES NUM_AUBIO_SOURCES)
+message(STATUS "Found ${NUM_AUBIO_SOURCES} Aubio source files")
+
+
 add_library(
         outertune-analysis
         SHARED
-        # We will create this file in the next step
         native-lib.cpp
         ${AUBIO_SOURCES}
 )
 
-# Search for system libraries (like logging)
-find_library(
-        log-lib
-        log
-)
+find_library(log-lib log)
 
-# Link libraries
 target_link_libraries(
         outertune-analysis
         ${log-lib}
@@ -52,4 +56,6 @@ add_definitions(
         -DHAVE_LIMITS_H=1
         -DHAVE_STDARG_H=1
         -DHAVE_ERRNO_H=1
+        -DHAVE_UNISTD_H=1
+        -DHAVE_C99_VARARGS_MACROS=1
 )

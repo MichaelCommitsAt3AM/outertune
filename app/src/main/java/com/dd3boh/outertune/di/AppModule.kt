@@ -1,15 +1,20 @@
 package com.dd3boh.outertune.di
 
 import android.content.Context
+import android.net.Uri
+import android.os.Environment
 import androidx.media3.database.DatabaseProvider
 import androidx.media3.database.StandaloneDatabaseProvider
 import androidx.media3.datasource.cache.LeastRecentlyUsedCacheEvictor
 import androidx.media3.datasource.cache.NoOpCacheEvictor
 import androidx.media3.datasource.cache.SimpleCache
+import androidx.work.WorkManager
 import com.dd3boh.outertune.constants.MaxSongCacheSizeKey
 import com.dd3boh.outertune.db.InternalDatabase
 import com.dd3boh.outertune.db.MusicDatabase
+import com.dd3boh.outertune.db.daos.DownloadDao
 import com.dd3boh.outertune.db.daos.TransitionDao
+import com.dd3boh.outertune.playback.downloadManager.DownloadDirectoryManagerOt
 import com.dd3boh.outertune.utils.dataStore
 import com.dd3boh.outertune.utils.get
 import dagger.Module
@@ -74,4 +79,50 @@ object AppModule {
     @Provides
     fun provideTransitionDao(database: MusicDatabase): TransitionDao =
         database.transitionDao()
+
+
+    @Singleton
+    @Provides
+    fun provideDownloadDao(database: MusicDatabase): DownloadDao =
+        database.downloadDao()
+
+    @Singleton
+    @Provides
+    fun provideWorkManager(@ApplicationContext context: Context): WorkManager =
+        WorkManager.getInstance(context)
+
+    @Singleton
+    @Provides
+    fun provideDownloadDirectoryManager(@ApplicationContext context: Context): DownloadDirectoryManagerOt {
+        // Try to get user-configured directory from DataStore/SharedPreferences
+        val userConfiguredUri = getUserDownloadDirectory(context)
+
+        // Use user-configured URI or fall back to default
+        val downloadDir = userConfiguredUri ?: getDefaultDownloadDirectory(context)
+        val extraDirs = getUserExtraDirectories(context) // Returns empty list if none configured
+
+        return DownloadDirectoryManagerOt(context, downloadDir, extraDirs)
+    }
+
+    private fun getDefaultDownloadDirectory(context: Context): Uri {
+        // Default to app's private music directory
+        val defaultDir = context.getExternalFilesDir(Environment.DIRECTORY_MUSIC)
+            ?: context.filesDir.resolve("downloads")
+
+        return Uri.fromFile(defaultDir)
+    }
+
+    private fun getUserDownloadDirectory(context: Context): Uri? {
+        // Read from SharedPreferences (blocking, but okay for DI)
+        val prefs = context.getSharedPreferences("download_settings", Context.MODE_PRIVATE)
+        val uriString = prefs.getString("download_directory_uri", null)
+        return uriString?.let { Uri.parse(it) }
+    }
+
+    private fun getUserExtraDirectories(context: Context): List<Uri> {
+        val prefs = context.getSharedPreferences("download_settings", Context.MODE_PRIVATE)
+        val extraDirsString = prefs.getStringSet("extra_directories", emptySet())
+        return extraDirsString?.mapNotNull { Uri.parse(it) } ?: emptyList()
+    }
+
 }

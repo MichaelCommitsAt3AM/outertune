@@ -15,6 +15,9 @@ import android.util.Log
 import android.widget.Toast
 import android.widget.Toast.LENGTH_SHORT
 import androidx.datastore.preferences.core.edit
+import androidx.hilt.work.HiltWorkerFactory
+import androidx.work.Configuration
+
 import coil3.ImageLoader
 import coil3.PlatformContext
 import coil3.SingletonImageLoader
@@ -51,6 +54,7 @@ import com.zionhuang.innertube.YouTube
 import com.zionhuang.innertube.models.YouTubeLocale
 import com.zionhuang.kugou.KuGou
 import dagger.hilt.android.HiltAndroidApp
+import jakarta.inject.Inject
 import kotlinx.coroutines.DelicateCoroutinesApi
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.GlobalScope
@@ -62,9 +66,13 @@ import kotlinx.coroutines.withContext
 import java.net.Proxy
 import java.util.Locale
 
+
 @HiltAndroidApp
-class App : Application(), SingletonImageLoader.Factory {
+class App : Application(), SingletonImageLoader.Factory, Configuration.Provider {
     private val TAG = App::class.simpleName.toString()
+
+    @Inject
+    lateinit var workerFactory: HiltWorkerFactory
 
     @OptIn(DelicateCoroutinesApi::class)
     override fun onCreate() {
@@ -163,10 +171,16 @@ class App : Application(), SingletonImageLoader.Factory {
         }
     }
 
+    // WorkManager configuration
+    override val workManagerConfiguration: Configuration
+        get() = Configuration.Builder()
+            .setWorkerFactory(workerFactory)
+            .build()
+
     override fun newImageLoader(context: PlatformContext): ImageLoader {
         val cacheSize = dataStore[MaxImageCacheSizeKey]
 
-        // will crash app if you set to 0 after cache starts being used
+        // Will crash app if you set to 0 after cache starts being used
         if (cacheSize == 0) {
             return ImageLoader.Builder(this)
                 .components {

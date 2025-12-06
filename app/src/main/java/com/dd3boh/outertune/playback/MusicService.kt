@@ -236,7 +236,11 @@ class MusicService : MediaLibraryService(),
         Log.i(TAG, "Starting MusicService")
         super.onCreate()
 
-        deckManager = DeckManager(this) {createExoPlayer()}
+        deckManager = DeckManager(this, { createExoPlayer() }) { newActivePlayer ->
+            // Runs on the main thread when transition completes
+            mediaSession.player = newActivePlayer
+        }
+
 
         // Attach listeners to DeckManager (which attaches to both A and B)
         deckManager.addListener(this)
@@ -269,12 +273,12 @@ class MusicService : MediaLibraryService(),
 //                setOffloadEnabled(dataStore.get(AudioOffloadKey, false))
 //            }
 //
-//        mediaLibrarySessionCallback.apply {
-//            service = this@MusicService
-//            toggleLike = ::toggleLike
-//            toggleStartRadio = ::toggleStartRadio
-//            toggleLibrary = ::toggleLibrary
-//        }
+        mediaLibrarySessionCallback.apply {
+            service = this@MusicService
+            toggleLike = ::toggleLike
+            toggleStartRadio = ::toggleStartRadio
+            toggleLibrary = ::toggleLibrary
+        }
 
         mediaSession = MediaLibrarySession.Builder(this, player, mediaLibrarySessionCallback)
             .setSessionActivity(

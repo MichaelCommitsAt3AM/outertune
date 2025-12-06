@@ -14,7 +14,8 @@
      */
     class DeckManager(
         private val context: Context,
-        private val playerCreator: () -> ExoPlayer
+        private val playerCreator: () -> ExoPlayer,
+        private val onActiveDeckChanged: (ExoPlayer) -> Unit
     ) {
         private val TAG = "DeckManager"
 
@@ -83,6 +84,9 @@
             val temp = activeDeck
             activeDeck = standbyDeck
             standbyDeck = temp
+
+            // Notify listener that the active player has changed
+            onActiveDeckChanged(activeDeck)
 
             // Clean up old deck
             standbyDeck.stop()

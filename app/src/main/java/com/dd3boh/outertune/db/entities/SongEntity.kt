@@ -45,11 +45,12 @@ data class SongEntity(
     val albumId: String? = null,
     val albumName: String? = null,
 
-    // Dj tags
+    // DJ feature values
     @ColumnInfo(name = "bpm") val bpm: Float? = null,
     @ColumnInfo(name = "key") val key: String? = null,
     @ColumnInfo(name = "first_beat_ms") val firstBeatMs: Long? = null,
     @ColumnInfo(name = "waveform_path") val waveformPath: String? = null,
+    @ColumnInfo(name = "beat_grid_path") val beatGridPath: String? = null,
 
     // val albumArtist // if anyone wants to implement album artists in a sane way, pull requests are welcome.
     val year: Int? = null,

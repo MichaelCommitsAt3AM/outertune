@@ -1,5 +1,6 @@
 package com.dd3boh.outertune.ui.screens.playlist
 
+import android.R.attr.progress
 import android.util.Log
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
@@ -93,6 +94,8 @@ import androidx.compose.material.icons.rounded.LinkOff
 import androidx.compose.material3.IconToggleButton
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.height
+import androidx.compose.material.icons.rounded.Check
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.ui.draw.alpha
 import com.dd3boh.outertune.LocalDatabase
 import com.dd3boh.outertune.LocalDownloadUtil
@@ -171,6 +174,8 @@ fun LocalPlaylistScreen(
 
     val playlistWithSongs by viewModel.playlistWithSongs.collectAsState()
 
+    val analysisProgress by viewModel.analysisProgress.collectAsState()
+
     val isPlaying by playerConnection.isPlaying.collectAsState()
     val mediaMetadata by playerConnection.mediaMetadata.collectAsState()
     val mutableSongs = remember { mutableStateListOf<PlaylistSong>() }
@@ -193,8 +198,10 @@ fun LocalPlaylistScreen(
         selection.clear()
     }
 
-    // NEW STATE: Track which songs we are editing
+    // Track which songs we are editing
     var showMixEditor by remember { mutableStateOf<Pair<String, String>?>(null) }
+
+    var showAnalysisDialog by remember { mutableStateOf(false) }
 
     // search
     var isSearching by rememberSaveable { mutableStateOf(false) }
@@ -273,6 +280,50 @@ fun LocalPlaylistScreen(
                 }
             )
         }
+    }
+
+    // --- Phase 3: Analysis Confirmation Dialog ---
+    if (showAnalysisDialog) {
+        DefaultDialog(
+            onDismiss = { showAnalysisDialog = false },
+            content = {
+                Text(
+                    text = "Enable DJ Mix Mode? This will analyze the BPM and Beat Grid for all songs in this playlist. This may take some time depending on the number of songs.",
+                    style = MaterialTheme.typography.bodyLarge,
+                    modifier = Modifier.padding(horizontal = 18.dp)
+                )
+            },
+            buttons = {
+                TextButton(
+                    onClick = {
+                        Log.e("LocalPlaylistScreen", "=== ANALYZE BUTTON CLICKED ===")
+                        showAnalysisDialog = false
+                    }
+                ) {
+                    Text(text = stringResource(android.R.string.cancel))
+                }
+
+                TextButton(
+                    onClick = {
+                        showAnalysisDialog = false
+                        // 1. Enable Mix Mode
+                        Log.d("LocalPlaylistScreen", "Enabling mix mode...")
+                        database.query {
+                            playlistWithSongs.first?.let {
+                                Log.d("LocalPlaylistScreen", "Updating playlist: ${it.playlist.id}")
+                                update(it.playlist.copy(isMixModeActive = true))
+                            }
+                        }
+                        // 2. Trigger Batch Analysis
+                        Log.e("LocalPlaylistScreen", "Calling viewModel.analyzePlaylist()...")
+                        viewModel.analyzePlaylist()
+                        Log.e("LocalPlaylistScreen", "=== analyzePlaylist() CALLED ===")
+                    }
+                ) {
+                    Text(text = "Analyze & Enable")
+                }
+            }
+        )
     }
 
     var showRemoveDownloadDialog by remember {
@@ -473,13 +524,32 @@ fun LocalPlaylistScreen(
                                 snackbarHostState = snackbarHostState,
                                 modifier = Modifier,
 
-                                // PASS NEW PARAMS
+
                                 isMixModeActive = playlist.playlist.isMixModeActive,
                                 onToggleMixMode = { isActive ->
-                                    database.query {
-                                        update(playlist.playlist.copy(isMixModeActive = isActive))
+                                    if (isActive) {
+                                        // Turning ON -> Confirm & Analyze
+                                        showAnalysisDialog = true
+                                    } else {
+                                        // Turning OFF -> Direct Update
+                                        database.query {
+                                            update(playlist.playlist.copy(isMixModeActive = false))
+                                        }
                                     }
                                 }
+                            )
+                        }
+                    }
+
+                    // Progress Indicator
+                    analysisProgress?.let { progress ->
+                        item(key = "analysis_progress") {
+                            LinearProgressIndicator(
+                                progress = { progress },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(4.dp)
+                                    .padding(bottom = 8.dp),
                             )
                         }
                     }
@@ -848,16 +918,20 @@ fun LocalPlaylistHeader(
                     if (songs.any { !it.song.song.isLocal }) {
                         when (downloadState) {
                             Download.STATE_COMPLETED -> {
+                                // All songs downloaded - show checkmark
                                 IconButton(
-                                    onClick = onShowRemoveDownloadDialog
+                                    onClick = {
+                                        // Show delete confirmation dialog
+                                        onShowRemoveDownloadDialog()
+                                    }
                                 ) {
                                     Icon(
-                                        imageVector = Icons.Rounded.OfflinePin,
-                                        contentDescription = null
+                                        imageVector = Icons.Rounded.Check,  // Or Icons.Rounded.CheckCircle
+                                        contentDescription = null,
+                                        tint = MaterialTheme.colorScheme.primary  // Green/primary color to indicate success
                                     )
                                 }
                             }
-
                             Download.STATE_DOWNLOADING -> {
                                 IconButton(
                                     onClick = {
@@ -877,8 +951,8 @@ fun LocalPlaylistHeader(
                                     )
                                 }
                             }
-
                             else -> {
+                                // Not downloaded - show download icon
                                 IconButton(
                                     onClick = {
                                         downloadUtil.download(songs.map { it.song.toMediaMetadata() })
@@ -890,19 +964,6 @@ fun LocalPlaylistHeader(
                                     )
                                 }
                             }
-                        }
-
-                        IconButton(
-                            onClick = {
-                                playerConnection.enqueueEnd(
-                                    items = songs.map { it.song.toMediaItem() }
-                                )
-                            }
-                        ) {
-                            Icon(
-                                imageVector = Icons.AutoMirrored.Rounded.QueueMusic,
-                                contentDescription = null
-                            )
                         }
                     }
                 }

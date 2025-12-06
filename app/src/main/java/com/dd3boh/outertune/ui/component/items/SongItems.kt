@@ -110,7 +110,10 @@ fun SongListItem(
             subtitle = joinByBullet(
                 (if (BuildConfig.DEBUG) song.song.id else ""),
                 song.artists.joinToString { it.name },
-                makeTimeString(song.song.duration * 1000L)
+                makeTimeString(song.song.duration * 1000L),
+                song.song.bpm?.let { "%.0f BPM".format(it) } ?: "",
+                song.song.key ?: ""
+
             ),
             badges = {
                 if (showLikedIcon && song.song.liked) {

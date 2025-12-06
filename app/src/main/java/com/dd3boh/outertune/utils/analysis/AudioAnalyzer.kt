@@ -2,6 +2,12 @@ package com.dd3boh.outertune.utils.analysis
 
 import android.util.Log
 
+data class AudioAnalysisResult(
+    val bpm: Float,
+    val firstBeatMs: Long,
+    val beatGrid: LongArray
+)
+
 object AudioAnalyzer {
     private const val TAG = "AudioAnalyzer"
 
@@ -19,5 +25,8 @@ object AudioAnalyzer {
      * @param sampleRate Sample rate (e.g., 44100)
      * @return FloatArray where [0] is BPM, [1] is First Beat Timestamp (ms)
      */
-    external fun analyzeBpm(pcmData: FloatArray, sampleRate: Int): FloatArray?
+//    external fun analyzeFile(filePath: String): AudioAnalysisResult?
+
+//    @Deprecated("Use analyzeFile instead", ReplaceWith("analyzeFile(filePath)"))
+    external fun analyzeBpm(pcmData: FloatArray, sampleRate: Int): AudioAnalysisResult?
 }

@@ -2,6 +2,8 @@ package com.dd3boh.outertune.playback
 
 import android.content.Context
 import android.net.ConnectivityManager
+import android.net.Uri
+import android.os.Environment
 import android.util.Log
 import android.widget.Toast
 import android.widget.Toast.LENGTH_SHORT
@@ -16,7 +18,6 @@ import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.offline.Download
 import androidx.media3.exoplayer.offline.DownloadManager
 import androidx.media3.exoplayer.offline.DownloadNotificationHelper
-import androidx.media3.exoplayer.offline.DownloadRequest
 import androidx.media3.exoplayer.offline.DownloadService
 import com.dd3boh.outertune.constants.AudioQuality
 import com.dd3boh.outertune.constants.AudioQualityKey
@@ -33,6 +34,7 @@ import com.dd3boh.outertune.models.MediaMetadata
 import com.dd3boh.outertune.playback.DownloadUtil.Companion.STATE_DOWNLOADING
 import com.dd3boh.outertune.playback.DownloadUtil.Companion.STATE_INVALID
 import com.dd3boh.outertune.playback.downloadManager.DownloadDirectoryManagerOt
+import com.dd3boh.outertune.playback.downloadManager.DownloadEvent
 import com.dd3boh.outertune.playback.downloadManager.DownloadManagerOt
 import com.dd3boh.outertune.utils.YTPlayerUtils
 import com.dd3boh.outertune.utils.dataStore
@@ -81,6 +83,7 @@ class DownloadUtil @Inject constructor(
     private val connectivityManager = context.getSystemService<ConnectivityManager>()!!
     private val audioQuality by enumPreference(context, AudioQualityKey, AudioQuality.AUTO)
     private val songUrlCache = HashMap<String, Pair<String, Long>>()
+
     private val dataSourceFactory = ResolvingDataSource.Factory(
         CacheDataSource.Factory()
             .setCache(playerCache)
@@ -92,50 +95,11 @@ class DownloadUtil @Inject constructor(
                 )
             )
     ) { dataSpec ->
-        val mediaId = dataSpec.key ?: error("No media id")
-        val length = if (dataSpec.length >= 0) dataSpec.length else 1
-        if (playerCache.isCached(mediaId, dataSpec.position, length)) {
-            return@Factory dataSpec
-        }
-
-        songUrlCache[mediaId]?.takeIf { it.second > System.currentTimeMillis() }?.let {
-            return@Factory dataSpec.withUri(it.first.toUri())
-        }
-
-        val playbackData = runBlocking(Dispatchers.IO) {
-            YTPlayerUtils.playerResponseForPlayback(
-                mediaId,
-                audioQuality = audioQuality,
-                connectivityManager = connectivityManager,
-            )
-        }.getOrThrow()
-        val format = playbackData.format
-
-        database.query {
-            upsert(
-                FormatEntity(
-                    id = mediaId,
-                    itag = format.itag,
-                    mimeType = format.mimeType.split(";")[0],
-                    codecs = format.mimeType.split("codecs=")[1].removeSurrounding("\""),
-                    bitrate = format.bitrate,
-                    sampleRate = format.audioSampleRate,
-                    contentLength = format.contentLength!!,
-                    loudnessDb = playbackData.audioConfig?.loudnessDb,
-                    playbackTrackingUrl = playbackData.playbackTracking?.videostatsPlaybackUrl?.baseUrl
-                )
-            )
-        }
-
-        val streamUrl = playbackData.streamUrl.let {
-            // Specify range to avoid YouTube's throttling
-            "${it}&range=0-${format.contentLength ?: 10000000}"
-        }
-
-        songUrlCache[mediaId] = streamUrl to System.currentTimeMillis() + (playbackData.streamExpiresInSeconds * 1000L)
-        dataSpec.withUri(streamUrl.toUri())
+        return@Factory dataSpec
     }
+
     val downloadNotificationHelper = DownloadNotificationHelper(context, ExoDownloadService.CHANNEL_ID)
+
     val downloadManager: DownloadManager =
         DownloadManager(context, databaseProvider, downloadCache, dataSourceFactory, Executor(Runnable::run)).apply {
             maxParallelDownloads = 3
@@ -147,45 +111,266 @@ class DownloadUtil @Inject constructor(
                 )
             )
         }
+
     val downloads = MutableStateFlow<Map<String, LocalDateTime>>(emptyMap())
 
-    var localMgr = DownloadDirectoryManagerOt(
-        context,
-        context.dataStore.get(DownloadPathKey, "").toUri(),
-        uriListFromString(context.dataStore.get(DownloadExtraPathKey, ""))
-    )
-    val downloadMgr = DownloadManagerOt(localMgr)
+    private fun getDefaultDownloadPath(): Uri {
+        val file = context.getExternalFilesDir(Environment.DIRECTORY_MUSIC)
+        val uri = file?.toUri() ?: Uri.EMPTY
+        Log.d(TAG, "Default download path: $uri (file: ${file?.absolutePath})")
+        return uri
+    }
+
+    var localMgr: DownloadDirectoryManagerOt
+    val downloadMgr: DownloadManagerOt
     var isProcessingDownloads = MutableStateFlow(false)
+
+    init {
+        Log.i(TAG, "=== DownloadUtil INIT START ===")
+
+        val savedPath = context.dataStore.get(DownloadPathKey, "")
+        Log.d(TAG, "Saved download path from DataStore: '$savedPath'")
+
+        val dlUri = if (savedPath.isNotEmpty()) savedPath.toUri() else getDefaultDownloadPath()
+        Log.i(TAG, "Using download URI: $dlUri")
+
+        val extraUris = uriListFromString(context.dataStore.get(DownloadExtraPathKey, ""))
+        Log.d(TAG, "Extra download URIs: ${extraUris.size} paths")
+
+        localMgr = DownloadDirectoryManagerOt(context, dlUri, extraUris)
+
+        // CREATE HTTP CLIENT WITH SAME CONFIG AS YOUTUBE
+        val downloadHttpClient = OkHttpClient.Builder()
+            .proxy(YouTube.proxy)  // Use YouTube's proxy if set
+            .connectTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(120, java.util.concurrent.TimeUnit.SECONDS)
+            .writeTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
+            .retryOnConnectionFailure(true)
+            .addInterceptor { chain ->
+                val request = chain.request().newBuilder()
+                    .header("User-Agent", "com.google.android.youtube/19.02.39 (Linux; U; Android 13) gzip")
+                    .header("Accept", "*/*")
+                    .header("Accept-Encoding", "identity")
+                    .header("Range", "bytes=0-")
+                    .build()
+                chain.proceed(request)
+            }
+            .build()
+
+        downloadMgr = DownloadManagerOt(localMgr, downloadHttpClient)
+
+        Log.i(TAG, "Download managers initialized")
+
+        // Observe custom download events to update Database and UI state
+        CoroutineScope(Dispatchers.IO).launch {
+            Log.d(TAG, "Starting download event collector")
+            downloadMgr.events.collect { event ->
+                when (event) {
+                    is DownloadEvent.Success -> {
+                        Log.i(TAG, "=== DOWNLOAD SUCCESS ===")
+                        Log.i(TAG, "Media ID: ${event.mediaId}")
+                        Log.i(TAG, "File URI: ${event.file}")
+                        Log.i(TAG, "File scheme: ${event.file.scheme}")
+
+                        val timeNow = LocalDateTime.now()
+
+                        // FIX: Get absolute path ensuring it starts with /
+                        val path: String? = when {
+                            event.file.scheme == "file" -> {
+                                val rawPath = event.file.path
+                                val fixedPath = if (rawPath?.startsWith("/") == true) rawPath else "/$rawPath"
+                                Log.d(TAG, "File scheme path - Raw: '$rawPath', Fixed: '$fixedPath'")
+                                fixedPath
+                            }
+                            else -> {
+                                val file = fileFromUri(context, event.file)
+                                val absPath = file?.absolutePath
+                                Log.d(TAG, "Non-file scheme - Resolved to: '$absPath'")
+                                absPath
+                            }
+                        }
+
+                        if (path != null) {
+                            Log.i(TAG, "Final resolved path: $path")
+
+                            // Create Download entity instead of updating Song
+                            val download = com.dd3boh.outertune.db.entities.Download(
+                                songId = event.mediaId,
+                                localPath = path,
+                                downloadedAt = System.currentTimeMillis(),
+                                analysisStatus = com.dd3boh.outertune.db.entities.AnalysisStatus.PENDING
+                            )
+
+                            try {
+                                database.downloadDao().insertDownload(download)
+                                Log.d(TAG, "Download entity inserted into database")
+
+                                // Also update Song for backward compatibility
+                                database.registerDownloadSong(event.mediaId, timeNow, path)
+                                Log.d(TAG, "Song entity updated with download info")
+                            } catch (e: Exception) {
+                                Log.e(TAG, "Database update failed", e)
+                                reportException(e)
+                            }
+                        } else {
+                            Log.e(TAG, "!!! FAILED TO RESOLVE PATH !!!")
+                            Log.e(TAG, "URI: ${event.file}")
+                            Log.e(TAG, "Scheme: ${event.file.scheme}")
+                        }
+
+                        downloads.update { map ->
+                            map.toMutableMap().apply { put(event.mediaId, timeNow) }
+                        }
+                        Log.i(TAG, "=== DOWNLOAD SUCCESS COMPLETE ===")
+                    }
+
+                    is DownloadEvent.Failure -> {
+                        Log.e(TAG, "=== DOWNLOAD FAILED ===")
+                        Log.e(TAG, "Media ID: ${event.mediaId}")
+                        Log.e(TAG, "Error: ${event.error?.message}")
+                        Log.e(TAG, "Error type: ${event.error?.javaClass?.simpleName}")
+                        event.error?.printStackTrace()
+
+                        database.updateDownloadStatus(event.mediaId, null)
+                        downloads.update { map ->
+                            map.toMutableMap().apply { remove(event.mediaId) }
+                        }
+
+                        withContext(Dispatchers.Main) {
+                            val errorMsg = event.error?.message ?: "Unknown error"
+                            Toast.makeText(context, "Download failed: $errorMsg", Toast.LENGTH_LONG).show()
+                        }
+                        Log.e(TAG, "=== DOWNLOAD FAILED END ===")
+                    }
+
+//                    is DownloadEvent.Progress -> {
+//                        Log.v(TAG, "Download progress: ${event.mediaId} - ${event.progress}%")
+//                    }
+                    // my actual code
+                    else -> {}
+                }
+            }
+        }
+
+        CoroutineScope(dlCoroutine).launch {
+            rescanDownloads()
+        }
+
+        downloadManager.addListener(
+            object : DownloadManager.Listener {
+                override fun onDownloadChanged(
+                    downloadManager: DownloadManager,
+                    download: Download,
+                    finalException: Exception?
+                ) {
+                    Log.d(TAG, "DownloadManager.onDownloadChanged: ${download.request.id}, state=${download.state}")
+                    if (finalException != null) {
+                        Log.e(TAG, "Download exception for ${download.request.id}", finalException)
+                    }
+
+                    if (download.state == Download.STATE_COMPLETED) {
+                        Log.i(TAG, "Download completed (ExoPlayer): ${download.request.id}")
+                        downloads.update { map ->
+                            if (!map.containsKey(download.request.id)) {
+                                map + (download.request.id to stateToLocalDateTime(download))
+                            } else map
+                        }
+                    }
+                }
+            }
+        )
+
+        Log.i(TAG, "=== DownloadUtil INIT COMPLETE ===")
+    }
 
     fun getDownload(songId: String): Flow<LocalDateTime?> = downloads.map { it[songId] }
 
     fun download(songs: List<MediaMetadata>) {
+        Log.i(TAG, "Downloading ${songs.size} songs")
         songs.forEach { song -> downloadSong(song.id, song.title) }
     }
 
     fun download(song: MediaMetadata) {
+        Log.i(TAG, "Download requested: [${song.id}] ${song.title}")
         downloadSong(song.id, song.title)
     }
 
     fun download(song: SongEntity) {
+        Log.i(TAG, "Download requested: [${song.id}] ${song.title}")
         downloadSong(song.id, song.title)
     }
 
     private fun downloadSong(id: String, title: String) {
-        if (downloads.value[id] != null) return
-        val downloadRequest = DownloadRequest.Builder(id, id.toUri())
-            .setCustomCacheKey(id)
-            .setData(title.toByteArray())
-            .build()
-        DownloadService.sendAddDownload(
-            context,
-            ExoDownloadService::class.java,
-            downloadRequest,
-            false
-        )
+        Log.i(TAG, "=== STARTING DOWNLOAD ===")
+        Log.i(TAG, "Song ID: $id")
+        Log.i(TAG, "Title: $title")
+
+        if (downloads.value[id] != null) {
+            Log.w(TAG, "Song already downloading or downloaded, skipping")
+            return
+        }
+
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                Log.d(TAG, "Updating download state to DOWNLOADING")
+                downloads.update { it + (id to STATE_DOWNLOADING) }
+
+                Log.d(TAG, "Fetching playback data...")
+                Log.d(TAG, "Audio quality: $audioQuality")
+                Log.d(TAG, "Network connected: ${connectivityManager.activeNetwork != null}")
+
+                val playbackData = YTPlayerUtils.playerResponseForPlayback(
+                    id,
+                    audioQuality = audioQuality,
+                    connectivityManager = connectivityManager,
+                ).getOrThrow()
+
+                Log.i(TAG, "Playback data obtained successfully")
+                Log.d(TAG, "Stream URL length: ${playbackData.streamUrl.length}")
+                Log.d(TAG, "Format itag: ${playbackData.format.itag}")
+                Log.d(TAG, "Format bitrate: ${playbackData.format.bitrate}")
+
+                val format = playbackData.format
+                Log.d(TAG, "Upserting format entity to database")
+                database.query {
+                    upsert(
+                        FormatEntity(
+                            id = id,
+                            itag = format.itag,
+                            mimeType = format.mimeType.split(";")[0],
+                            codecs = format.mimeType.split("codecs=")[1].removeSurrounding("\""),
+                            bitrate = format.bitrate,
+                            sampleRate = format.audioSampleRate,
+                            contentLength = format.contentLength!!,
+                            loudnessDb = playbackData.audioConfig?.loudnessDb,
+                            playbackTrackingUrl = playbackData.playbackTracking?.videostatsPlaybackUrl?.baseUrl
+                        )
+                    )
+                }
+                Log.d(TAG, "Format entity upserted")
+
+                Log.i(TAG, "Enqueueing download to DownloadManagerOt")
+                downloadMgr.enqueue(id, playbackData.streamUrl, title)
+                Log.i(TAG, "Download enqueued successfully")
+
+            } catch (e: Exception) {
+                Log.e(TAG, "=== DOWNLOAD START FAILED ===", e)
+                Log.e(TAG, "Exception type: ${e.javaClass.simpleName}")
+                Log.e(TAG, "Exception message: ${e.message}")
+                e.printStackTrace()
+
+                reportException(e)
+                downloads.update { it - id }
+
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(context, "Failed to start download: ${e.message}", LENGTH_SHORT).show()
+                }
+            }
+        }
     }
 
     fun resumeDownloadsOnStart() {
+        Log.d(TAG, "Resuming downloads on start")
         DownloadService.sendResumeDownloads(
             context,
             ExoDownloadService::class.java,
@@ -193,22 +378,22 @@ class DownloadUtil @Inject constructor(
         )
     }
 
-
-// Deletes from custom dl
-
     fun delete(song: PlaylistSong) = deleteSong(song.song.id)
-
     fun delete(song: SongItem) = deleteSong(song.id)
-
     fun delete(song: Song) = deleteSong(song.song.id)
-
     fun delete(song: SongEntity) = deleteSong(song.id)
-
     fun delete(song: MediaMetadata) = deleteSong(song.id)
 
     private fun deleteSong(id: String): Boolean {
+        Log.i(TAG, "Deleting song: $id")
         val deleted = localMgr.deleteFile(id)
-        if (!deleted) return false
+
+        if (!deleted) {
+            Log.w(TAG, "Failed to delete file for: $id")
+            return false
+        }
+
+        Log.d(TAG, "File deleted successfully: $id")
         downloads.update { map ->
             map.toMutableMap().apply {
                 remove(id)
@@ -218,13 +403,12 @@ class DownloadUtil @Inject constructor(
         runBlocking {
             database.song(id).first()?.song?.copy(localPath = null)
             database.updateDownloadStatus(id, null)
+            database.downloadDao().deleteDownload(id)
         }
+        Log.i(TAG, "Delete completed: $id")
         return true
     }
 
-    /**
-     * Retrieve song from cache, and delete it from cache afterwards
-     */
     fun getFromCache(cache: SimpleCache, mediaId: String): ByteArray? {
         val spans: Set<CacheSpan> = cache.getCachedSpans(mediaId)
         if (spans.isEmpty()) return null
@@ -246,48 +430,32 @@ class DownloadUtil @Inject constructor(
         return null
     }
 
-    /**
-     * Migrated existing downloads from the download cache to the new system in external storage
-     */
     suspend fun migrateDownloads() {
         if (isProcessingDownloads.value) return
         isProcessingDownloads.value = true
 
         var runs = 0
         try {
-            // "skeleton" of old download manager to access old download data
             val dataSourceFactory = ResolvingDataSource.Factory(
                 CacheDataSource.Factory()
                     .setCache(playerCache)
-                    .setUpstreamDataSourceFactory(
-                        OkHttpDataSource.Factory(
-                            OkHttpClient.Builder()
-                                .proxy(YouTube.proxy)
-                                .build()
-                        )
-                    )
-            ) { dataSpec ->
-                return@Factory dataSpec
-            }
+                    .setUpstreamDataSourceFactory(OkHttpDataSource.Factory(OkHttpClient()))
+            ) { it }
 
-            val downloadManager: DownloadManager = DownloadManager(
+            val downloadManager = DownloadManager(
                 context,
                 databaseProvider,
                 downloadCache,
                 dataSourceFactory,
                 Executor(Runnable::run)
-            ).apply {
-                maxParallelDownloads = 3
-            }
+            )
 
-            // actual migration code
             val downloadedSongs = mutableMapOf<String, Download>()
             val cursor = downloadManager.downloadIndex.getDownloads()
             while (cursor.moveToNext()) {
                 downloadedSongs[cursor.download.request.id] = cursor.download
             }
 
-            // copy all completed downloads
             val toMigrate = downloadedSongs.filter { it.value.state == Download.STATE_COMPLETED }
             toMigrate.forEach { s ->
                 if (runs++ % 10 == 0) {
@@ -317,6 +485,7 @@ class DownloadUtil @Inject constructor(
 
 
     fun cd() {
+        Log.d(TAG, "Changing download directory")
         localMgr.doInit(
             context,
             context.dataStore.get(DownloadPathKey, "").toUri(),
@@ -324,16 +493,12 @@ class DownloadUtil @Inject constructor(
         )
     }
 
-    /**
-     * Rescan download directory and updates songs
-     */
     suspend fun rescanDownloads() {
         Log.i(TAG, "+rescanDownloads()")
         isProcessingDownloads.value = true
         val dbDownloads = database.downloadedOrQueuedSongs().first()
         val result = mutableMapOf<String, LocalDateTime>()
 
-        // get missing files not in custom downloads or in internal downloads, remove them
         val missingFiles =
             localMgr.getMissingFiles(dbDownloads.filterNot { it.song.dateDownload == null }).toMutableList()
         Log.d(TAG, "Found ${missingFiles.size}/${dbDownloads.size} songs not in custom download directories")
@@ -341,22 +506,21 @@ class DownloadUtil @Inject constructor(
         while (cursor.moveToNext()) {
             missingFiles.removeIf { it.id == cursor.download.request.id }
         }
-        Log.d(
-            TAG,
-            "Found ${missingFiles.size}/${dbDownloads.size} song not in custom download directories + internal cache. Removing these files now"
-        )
 
         database.transaction {
             missingFiles.forEach {
                 Log.v(TAG, "Shedding: [${it.id}] ${it.song.title}")
                 removeDownloadSong(it.song.id)
+                // Also remove from Download table
+                runBlocking{
+                    downloadDao().deleteDownload(it.song.id)
+                }
             }
         }
 
-        // new files
         val availableDownloads = dbDownloads.minus(missingFiles)
         availableDownloads.forEach { s ->
-            result[s.song.id] = s.song.dateDownload!! // sql should cover our butts
+            result[s.song.id] = s.song.dateDownload!!
         }
 
         downloads.value = result
@@ -365,12 +529,6 @@ class DownloadUtil @Inject constructor(
     }
 
 
-    /**
-     * Scan and import downloaded songs from main and extra directories.
-     *
-     * This is intended for re-importing existing songs (ex. songs get moved, after restoring app backup), thus all
-     * songs will already need to exist in the database.
-     */
     suspend fun scanDownloads() {
         Log.i(TAG, "+scanDownloads()")
         if (isProcessingDownloads.value) {
@@ -379,92 +537,65 @@ class DownloadUtil @Inject constructor(
         }
         isProcessingDownloads.value = true
 
-//            val scanner = LocalMediaScanner.getScanner(context, ScannerImpl.TAGLIB, SCANNER_OWNER_DL)
         database.removeAllDownloadedSongs()
         val timeNow = LocalDateTime.now()
 
-        // add custom downloads
         val availableFiles = localMgr.getAvailableFiles(false)
         database.transaction {
             availableFiles.forEach { f ->
                 try {
-                    val file = fileFromUri(context, f.value)
-                    if (file == null) throw (InvalidAudioFileException("Hello darkness my old friend"))
-                    // TODO: validate files in download folder
-//                        val format: FormatEntity? = scanner.advancedScan(f.value).format
-//                        if (format != null) {
-//                            database.upsert(format)
-//                        }
-                    registerDownloadSong(f.key, timeNow, file.absolutePath)
+                    //Ensure absolute path with leading slash
+                    val path: String? = when {
+                        f.value.scheme == "file" -> {
+                            val rawPath = f.value.path
+                            if (rawPath?.startsWith("/") == true) rawPath else "/$rawPath"
+                        }
+                        else -> fileFromUri(context, f.value)?.absolutePath
+                    }
+
+                    if (path != null) {
+                        registerDownloadSong(f.key, timeNow, path)
+
+                        // Create or update Download entity
+                        runBlocking{
+                            val existingDownload = downloadDao().getDownload(f.key)
+                            if (existingDownload == null) {
+                                val download = com.dd3boh.outertune.db.entities.Download(
+                                    songId = f.key,
+                                    localPath = path,
+                                    downloadedAt = System.currentTimeMillis(),
+                                    analysisStatus = com.dd3boh.outertune.db.entities.AnalysisStatus.PENDING
+                                )
+                                downloadDao().insertDownload(download)
+                            }
+                        }
+                    }
 
                 } catch (e: InvalidAudioFileException) {
                     reportException(e)
                 }
             }
         }
-//            LocalMediaScanner.destroyScanner(SCANNER_OWNER_DL)
         Log.d(TAG, "Registered ${availableFiles.size} files from custom downloads")
 
-        // add internal downloads
         val cursor = downloadManager.downloadIndex.getDownloads()
         var count = 0
         database.transaction {
             while (cursor.moveToNext()) {
                 updateDownloadStatus(cursor.download.request.id, stateToLocalDateTime(cursor.download))
-                count ++
+                count++
             }
         }
         Log.d(TAG, "Registered $count files from internal downloads")
         isProcessingDownloads.value = false
-        Log.d(TAG, "Database registration complete, triggering map registry rebuild")
         rescanDownloads()
         Log.i(TAG, "-scanDownloads()")
     }
 
+
     companion object {
         val STATE_DOWNLOADING: LocalDateTime = Instant.ofEpochMilli(1).atZone(ZoneOffset.UTC).toLocalDateTime()
         val STATE_INVALID: LocalDateTime = Instant.ofEpochMilli(0).atZone(ZoneOffset.UTC).toLocalDateTime()
-    }
-
-
-    init {
-        Log.i(TAG, "DownloadUtil init")
-        // TODO: make sure db is update when download is queued
-        CoroutineScope(dlCoroutine).launch {
-            rescanDownloads()
-        }
-
-        downloadManager.addListener(
-            object : DownloadManager.Listener {
-                override fun onDownloadChanged(
-                    downloadManager: DownloadManager,
-                    download: Download,
-                    finalException: Exception?
-                ) {
-                    downloads.update { map ->
-                        map.toMutableMap().apply {
-                            val state = stateToLocalDateTime(download)
-                            if (state == STATE_INVALID) {
-                                Log.w(TAG, "Invalid download state for ${download.request.id}. Removing download")
-                                remove(download.request.id)
-                            } else {
-                                set(download.request.id, state)
-                            }
-                        }
-                    }
-
-                    CoroutineScope(Dispatchers.IO).launch {
-                        if (download.state == Download.STATE_COMPLETED) {
-                            val updateTime =
-                                Instant.ofEpochMilli(download.updateTimeMs).atZone(ZoneOffset.UTC).toLocalDateTime()
-                            database.updateDownloadStatus(download.request.id, updateTime)
-                        } else {
-                            database.updateDownloadStatus(download.request.id, null)
-                        }
-                    }
-                }
-            }
-        )
     }
 }
 
@@ -476,5 +607,14 @@ fun stateToLocalDateTime(download: Download): LocalDateTime {
 
         Download.STATE_DOWNLOADING, Download.STATE_QUEUED -> STATE_DOWNLOADING
         else -> STATE_INVALID
+    }
+}
+
+suspend fun MusicDatabase.registerDownloadSong(id: String, downloadDate: LocalDateTime, localPath: String?) {
+    val song = song(id).first()?.song
+    if (song != null) {
+        query {
+            update(song.copy(dateDownload = downloadDate, localPath = localPath))
+        }
     }
 }

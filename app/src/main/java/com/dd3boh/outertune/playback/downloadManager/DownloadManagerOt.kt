@@ -1,6 +1,7 @@
 package com.dd3boh.outertune.playback.downloadManager
 
 import android.net.Uri
+import android.util.Log
 import com.dd3boh.outertune.utils.reportException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -21,16 +22,21 @@ sealed class DownloadEvent {
 
 class DownloadManagerOt(
     private val local: DownloadDirectoryManagerOt,
-    private val httpClient: OkHttpClient = OkHttpClient(),
+    private val httpClient: OkHttpClient,
     private val scope: CoroutineScope = CoroutineScope(Dispatchers.IO)
 ) {
     private val _events = MutableSharedFlow<DownloadEvent>(extraBufferCapacity = 100)
     val events = _events.asSharedFlow()
 
+    // Limit to 3 concurrent downloads
+    private val downloadSemaphore = kotlinx.coroutines.sync.Semaphore(3)
+
     fun enqueue(mediaId: String, url: String, displayName: String? = null, abort: Boolean = false) {
+        Log.d("DownloadManagerOt", "Enqueue called: $displayName [$mediaId]")
 
         // if already exists, immediately emit success
         local.getFilePathIfExists(mediaId)?.let {
+            Log.i("DownloadManagerOt", "File already exists at $it. Skipping download.")
             _events.tryEmit(DownloadEvent.Success(mediaId, it))
             return
         }
@@ -41,54 +47,40 @@ class DownloadManagerOt(
         }
 
         scope.launch {
-            val request = Request.Builder().url(url).build()
+            // WAIT FOR AVAILABLE SLOT
+            downloadSemaphore.acquire()
             try {
+                Log.d("DownloadManagerOt", "Starting HTTP request for $mediaId")
+                val request = Request.Builder().url(url).build()
+
                 httpClient.newCall(request).execute().use { resp ->
+                    Log.d("DownloadManagerOt", "Response Code: ${resp.code}")
                     if (!resp.isSuccessful) {
-                        throw IllegalStateException("HTTP ${resp.code}")
+                        throw IllegalStateException("HTTP Request Failed: ${resp.code} ${resp.message}")
                     }
+
                     val body = resp.body
-                    val total = body.contentLength()
-                    var downloaded = 0L
+                    Log.d("DownloadManagerOt", "Content Length: ${body.contentLength()} bytes")
 
-                    // wrap the source to track progress
-                    val source = body.byteStream()
-                    val countingStream = object : InputStream() {
-                        override fun read(): Int {
-                            val byte = source.read()
-                            if (byte >= 0) {
-                                downloaded++
-                                _events.tryEmit(DownloadEvent.Progress(mediaId, downloaded, total))
-                            }
-                            return byte
-                        }
+                    // Save directly without progress tracking
+                    Log.d("DownloadManagerOt", "Attempting to save stream to disk...")
+                    val saved = local.saveFile(mediaId, body.byteStream(), displayName = displayName)
 
-                        override fun read(b: ByteArray, off: Int, len: Int): Int {
-                            val count = source.read(b, off, len)
-                            if (count > 0) {
-                                downloaded += count
-                                _events.tryEmit(DownloadEvent.Progress(mediaId, downloaded, total))
-                            }
-                            return count
-                        }
-
-                        override fun close() {
-                            source.close()
-                        }
-                    }
-
-
-                    // save to disk
-                    val saved = local.saveFile(mediaId, countingStream, displayName = displayName)
                     if (saved != null) {
+                        Log.i("DownloadManagerOt", "File saved successfully: $saved")
                         _events.tryEmit(DownloadEvent.Success(mediaId, saved))
                     } else {
-                        throw IOException("Failed to save file")
+                        Log.e("DownloadManagerOt", "Failed to save file: saveFile returned null")
+                        throw IOException("Failed to create file or write stream")
                     }
                 }
             } catch (e: Throwable) {
+                Log.e("DownloadManagerOt", "Download Exception for $mediaId", e)
                 reportException(e)
                 _events.tryEmit(DownloadEvent.Failure(mediaId, e))
+            } finally {
+                // RELEASE SLOT
+                downloadSemaphore.release()
             }
         }
     }
@@ -100,45 +92,22 @@ class DownloadManagerOt(
             return
         }
 
-        try {
-            val total = data.size.toLong()
-            var downloaded = 0L
-
-            // wrap the source to track progress
-            val source = data.inputStream()
-            val countingStream = object : InputStream() {
-                override fun read(): Int {
-                    val byte = source.read()
-                    if (byte >= 0) {
-                        downloaded++
-                        _events.tryEmit(DownloadEvent.Progress(mediaId, downloaded, total))
-                    }
-                    return byte
+        scope.launch {
+            downloadSemaphore.acquire()
+            try {
+                // Save directly without progress tracking
+                val saved = local.saveFile(mediaId, data.inputStream(), displayName = displayName)
+                if (saved != null) {
+                    _events.tryEmit(DownloadEvent.Success(mediaId, saved))
+                } else {
+                    throw IOException("Failed to save file")
                 }
-
-                override fun read(b: ByteArray, off: Int, len: Int): Int {
-                    val count = source.read(b, off, len)
-                    if (count > 0) {
-                        downloaded += count
-                        _events.tryEmit(DownloadEvent.Progress(mediaId, downloaded, total))
-                    }
-                    return count
-                }
-
-                override fun close() {
-                    source.close()
-                }
+            } catch (e: Throwable) {
+                reportException(e)
+                _events.tryEmit(DownloadEvent.Failure(mediaId, e))
+            } finally {
+                downloadSemaphore.release()
             }
-
-            // save to disk
-            val saved = local.saveFile(mediaId, countingStream, displayName = displayName)
-            if (saved != null) {
-                _events.tryEmit(DownloadEvent.Success(mediaId, saved))
-            } else {
-                throw IOException("Failed to save file")
-            }
-        } catch (e: Throwable) {
-            _events.tryEmit(DownloadEvent.Failure(mediaId, e))
         }
     }
 

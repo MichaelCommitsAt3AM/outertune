@@ -16,9 +16,12 @@ import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 import androidx.sqlite.db.SupportSQLiteOpenHelper
 import com.dd3boh.outertune.db.MusicDatabase.Companion.MUSIC_DATABASE_VERSION
+import com.dd3boh.outertune.db.daos.DownloadDao
+import com.dd3boh.outertune.db.daos.TransitionDao
 import com.dd3boh.outertune.db.entities.AlbumArtistMap
 import com.dd3boh.outertune.db.entities.AlbumEntity
 import com.dd3boh.outertune.db.entities.ArtistEntity
+import com.dd3boh.outertune.db.entities.Download
 import com.dd3boh.outertune.db.entities.Event
 import com.dd3boh.outertune.db.entities.FormatEntity
 import com.dd3boh.outertune.db.entities.GenreEntity
@@ -52,8 +55,9 @@ class MusicDatabase(
     val openHelper: SupportSQLiteOpenHelper
         get() = delegate.openHelper
 
-    // Add this method
-    fun transitionDao(): com.dd3boh.outertune.db.daos.TransitionDao = delegate.transitionDao()
+    fun transitionDao(): TransitionDao = delegate.transitionDao()
+
+    fun downloadDao(): DownloadDao = delegate.downloadDao()
 
     fun query(block: MusicDatabase.() -> Unit) = with(delegate) {
         queryExecutor.execute {
@@ -72,7 +76,7 @@ class MusicDatabase(
     fun close() = delegate.close()
 
     companion object {
-        const val MUSIC_DATABASE_VERSION = 21
+        const val MUSIC_DATABASE_VERSION = 22
     }
 }
 
@@ -97,7 +101,8 @@ class MusicDatabase(
         Event::class,
         RelatedSongMap::class,
         RecentActivityEntity::class,
-        TransitionEntity::class
+        TransitionEntity::class,
+        Download::class
     ],
     views = [
         SortedSongArtistMap::class,
@@ -127,7 +132,8 @@ class MusicDatabase(
 @TypeConverters(Converters::class)
 abstract class InternalDatabase : RoomDatabase() {
     abstract val dao: DatabaseDao
-    abstract fun transitionDao(): com.dd3boh.outertune.db.daos.TransitionDao
+    abstract fun transitionDao(): TransitionDao
+    abstract fun downloadDao(): DownloadDao
 
     companion object {
         const val DB_NAME = "song.db"
@@ -141,6 +147,7 @@ abstract class InternalDatabase : RoomDatabase() {
                     .addMigrations(MIGRATION_15_16)
                     .addMigrations(MIGRATION_16_17)
                     .addMigrations(MIGRATION_20_21)
+                    .addMigrations(MIGRATION_21_22)
                     .build()
             )
 
@@ -152,6 +159,7 @@ abstract class InternalDatabase : RoomDatabase() {
                     .addMigrations(MIGRATION_14_15)
                     .addMigrations(MIGRATION_15_16)
                     .addMigrations(MIGRATION_16_17)
+                    .addMigrations(MIGRATION_21_22)
                     .build()
             )
     }
@@ -705,6 +713,13 @@ val MIGRATION_20_21 = object : Migration(20, 21) {
 
         // 4. Create Index for TransitionEntity
         db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS `index_transitions_fromSongId_toSongId` ON `transitions` (`fromSongId`, `toSongId`)")
+    }
+}
+
+val MIGRATION_21_22 = object : Migration(21, 22) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        // Add the missing column for Beat Grids
+        db.execSQL("ALTER TABLE song ADD COLUMN beat_grid_path TEXT DEFAULT NULL")
     }
 }
 
