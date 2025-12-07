@@ -198,7 +198,7 @@ class DownloadUtil @Inject constructor(
                                 songId = event.mediaId,
                                 localPath = path,
                                 downloadedAt = System.currentTimeMillis(),
-                                analysisStatus = com.dd3boh.outertune.db.entities.AnalysisStatus.PENDING
+                                fileSize = null
                             )
 
                             try {
@@ -564,7 +564,7 @@ class DownloadUtil @Inject constructor(
                                     songId = f.key,
                                     localPath = path,
                                     downloadedAt = System.currentTimeMillis(),
-                                    analysisStatus = com.dd3boh.outertune.db.entities.AnalysisStatus.PENDING
+                                    fileSize = null
                                 )
                                 downloadDao().insertDownload(download)
                             }

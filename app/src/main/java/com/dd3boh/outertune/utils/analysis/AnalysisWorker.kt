@@ -6,7 +6,6 @@ import androidx.hilt.work.HiltWorker
 import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
 import com.dd3boh.outertune.db.MusicDatabase
-import com.dd3boh.outertune.db.entities.AnalysisStatus
 import dagger.assisted.Assisted
 import dagger.assisted.AssistedInject
 import kotlinx.coroutines.flow.first
@@ -46,19 +45,11 @@ class AnalysisWorker @AssistedInject constructor(
 
         Log.d(TAG, "Input data - songId: $songId, path: $path")
 
-        if (path == null) {
-            Log.e(TAG, "path is NULL - returning failure")
-            return Result.failure()
-        }
-
         val file = File(path)
         if (!file.exists()) {
-            downloadDao.updateAnalysisStatus(songId, AnalysisStatus.FAILED)
+            Log.e(TAG, "File does not exist: $path")
             return Result.failure()
         }
-
-        // Update to in progress
-        downloadDao.updateAnalysisStatus(songId, AnalysisStatus.IN_PROGRESS)
 
         // Add leading slash if missing
         val absolutePath = if (path.startsWith("/")) path else "/$path"
@@ -70,7 +61,6 @@ class AnalysisWorker @AssistedInject constructor(
             Log.d(TAG, "Step 1: Decoding audio file...")
             val (pcmData, sampleRate) = AudioDecoder.decodeToMono(absolutePath) ?: run {
                 Log.e(TAG, "Failed to decode audio file")
-                downloadDao.updateAnalysisStatus(songId, AnalysisStatus.FAILED)
                 return Result.failure()
             }
             Log.d(TAG, "Step 1: Decoded ${pcmData.size} samples at $sampleRate Hz")
@@ -82,7 +72,6 @@ class AnalysisWorker @AssistedInject constructor(
 
             if (analysisResult == null) {
                 Log.e(TAG, "Analysis returned null")
-                downloadDao.updateAnalysisStatus(songId, AnalysisStatus.FAILED)
                 return Result.failure()
             }
 
@@ -107,7 +96,7 @@ class AnalysisWorker @AssistedInject constructor(
             beatFile.writeText(analysisResult.beatGrid.joinToString(","))
             Log.d(TAG, "Step 4: Beat grid saved to ${beatFile.absolutePath}, size=${beatFile.length()} bytes")
 
-            // Step 5: Update database
+            // Step 5: Update SongEntity with analysis results
             Log.d(TAG, "Step 5: Updating database...")
             val song = database.song(songId).first()?.song
             Log.d(TAG, "Step 5: Retrieved song from DB: ${song?.let { "id=${it.id}" } ?: "NULL"}")
@@ -122,10 +111,6 @@ class AnalysisWorker @AssistedInject constructor(
                 )
                 Log.d(TAG, "Step 5: Updating song with BPM=${updated.bpm}, waveformPath=${updated.waveformPath}")
                 database.update(updated)
-                Log.i(TAG, "Step 5: Database update complete")
-
-                // Update analysis status to COMPLETED
-                downloadDao.updateAnalysisStatus(songId, AnalysisStatus.COMPLETED)
                 Log.i(TAG, "=== Analysis SUCCESSFUL for $songId, BPM=${analysisResult.bpm} ===")
             } else {
                 Log.w(TAG, "Step 5: Song not found in database, skipping update")
@@ -137,9 +122,6 @@ class AnalysisWorker @AssistedInject constructor(
             Log.e(TAG, "Exception type: ${e.javaClass.simpleName}")
             Log.e(TAG, "Exception message: ${e.message}")
             e.printStackTrace()
-
-            // Update status to FAILED on error
-            downloadDao.updateAnalysisStatus(songId, AnalysisStatus.FAILED)
 
             Result.failure()
         }

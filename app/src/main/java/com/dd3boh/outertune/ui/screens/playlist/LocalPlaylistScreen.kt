@@ -805,7 +805,9 @@ fun LocalPlaylistHeader(
     modifier: Modifier,
     // Mix params
     isMixModeActive: Boolean,
-    onToggleMixMode: (Boolean) -> Unit
+    onToggleMixMode: (Boolean) -> Unit,
+    analysisProgress: Float? = null
+
 ) {
     Log.v("LocalPlaylistScreen", "P_H_RC-1")
     val playerConnection = LocalPlayerConnection.current ?: return
@@ -1018,6 +1020,7 @@ fun LocalPlaylistHeader(
             IconToggleButton(
                 checked = isMixModeActive,
                 onCheckedChange = onToggleMixMode,
+                enabled = analysisProgress == null,
                 modifier = Modifier
                     .background(
                         color = MaterialTheme.colorScheme.secondaryContainer,

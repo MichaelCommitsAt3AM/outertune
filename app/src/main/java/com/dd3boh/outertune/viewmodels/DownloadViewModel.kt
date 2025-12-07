@@ -4,7 +4,6 @@ package com.dd3boh.outertune.viewmodels
 import androidx.lifecycle.ViewModel
 import androidx.work.WorkManager
 import com.dd3boh.outertune.db.daos.DownloadDao
-import com.dd3boh.outertune.db.entities.AnalysisStatus
 import com.dd3boh.outertune.db.entities.Download
 import com.dd3boh.outertune.db.entities.Song
 import com.dd3boh.outertune.playback.downloadManager.DownloadDirectoryManagerOt
@@ -32,7 +31,8 @@ class DownloadViewModel @Inject constructor(
             val download = Download(
                 songId = song.id,
                 localPath = path,
-                analysisStatus = AnalysisStatus.PENDING
+                downloadedAt = System.currentTimeMillis(),
+                fileSize = null
             )
             downloadDao.insertDownload(download)
 
