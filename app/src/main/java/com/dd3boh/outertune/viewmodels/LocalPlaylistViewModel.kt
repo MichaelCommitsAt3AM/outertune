@@ -95,14 +95,29 @@ class LocalPlaylistViewModel @Inject constructor(
         Log.e("LocalPlaylistViewModel", "=== analyzePlaylist() FUNCTION ENTERED ===")
 
         viewModelScope.launch(Dispatchers.IO) {
+            val tag = "analysis_playlist_$playlistId"
+
+            // Check if work is already running
+            val workInfos = workManager.getWorkInfosByTag(tag).get()
+            val hasRunningWork = workInfos.any {
+                it.state == WorkInfo.State.RUNNING || it.state == WorkInfo.State.ENQUEUED
+            }
+
+            if (hasRunningWork) {
+                Log.w("LocalPlaylistViewModel", "Analysis already in progress, skipping...")
+                return@launch
+            }
+
             val songs = playlistWithSongs.value.second
             Log.e("LocalPlaylistViewModel", "Total songs in playlist: ${songs.size}")
 
             val songsNeedingAnalysis = songs.mapNotNull { playlistSong ->
                 val songId = playlistSong.song.id
+                val song = playlistSong.song.song  // Access the SongEntity
                 val download = downloadDao.getDownload(songId)
 
-                if (download != null && download.bpm == null) {
+                // Check if song has local file AND hasn't been analyzed yet
+                if (download != null && song.bpm == null) {  // Changed from download.bpm to song.bpm
                     Pair(playlistSong.song, download)
                 } else null
             }
@@ -114,7 +129,9 @@ class LocalPlaylistViewModel @Inject constructor(
                 return@launch
             }
 
-            val tag = "analysis_playlist_$playlistId"
+            // Cancel any previous work
+            workManager.cancelAllWorkByTag(tag)
+
             Log.e("LocalPlaylistViewModel", "Creating work requests with tag: $tag")
 
             val requests = songsNeedingAnalysis.map { (song, download) ->
@@ -124,12 +141,10 @@ class LocalPlaylistViewModel @Inject constructor(
                         "path" to download.localPath
                     ))
                     .addTag(tag)
-                    // Add constraint: stop if it takes too long
                     .setInitialDelay(0, TimeUnit.SECONDS)
                     .build()
             }
 
-            // Chain with continuePropagation to skip failed items
             if (requests.isEmpty()) return@launch
 
             var continuation = workManager.beginWith(requests.first())
@@ -137,7 +152,6 @@ class LocalPlaylistViewModel @Inject constructor(
                 continuation = continuation.then(request)
             }
 
-            // Use .enqueue() which returns immediately
             continuation.enqueue()
             Log.e("LocalPlaylistViewModel", "=== WORK CHAIN ENQUEUED ===")
         }

@@ -76,7 +76,7 @@ class MusicDatabase(
     fun close() = delegate.close()
 
     companion object {
-        const val MUSIC_DATABASE_VERSION = 22
+        const val MUSIC_DATABASE_VERSION = 23
     }
 }
 
@@ -127,6 +127,7 @@ class MusicDatabase(
         AutoMigration(from = 17, to = 18, spec = Migration17To18::class), // Fix Room nonsense
         AutoMigration(from = 18, to = 19), // Recent activity
         AutoMigration(from = 19, to = 20, spec = Migration19To20::class), // Db optimization, remove totalplaytime, local media fields
+        AutoMigration(from = 22, to = 23, spec = Migration22To23::class),
     ]
 )
 @TypeConverters(Converters::class)
@@ -681,7 +682,6 @@ class Migration12To13 : AutoMigrationSpec {
     }
 }
 
-// 5. ADD THIS MIGRATION OBJECT AT THE BOTTOM OF THE FILE
 val MIGRATION_20_21 = object : Migration(20, 21) {
     override fun migrate(db: SupportSQLiteDatabase) {
         // 1. Add columns to SongEntity (using the names from your @ColumnInfo)
@@ -722,6 +722,15 @@ val MIGRATION_21_22 = object : Migration(21, 22) {
         db.execSQL("ALTER TABLE song ADD COLUMN beat_grid_path TEXT DEFAULT NULL")
     }
 }
+
+@DeleteColumn.Entries(
+    DeleteColumn(tableName = "downloads", columnName = "bpm"),
+    DeleteColumn(tableName = "downloads", columnName = "beatGrid"),
+    DeleteColumn(tableName = "downloads", columnName = "waveformData"),
+    DeleteColumn(tableName = "downloads", columnName = "analysisStatus"),
+    DeleteColumn(tableName = "downloads", columnName = "analyzedAt")
+)
+class Migration22To23 : AutoMigrationSpec
 
 /**
  * Nonsense migration failure
