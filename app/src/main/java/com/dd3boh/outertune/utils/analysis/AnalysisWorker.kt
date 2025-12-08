@@ -29,29 +29,27 @@ class AnalysisWorker @AssistedInject constructor(
     override suspend fun doWork(): Result {
         Log.d(TAG, "=== doWork() CALLED ===")
 
-        val songId = inputData.getString("songId")
+        val songId = inputData.getString("songId") ?: return Result.failure()
 
-        // Check songId is not null first
-        if (songId == null) {
-            Log.e(TAG, "songId is NULL - returning failure")
+        // FIX: Get SongEntity first to check for localPath
+        val song = database.song(songId).first()?.song ?: run {
+            Log.e(TAG, "Song not found in DB: $songId")
             return Result.failure()
         }
 
-        // Get download info from database
-        val downloadDao = database.downloadDao()
-        val download = downloadDao.getDownload(songId) ?: return Result.failure()
-
-        val path = download.localPath
-
-        Log.d(TAG, "Input data - songId: $songId, path: $path")
+        // FIX: Use the song's localPath directly (works for Local and Downloaded songs)
+        val path = song.localPath ?: run {
+            Log.e(TAG, "No local path for song: $songId")
+            return Result.failure()
+        }
 
         val file = File(path)
         if (!file.exists()) {
-            Log.e(TAG, "File does not exist: $path")
+            Log.e(TAG, "Audio file does not exist: $path")
             return Result.failure()
         }
 
-        // Add leading slash if missing
+        // Add leading slash if missing (sometimes needed for absolute paths)
         val absolutePath = if (path.startsWith("/")) path else "/$path"
 
         Log.i(TAG, "Starting analysis for songId=$songId, path=$absolutePath")
@@ -63,66 +61,51 @@ class AnalysisWorker @AssistedInject constructor(
                 Log.e(TAG, "Failed to decode audio file")
                 return Result.failure()
             }
-            Log.d(TAG, "Step 1: Decoded ${pcmData.size} samples at $sampleRate Hz")
 
             // Step 2: Analyze BPM using Aubio
             Log.d(TAG, "Step 2: Running BPM analysis...")
-            val analysisResult = AudioAnalyzer.analyzeBpm(pcmData, sampleRate)
-            Log.d(TAG, "Step 2: Analysis complete - BPM=${analysisResult?.bpm}, beats=${analysisResult?.beatGrid?.size}")
-
-            if (analysisResult == null) {
+            val analysisResult = AudioAnalyzer.analyzeBpm(pcmData, sampleRate) ?: run {
                 Log.e(TAG, "Analysis returned null")
                 return Result.failure()
             }
 
-            // Step 3: Get waveform for visualization (still use Amplituda)
+            // Step 3: Get waveform for visualization (Amplituda)
             Log.d(TAG, "Step 3: Extracting waveform...")
-            val waveformData = amplituda.processAudio(absolutePath, Compress.withParams(Compress.AVERAGE, 100)).get()
-            val amplitudes = waveformData.amplitudesAsList()
+            val waveformResult = amplituda.processAudio(absolutePath, Compress.withParams(Compress.AVERAGE, 100)).get()
+            val amplitudes = waveformResult.amplitudesAsList()
 
-            // Step 4: Save analysis artifacts
-            Log.d(TAG, "Step 4: Saving analysis artifacts...")
+            // CRITICAL FIX: Normalize to 0.0-1.0 range
+            val maxAmplitude = amplitudes.maxOrNull()?.toFloat() ?: 1f
+            val normalizedWaveform = amplitudes.map { it.toFloat() / maxAmplitude }
+
+            Log.d(TAG, "Waveform: ${amplitudes.size} points, max=$maxAmplitude, sample=${normalizedWaveform.take(5)}")
+
+            // Save normalized waveform
             val cacheDir = File(applicationContext.cacheDir, "analysis_data")
             cacheDir.mkdirs()
-            Log.d(TAG, "Step 4: Cache directory: ${cacheDir.absolutePath}, exists=${cacheDir.exists()}")
 
-            // Save waveform
             val waveformFile = File(cacheDir, "${songId}_waveform.dat")
-            waveformFile.writeText(amplitudes.joinToString(","))
-            Log.d(TAG, "Step 4: Waveform saved to ${waveformFile.absolutePath}, size=${waveformFile.length()} bytes")
+            waveformFile.writeText(normalizedWaveform.joinToString(","))
 
-            // Save beat grid
+            // Save beat grid (timestamps in seconds)
             val beatFile = File(cacheDir, "${songId}_beats.dat")
             beatFile.writeText(analysisResult.beatGrid.joinToString(","))
-            Log.d(TAG, "Step 4: Beat grid saved to ${beatFile.absolutePath}, size=${beatFile.length()} bytes")
+            Log.d(TAG, "Beat grid: ${analysisResult.beatGrid.size} beats, sample=${analysisResult.beatGrid.take(5)}")
 
-            // Step 5: Update SongEntity with analysis results
-            Log.d(TAG, "Step 5: Updating database...")
-            val song = database.song(songId).first()?.song
-            Log.d(TAG, "Step 5: Retrieved song from DB: ${song?.let { "id=${it.id}" } ?: "NULL"}")
-
-            if (song != null) {
-                val updated = song.copy(
-                    waveformPath = waveformFile.absolutePath,
-                    beatGridPath = beatFile.absolutePath,
-                    bpm = analysisResult.bpm,
-                    firstBeatMs = analysisResult.firstBeatMs,
-                    key = null
-                )
-                Log.d(TAG, "Step 5: Updating song with BPM=${updated.bpm}, waveformPath=${updated.waveformPath}")
-                database.update(updated)
-                Log.i(TAG, "=== Analysis SUCCESSFUL for $songId, BPM=${analysisResult.bpm} ===")
-            } else {
-                Log.w(TAG, "Step 5: Song not found in database, skipping update")
-            }
+            // Step 5: Update SongEntity
+            val updated = song.copy(
+                waveformPath = waveformFile.absolutePath,
+                beatGridPath = beatFile.absolutePath,
+                bpm = analysisResult.bpm,
+                firstBeatMs = analysisResult.firstBeatMs
+            )
+            database.update(updated)
+            Log.i(TAG, "=== Analysis SUCCESSFUL for $songId ===")
 
             Result.success()
         } catch (e: Exception) {
             Log.e(TAG, "=== ERROR analyzing song $songId ===", e)
-            Log.e(TAG, "Exception type: ${e.javaClass.simpleName}")
-            Log.e(TAG, "Exception message: ${e.message}")
             e.printStackTrace()
-
             Result.failure()
         }
     }

@@ -1,5 +1,6 @@
 package com.dd3boh.outertune.ui.component
 
+import android.util.Log
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.runtime.*
@@ -13,9 +14,23 @@ fun WaveformView(
     waveformData: FloatArray,
     beatMarkers: List<Float>,
     markerPosition: BeatMarkerPosition,
-    modifier: Modifier = Modifier
+    songDurationSeconds: Float?,
+    modifier: Modifier = Modifier,
+    zoomFactor: Float = 1f,
+    initialOffset: Float = 0f
 ) {
-    var horizontalOffset by remember { mutableStateOf(0f) }
+    var horizontalOffset by remember { mutableStateOf(initialOffset) }
+
+    // Center the view when zoom changes
+    LaunchedEffect(zoomFactor) {
+        if (zoomFactor > 1f) {
+            // Center the zoomed waveform
+            // When zoomed in, show the beginning of the song centered
+            horizontalOffset = 0f
+        } else {
+            horizontalOffset = 0f
+        }
+    }
 
     Canvas(
         modifier = modifier.pointerInput(Unit) {
@@ -30,7 +45,10 @@ fun WaveformView(
         val centerY = height / 2f
         val maxAmplitude = height / 2f
 
-        // Draw grid
+        // Debug logging
+        Log.d("WaveformView", "Canvas: width=$width, zoom=$zoomFactor, offset=$horizontalOffset, waveform=${waveformData.size}, beats=${beatMarkers.size}")
+
+        // Draw grid (4 bars)
         val barWidth = width / 4f
         for (i in 0..4) {
             val x = i * barWidth
@@ -42,42 +60,74 @@ fun WaveformView(
             )
         }
 
-        // Draw waveform
-        if (waveformData.isNotEmpty()) {
-            val pixelsPerSample = width / waveformData.size
+        // Draw waveform with zoom (FIXED)
+        if (waveformData.isNotEmpty() && songDurationSeconds != null && songDurationSeconds > 0) {
+            // Calculate how much width each sample should take
+            val totalWaveformWidth = width * zoomFactor
+            val pixelsPerSample = totalWaveformWidth / waveformData.size
 
-            waveformData.forEachIndexed { index, amplitude ->
+            // Draw only visible samples for performance
+            val startIndex = ((-horizontalOffset) / pixelsPerSample).toInt().coerceAtLeast(0)
+            val endIndex = ((width - horizontalOffset) / pixelsPerSample).toInt().coerceAtMost(waveformData.size - 1)
+
+            Log.d("WaveformView", "Drawing samples $startIndex to $endIndex (of ${waveformData.size}), pixelsPerSample=$pixelsPerSample")
+
+            for (index in startIndex..endIndex) {
+                val amplitude = waveformData[index]
                 val x = (index * pixelsPerSample) + horizontalOffset
-                if (x in 0f..width) {
-                    val scaledAmplitude = amplitude.coerceIn(-1f, 1f)
-                    val top = centerY - (scaledAmplitude * maxAmplitude)
-                    val bottom = centerY + (scaledAmplitude * maxAmplitude)
 
-                    drawLine(
-                        color = Color.LightGray,
-                        start = Offset(x, top),
-                        end = Offset(x, bottom),
-                        strokeWidth = 1f
-                    )
-                }
+                val normalizedAmp = amplitude.coerceIn(0f, 1f)
+                val scaledAmplitude = normalizedAmp * maxAmplitude
+
+                drawLine(
+                    color = Color.LightGray,
+                    start = Offset(x, centerY - scaledAmplitude),
+                    end = Offset(x, centerY + scaledAmplitude),
+                    strokeWidth = 2f
+                )
             }
         }
 
-        // Draw beat markers
-        beatMarkers.forEach { position ->
-            val x = position + horizontalOffset
-            if (x in 0f..width) {
-                val y = if (markerPosition == BeatMarkerPosition.BOTTOM) {
-                    height - 30f
-                } else {
-                    30f
-                }
+        // Draw beat markers as dots (FIXED)
+        if (beatMarkers.isNotEmpty() && songDurationSeconds != null && songDurationSeconds > 0) {
+            val totalWaveformWidth = width * zoomFactor
 
-                drawCircle(
-                    color = Color.Green,
-                    radius = 6f,
-                    center = Offset(x, y)
-                )
+            beatMarkers.forEachIndexed { index, beatTimeSeconds ->
+                // Convert beat time to position
+                val normalizedPosition = beatTimeSeconds / songDurationSeconds
+                val x = (normalizedPosition * totalWaveformWidth) + horizontalOffset
+
+                // Only draw if visible
+                if (x in -50f..(width + 50f)) {
+                    val isMajorBeat = index % 4 == 0
+
+                    when (markerPosition) {
+                        BeatMarkerPosition.BOTTOM -> {
+                            drawCircle(
+                                color = if (isMajorBeat) Color(0xFF4CAF50) else Color(0xFF81C784),
+                                radius = if (isMajorBeat) 8f else 5f,
+                                center = Offset(x, height - 15f)
+                            )
+                        }
+                        BeatMarkerPosition.TOP -> {
+                            drawCircle(
+                                color = if (isMajorBeat) Color(0xFF4CAF50) else Color(0xFF81C784),
+                                radius = if (isMajorBeat) 8f else 5f,
+                                center = Offset(x, 15f)
+                            )
+                        }
+                    }
+
+                    // Draw vertical line for major beats
+                    if (isMajorBeat) {
+                        drawLine(
+                            color = Color(0xFF4CAF50).copy(alpha = 0.3f),
+                            start = Offset(x, 0f),
+                            end = Offset(x, height),
+                            strokeWidth = 2f
+                        )
+                    }
+                }
             }
         }
     }
