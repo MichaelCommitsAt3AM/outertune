@@ -36,6 +36,7 @@ import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Shuffle
 import androidx.compose.material.icons.rounded.Sync
+import androidx.compose.ui.res.painterResource
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -654,30 +655,21 @@ fun LocalPlaylistScreen(
                         val nextSong = mutableSongs[index + 1]
 
                         Box(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(24.dp), // Small height for the connector
+                            modifier = Modifier.fillMaxWidth().height(24.dp),
                             contentAlignment = Alignment.Center
                         ) {
-                            // Optional: Small vertical line to look like a chain
-                            /*
-                            Box(modifier = Modifier
-                                .width(2.dp)
-                                .fillMaxHeight()
-                                .background(MaterialTheme.colorScheme.outlineVariant))
-                            */
-
                             IconButton(
                                 onClick = {
-                                    showMixEditor = song.song.id to nextSong.song.id
+                                    // Phase 1: Navigate to Editor
+                                    navController.navigate("transition_editor/${song.song.id}/${nextSong.song.id}")
                                 },
                                 modifier = Modifier.size(24.dp)
                             ) {
                                 Icon(
                                     imageVector = Icons.Rounded.Link,
                                     contentDescription = "Edit Transition",
-                                    modifier = Modifier.size(16.dp),
-                                    tint = MaterialTheme.colorScheme.primary
+                                    tint = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.size(16.dp)
                                 )
                             }
                         }
@@ -1029,9 +1021,15 @@ fun LocalPlaylistHeader(
                     .size(ButtonDefaults.MinHeight) // Match height of other buttons
             ) {
                 Icon(
-                    imageVector = if (isMixModeActive) Icons.Rounded.Link else Icons.Rounded.LinkOff,
+                    painter = painterResource(id = R.drawable.instant_mix),
                     contentDescription = "Toggle Mix Mode",
-                    tint = MaterialTheme.colorScheme.onSecondaryContainer
+                    tint = if (isMixModeActive) {
+                        MaterialTheme.colorScheme.primary
+                    } else {
+                        MaterialTheme.colorScheme.onSecondaryContainer
+                    },
+                    modifier = Modifier
+                        .alpha(if (isMixModeActive) 1f else 0.6f)
                 )
             }
         }

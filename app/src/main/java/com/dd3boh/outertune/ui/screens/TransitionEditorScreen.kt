@@ -8,65 +8,50 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
+import coil3.compose.AsyncImage
+import com.dd3boh.outertune.db.entities.Song
 import com.dd3boh.outertune.ui.component.BeatMarkerPosition
 import com.dd3boh.outertune.ui.component.WaveformView
+import com.dd3boh.outertune.utils.makeTimeString
+import com.dd3boh.outertune.viewmodels.TransitionEditorViewModel
 
 @Composable
 fun TransitionEditorScreen(
+    songAId: String,
+    songBId: String,
     onCancel: () -> Unit = {},
-    onSave: () -> Unit = {}
+    onSave: () -> Unit = {},
+    viewModel: TransitionEditorViewModel = hiltViewModel()
 ) {
+
+    // Phase 1: Trigger Data Load
+    LaunchedEffect(songAId, songBId) {
+        viewModel.loadData(songAId, songBId)
+    }
+    // Phase 2: Collect Data
+    val track1 by viewModel.track1.collectAsState()
+    val track2 by viewModel.track2.collectAsState()
+    val waveformData1 by viewModel.waveformData1.collectAsState()
+    val waveformData2 by viewModel.waveformData2.collectAsState()
+    val beatMarkers1 by viewModel.beatGrid1.collectAsState()
+    val beatMarkers2 by viewModel.beatGrid2.collectAsState()
+    val zoomFactor1 by viewModel.zoomFactor1.collectAsState()
+    val zoomFactor2 by viewModel.zoomFactor2.collectAsState()
+    val barsCount by viewModel.barsCount.collectAsState()
+
     var selectedTab by remember { mutableStateOf(0) }
     var overlapMode by remember { mutableStateOf("Overlap") }
     var eqMode by remember { mutableStateOf("None") }
     var effectMode by remember { mutableStateOf("Low pass filt...") }
-    var barsCount by remember { mutableStateOf("4 bars") }
 
-    val track1 = remember {
-        Track(
-            title = "Hi",
-            artist = "Vybz Kartel",
-            bpm = 95,
-            duration = "02:38",
-            albumArt = com.yourapp.R.drawable.album_art_1
-        )
-    }
-
-    val track2 = remember {
-        Track(
-            title = "Loodi (feat. Vybz Kartel)",
-            artist = "Shenseea",
-            bpm = 96,
-            duration = "03:12",
-            albumArt = com.yourapp.R.drawable.album_art_2
-        )
-    }
-
-    val beatMarkers1 = remember {
-        (0..10).map { it * 200f }
-    }
-
-    val beatMarkers2 = remember {
-        (0..10).map { it * 200f + 50f }
-    }
-
-    val waveformData1 = remember {
-        FloatArray(2000) { index ->
-            (Math.sin(index * 0.05) * 0.5f + Math.random() * 0.3f).toFloat()
-        }
-    }
-
-    val waveformData2 = remember {
-        FloatArray(2000) { index ->
-            (Math.sin(index * 0.03) * 0.5f + Math.random() * 0.3f).toFloat()
-        }
-    }
 
     Box(
         modifier = Modifier
@@ -85,10 +70,9 @@ fun TransitionEditorScreen(
             Spacer(modifier = Modifier.height(24.dp))
 
             // Track 1 Info
-            TrackInfo(
-                track = track1,
-                modifier = Modifier.padding(horizontal = 16.dp)
-            )
+            track1?.let { song ->
+                TransitionTrackInfo(song = song, modifier = Modifier.padding(horizontal = 16.dp))
+            }
 
             Spacer(modifier = Modifier.height(24.dp))
 
@@ -99,26 +83,32 @@ fun TransitionEditorScreen(
                     .height(400.dp)
             ) {
                 Column {
+                    // Track 1 Waveform - ADD zoomFactor parameter
                     WaveformView(
                         waveformData = waveformData1,
                         beatMarkers = beatMarkers1,
                         markerPosition = BeatMarkerPosition.BOTTOM,
+                        songDurationSeconds = track1?.song?.duration?.toFloat(),
+                        zoomFactor = zoomFactor1, // <-- ADD THIS
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(200.dp)
                     )
 
+                    // Track 2 Waveform - ADD zoomFactor parameter
                     WaveformView(
                         waveformData = waveformData2,
                         beatMarkers = beatMarkers2,
                         markerPosition = BeatMarkerPosition.TOP,
+                        songDurationSeconds = track2?.song?.duration?.toFloat(),
+                        zoomFactor = zoomFactor2, // <-- ADD THIS
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(200.dp)
                     )
                 }
 
-                // Transition Overlay
+                // Transition Overlay (Fixed center window)
                 Box(
                     modifier = Modifier
                         .width(200.dp)
@@ -131,32 +121,19 @@ fun TransitionEditorScreen(
                 )
             }
 
-            // Bars Dropdown
-            Box(
+
+            BarsDropdown(
+                selectedBars = barsCount,
+                onBarsSelected = { viewModel.setBarsCount(it) },
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(vertical = 16.dp),
-                contentAlignment = Alignment.Center
-            ) {
-                Surface(
-                    shape = RoundedCornerShape(8.dp),
-                    color = Color(0xFF2C2C2C)
-                ) {
-                    Text(
-                        text = "$barsCount ⌄",
-                        color = Color.White,
-                        fontSize = 14.sp,
-                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
-                    )
-                }
-            }
+                    .padding(vertical = 16.dp)
+            )
 
             // Track 2 Info
-            TrackInfo(
-                track = track2,
-                showDurationBadge = false,
-                modifier = Modifier.padding(horizontal = 16.dp)
-            )
+            track2?.let { song ->
+                TransitionTrackInfo(song = song, showDurationBadge = false, modifier = Modifier.padding(horizontal = 16.dp))
+            }
 
             Spacer(modifier = Modifier.weight(1f))
 
@@ -231,6 +208,8 @@ fun TopBar(
     }
 }
 
+// NOTE: This composable seems unused now, as you are using TransitionTrackInfo.
+// You can remove it if you wish.
 @Composable
 fun TrackInfo(
     track: Track,
@@ -294,6 +273,118 @@ fun TrackInfo(
                     text = track.duration,
                     color = Color.White,
                     fontSize = 14.sp
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun TransitionTrackInfo(
+    song: Song,
+    showDurationBadge: Boolean = true,
+    modifier: Modifier = Modifier
+) {
+    Row(
+        modifier = modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        // FIX: Access .song.getThumbnailModel()
+        AsyncImage(
+            model = song.song.getThumbnailModel(),
+            contentDescription = "Album Art",
+            modifier = Modifier.size(60.dp).clip(RoundedCornerShape(4.dp)),
+            contentScale = ContentScale.Crop
+        )
+
+        Spacer(modifier = Modifier.width(12.dp))
+
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = song.title, // Accessing from wrapper (overridden property) is fine
+                color = Color.White,
+                fontSize = 18.sp,
+                fontWeight = FontWeight.Bold,
+                maxLines = 1
+            )
+            Text(
+                text = song.artists.joinToString { it.name }, // Accessing from wrapper is fine
+                color = Color(0xFFAAAAAA),
+                fontSize = 14.sp,
+                maxLines = 1
+            )
+        }
+
+        Column(horizontalAlignment = Alignment.End) {
+            // FIX: Access .song.bpm
+            Text(
+                text = song.song.bpm?.let { "${it.toInt()} bpm" } ?: "-- bpm",
+                color = Color.White,
+                fontSize = 12.sp
+            )
+
+            // FIX: Access .song.key
+            song.song.key?.let { key ->
+                Text(text = key, color = Color.Gray, fontSize = 12.sp)
+            }
+
+            if (showDurationBadge) {
+                Spacer(modifier = Modifier.height(4.dp))
+                Surface(
+                    shape = RoundedCornerShape(4.dp),
+                    color = Color(0xFF3949AB)
+                ) {
+                    // FIX: Access .song.duration
+                    Text(
+                        text = makeTimeString(song.song.duration * 1000L),
+                        color = Color.White,
+                        fontSize = 14.sp,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                    )
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun BarsDropdown(
+    selectedBars: Int,
+    onBarsSelected: (Int) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val barsOptions = listOf(2, 4, 8, 16, 32)
+    var expanded by remember { mutableStateOf(false) }
+
+    Box(
+        modifier = modifier,
+        contentAlignment = Alignment.Center
+    ) {
+        Surface(
+            shape = RoundedCornerShape(8.dp),
+            color = Color(0xFF2C2C2C),
+            onClick = { expanded = !expanded }
+        ) {
+            Text(
+                text = "$selectedBars bars ⌄",
+                color = Color.White,
+                fontSize = 14.sp,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+            )
+        }
+
+        DropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { expanded = false }
+        ) {
+            barsOptions.forEach { bars ->
+                DropdownMenuItem(
+                    text = { Text("$bars bars") },
+                    onClick = {
+                        onBarsSelected(bars)
+                        expanded = false
+                    }
                 )
             }
         }
@@ -452,6 +543,7 @@ fun DropdownOption(
     }
 }
 
+// NOTE: This class also seems unused now.
 data class Track(
     val title: String,
     val artist: String,

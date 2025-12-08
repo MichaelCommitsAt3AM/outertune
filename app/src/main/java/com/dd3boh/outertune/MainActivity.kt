@@ -148,6 +148,7 @@ import com.dd3boh.outertune.ui.screens.MoodAndGenresScreen
 import com.dd3boh.outertune.ui.screens.Screens
 import com.dd3boh.outertune.ui.screens.SetupWizard
 import com.dd3boh.outertune.ui.screens.StatsScreen
+import com.dd3boh.outertune.ui.screens.TransitionEditorScreen
 import com.dd3boh.outertune.ui.screens.YouTubeBrowseScreen
 import com.dd3boh.outertune.ui.screens.artist.ArtistAlbumsScreen
 import com.dd3boh.outertune.ui.screens.artist.ArtistItemsScreen
@@ -720,6 +721,27 @@ class MainActivity : ComponentActivity() {
                                     ) {
                                         YouTubeBrowseScreen(navController, scrollBehavior)
                                     }
+
+                                    composable(
+                                        route = "transition_editor/{songAId}/{songBId}",
+                                        arguments = listOf(
+                                            navArgument("songAId") { type = NavType.StringType },
+                                            navArgument("songBId") { type = NavType.StringType }
+                                        )
+                                    ) { backStackEntry ->
+                                        val songAId = backStackEntry.arguments?.getString("songAId") ?: return@composable
+                                        val songBId = backStackEntry.arguments?.getString("songBId") ?: return@composable
+
+                                        TransitionEditorScreen(
+                                            songAId = songAId,
+                                            songBId = songBId,
+                                            onCancel = { navController.popBackStack() },
+                                            onSave = {
+                                                // Save logic handled in ViewModel/Screen
+                                                navController.popBackStack()
+                                            }
+                                        )
+                                    }
                                     composable("settings") {
                                         SettingsScreen(navController, scrollBehavior)
                                     }
@@ -769,6 +791,30 @@ class MainActivity : ComponentActivity() {
                                     composable("setup_wizard") {
                                         SetupWizard(navController)
                                     }
+
+                                    composable(
+                                        route = "transition_editor/{songAId}/{songBId}",
+                                        arguments = listOf(
+                                            navArgument("songAId") { type = NavType.StringType },
+                                            navArgument("songBId") { type = NavType.StringType }
+                                        )
+                                    ) { backStackEntry ->
+                                        val songAId = backStackEntry.arguments?.getString("songAId") ?: return@composable
+                                        val songBId = backStackEntry.arguments?.getString("songBId") ?: return@composable
+
+                                        // Import the screen appropriately
+                                        com.dd3boh.outertune.ui.screens.TransitionEditorScreen(
+                                            songAId = songAId,
+                                            songBId = songBId,
+                                            onCancel = { navController.popBackStack() },
+                                            onSave = {
+                                                // Save logic to be implemented in Phase 3
+                                                navController.popBackStack()
+                                            }
+                                        )
+                                    }
+
+
                                 }
                             }
 
@@ -965,18 +1011,28 @@ class MainActivity : ComponentActivity() {
                             // phone
                             navHost()
 
-                            SearchBarContainer(navController, scrollBehavior)
 
-                            if (oobeStatus >= OOBE_VERSION) {
-                                BottomSheetPlayer(
-                                    state = playerBottomSheetState,
-                                    navController = navController
-                                )
 
-                                if (!useNavRail) {
-                                    navbar()
-                                } else {
-                                    navRail(if (LocalLayoutDirection.current == LayoutDirection.Rtl) Alignment.BottomEnd else Alignment.BottomStart)
+                            // Check if we are on the Transition Editor screen
+                            val currentRoute = navBackStackEntry?.destination?.route
+                            val isTransitionEditor = currentRoute?.startsWith("transition_editor") == true
+
+                            // Hide SearchBar and Bottom Player/Nav if on Transition Editor
+                            if (!isTransitionEditor) {
+                                // Keep this one inside the check
+                                SearchBarContainer(navController, scrollBehavior)
+
+                                if (oobeStatus >= OOBE_VERSION) {
+                                    BottomSheetPlayer(
+                                        state = playerBottomSheetState,
+                                        navController = navController
+                                    )
+
+                                    if (!useNavRail) {
+                                        navbar()
+                                    } else {
+                                        navRail(if (LocalLayoutDirection.current == LayoutDirection.Rtl) Alignment.BottomEnd else Alignment.BottomStart)
+                                    }
                                 }
                             }
                             bottomSheetMenu()
