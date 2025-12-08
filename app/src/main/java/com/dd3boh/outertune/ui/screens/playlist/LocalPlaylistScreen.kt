@@ -643,6 +643,7 @@ fun LocalPlaylistScreen(
                                 )
                             },
                             dragHandleModifier = if (sortType == PlaylistSongSortType.CUSTOM && !locked && !isSearching && editable) Modifier.draggableHandle() else null,
+                            isMixModeActive = playlistWithSongs.first?.playlist?.isMixModeActive == true,
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .background(MaterialTheme.colorScheme.background),

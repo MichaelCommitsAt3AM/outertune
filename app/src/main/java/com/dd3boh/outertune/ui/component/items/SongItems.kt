@@ -98,6 +98,7 @@ fun SongListItem(
     thumbnailSize: Int,
     onPlay: () -> Unit,
     dragHandleModifier: Modifier? = null,
+    isMixModeActive: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
     val menuState = LocalMenuState.current
@@ -108,12 +109,10 @@ fun SongListItem(
         ListItem(
             title = song.song.title,
             subtitle = joinByBullet(
-                // (if (BuildConfig.DEBUG) song.song.id else ""),
                 song.artists.joinToString { it.name },
                 makeTimeString(song.song.duration * 1000L),
-                song.song.bpm?.let { "%.0f BPM".format(it) } ?: "",
-                song.song.key ?: ""
-
+                if (isMixModeActive) song.song.bpm?.let { "%.0f BPM".format(it) } ?: "" else null,
+                if (isMixModeActive) song.song.key ?: "" else null
             ),
             badges = {
                 if (showLikedIcon && song.song.liked) {
