@@ -15,6 +15,8 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
 import coil3.compose.AsyncImage
 import com.dd3boh.outertune.db.entities.Song
@@ -57,6 +59,7 @@ fun TransitionEditorScreen(
         modifier = Modifier
             .fillMaxSize()
             .background(Color.Black)
+            .windowInsetsPadding(WindowInsets.safeDrawing)
     ) {
         Column(
             modifier = Modifier.fillMaxSize()
@@ -80,7 +83,7 @@ fun TransitionEditorScreen(
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(400.dp)
+                    .height(300.dp)
             ) {
                 Column {
                     // Track 1 Waveform - ADD zoomFactor parameter
@@ -92,7 +95,7 @@ fun TransitionEditorScreen(
                         zoomFactor = zoomFactor1, // <-- ADD THIS
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(200.dp)
+                            .height(150.dp)
                     )
 
                     // Track 2 Waveform - ADD zoomFactor parameter
@@ -104,7 +107,7 @@ fun TransitionEditorScreen(
                         zoomFactor = zoomFactor2, // <-- ADD THIS
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(200.dp)
+                            .height(150.dp)
                     )
                 }
 
@@ -185,17 +188,6 @@ fun TopBar(
 
             Spacer(modifier = Modifier.height(4.dp))
 
-            Surface(
-                shape = RoundedCornerShape(4.dp),
-                color = Color(0xFF4CAF50)
-            ) {
-                Text(
-                    text = "Beta",
-                    color = Color.Black,
-                    fontSize = 12.sp,
-                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
-                )
-            }
         }
 
         TextButton(onClick = onSave) {
@@ -204,77 +196,6 @@ fun TopBar(
                 color = Color(0xFF4CAF50),
                 fontSize = 16.sp
             )
-        }
-    }
-}
-
-// NOTE: This composable seems unused now, as you are using TransitionTrackInfo.
-// You can remove it if you wish.
-@Composable
-fun TrackInfo(
-    track: Track,
-    showDurationBadge: Boolean = true,
-    modifier: Modifier = Modifier
-) {
-    Row(
-        modifier = modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Image(
-            painter = painterResource(id = track.albumArt),
-            contentDescription = "Album Art",
-            modifier = Modifier.size(60.dp),
-            contentScale = ContentScale.Crop
-        )
-
-        Spacer(modifier = Modifier.width(12.dp))
-
-        Column(
-            modifier = Modifier.weight(1f)
-        ) {
-            Text(
-                text = track.title,
-                color = Color.White,
-                fontSize = 18.sp,
-                fontWeight = FontWeight.Bold
-            )
-
-            Text(
-                text = track.artist,
-                color = Color(0xFFAAAAAA),
-                fontSize = 14.sp
-            )
-        }
-
-        Column(
-            horizontalAlignment = Alignment.End
-        ) {
-            Text(
-                text = "${track.bpm} bpm",
-                color = Color.White,
-                fontSize = 12.sp
-            )
-
-            if (showDurationBadge) {
-                Spacer(modifier = Modifier.height(4.dp))
-                Surface(
-                    shape = RoundedCornerShape(4.dp),
-                    color = Color(0xFF3949AB)
-                ) {
-                    Text(
-                        text = track.duration,
-                        color = Color.White,
-                        fontSize = 14.sp,
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
-                    )
-                }
-            } else {
-                Text(
-                    text = track.duration,
-                    color = Color.White,
-                    fontSize = 14.sp
-                )
-            }
         }
     }
 }
@@ -404,72 +325,303 @@ fun ControlPanel(
     onEffectModeChanged: (String) -> Unit,
     modifier: Modifier = Modifier
 ) {
+    var showBottomSheet by remember { mutableStateOf(false) }
+    val sheetState = rememberModalBottomSheetState()
+
+    // Main Control Panel
     Surface(
         modifier = modifier.fillMaxWidth(),
         shape = RoundedCornerShape(12.dp),
         color = Color(0xFF1C1C1C),
         border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF333333))
     ) {
-        Column(
-            modifier = Modifier.padding(16.dp)
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(12.dp),
+            horizontalArrangement = Arrangement.SpaceEvenly
         ) {
-            // Tabs
+            TabButton(
+                text = "Volume",
+                selected = selectedTab == 0,
+                onClick = {
+                    onTabSelected(0)
+                    showBottomSheet = true
+                },
+                modifier = Modifier.weight(1f)
+            )
+
+            TabButton(
+                text = "EQ",
+                selected = selectedTab == 1,
+                onClick = {
+                    onTabSelected(1)
+                    showBottomSheet = true
+                },
+                modifier = Modifier.weight(1f)
+            )
+
+            TabButton(
+                text = "Effect",
+                selected = selectedTab == 2,
+                onClick = {
+                    onTabSelected(2)
+                    showBottomSheet = true
+                },
+                modifier = Modifier.weight(1f)
+            )
+        }
+    }
+
+    // Modal Bottom Sheet with drag-to-dismiss
+    if (showBottomSheet) {
+        ModalBottomSheet(
+            onDismissRequest = { showBottomSheet = false },
+            sheetState = sheetState,
+            containerColor = Color(0xFF1E1E1E),
+            shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp),
+            dragHandle = {
+                // Custom drag handle
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 12.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .width(40.dp)
+                            .height(4.dp)
+                            .background(Color(0xFF4A4A4A), RoundedCornerShape(2.dp))
+                    )
+                }
+            }
+        ) {
+            BottomSheetContent(
+                selectedTab = selectedTab,
+                overlapMode = overlapMode,
+                onOverlapModeChanged = {
+                    onOverlapModeChanged(it)
+                    showBottomSheet = false
+                },
+                eqMode = eqMode,
+                onEqModeChanged = {
+                    onEqModeChanged(it)
+                    showBottomSheet = false
+                },
+                effectMode = effectMode,
+                onEffectModeChanged = {
+                    onEffectModeChanged(it)
+                    showBottomSheet = false
+                }
+            )
+        }
+    }
+}
+
+@Composable
+fun BottomSheetContent(
+    selectedTab: Int,
+    overlapMode: String,
+    onOverlapModeChanged: (String) -> Unit,
+    eqMode: String,
+    onEqModeChanged: (String) -> Unit,
+    effectMode: String,
+    onEffectModeChanged: (String) -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(bottom = 20.dp)
+    ) {
+        // Title based on selected tab
+        val title = when (selectedTab) {
+            0 -> "Overlap Mode"
+            1 -> "EQ Mode"
+            else -> "Effect Mode"
+        }
+
+        Text(
+            text = title,
+            color = Color.White,
+            fontSize = 20.sp,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.padding(horizontal = 24.dp)
+        )
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        // Options based on tab
+        when (selectedTab) {
+            0 -> {
+                listOf("Overlap", "Crossfade", "Cut").forEach { option ->
+                    ModernOptionItem(
+                        text = option,
+                        selected = option == overlapMode,
+                        onClick = { onOverlapModeChanged(option) },
+                        icon = when (option) {
+                            "Overlap" -> "○○"
+                            "Crossfade" -> "◐◑"
+                            else -> "●○"
+                        }
+                    )
+                }
+            }
+            1 -> {
+                listOf("None", "Centre Bass swap", "End Bass Swap", "Onset Bass Swap").forEach { option ->
+                    ModernOptionItem(
+                        text = option,
+                        selected = option == eqMode,
+                        onClick = { onEqModeChanged(option) },
+                        icon = when (option) {
+                            "None" -> "─"
+                            "Low pass" -> "⌄"
+                            "High pass" -> "⌃"
+                            else -> "◇"
+                        }
+                    )
+                }
+            }
+            2 -> {
+                listOf("None", "Low pass in", "Low Pass out", "High Pass in", "High Pass Out").forEach { option ->
+                    ModernOptionItem(
+                        text = option,
+                        selected = option == effectMode,
+                        onClick = { onEffectModeChanged(option) },
+                        icon = when (option) {
+                            "None" -> "─"
+                            "Low pass in" -> "x"
+                            "Low Pass out" -> "y"
+                            "High Pass in" -> "z"
+                            "High Pass Out" -> "d"
+                            else -> "∿"
+                        }
+                    )
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(8.dp))
+    }
+}
+
+@Composable
+fun ModernOptionItem(
+    text: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+    icon: String
+) {
+    Surface(
+        onClick = onClick,
+        color = if (selected) Color(0xFF2A2A2A) else Color.Transparent,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 4.dp),
+        shape = RoundedCornerShape(12.dp)
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 16.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
             Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceEvenly
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(16.dp)
             ) {
-                TabItem(
-                    text = "Volume",
-                    selected = selectedTab == 0,
-                    onClick = { onTabSelected(0) },
-                    modifier = Modifier.weight(1f)
-                )
+                // Icon circle
+                Box(
+                    modifier = Modifier
+                        .size(40.dp)
+                        .background(
+                            color = if (selected) Color(0xFF4CAF50).copy(alpha = 0.2f)
+                            else Color(0xFF2A2A2A),
+                            shape = RoundedCornerShape(20.dp)
+                        ),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = icon,
+                        color = if (selected) Color(0xFF4CAF50) else Color(0xFF8A8A8A),
+                        fontSize = 18.sp
+                    )
+                }
 
-                TabItem(
-                    text = "EQ",
-                    selected = selectedTab == 1,
-                    onClick = { onTabSelected(1) },
-                    modifier = Modifier.weight(1f)
-                )
-
-                TabItem(
-                    text = "Effect",
-                    selected = selectedTab == 2,
-                    onClick = { onTabSelected(2) },
-                    modifier = Modifier.weight(1f)
+                // Option text
+                Text(
+                    text = text,
+                    color = if (selected) Color.White else Color(0xFFB0B0B0),
+                    fontSize = 16.sp,
+                    fontWeight = if (selected) FontWeight.Medium else FontWeight.Normal
                 )
             }
 
-            Spacer(modifier = Modifier.height(16.dp))
+            // Selection indicator
+            if (selected) {
+                Box(
+                    modifier = Modifier
+                        .size(24.dp)
+                        .background(Color(0xFF4CAF50), RoundedCornerShape(12.dp)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = "✓",
+                        color = Color.White,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+        }
+    }
+}
 
-            // Dropdowns
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceEvenly
-            ) {
-                DropdownOption(
-                    value = overlapMode,
-                    options = listOf("Overlap", "Crossfade", "Cut"),
-                    onValueChange = onOverlapModeChanged,
-                    modifier = Modifier.weight(1f)
-                )
 
-                Spacer(modifier = Modifier.width(8.dp))
 
-                DropdownOption(
-                    value = eqMode,
-                    options = listOf("None", "Low pass", "High pass", "Band pass"),
-                    onValueChange = onEqModeChanged,
-                    modifier = Modifier.weight(1f)
-                )
+@Composable
+fun OptionHeader(text: String) {
+    Text(
+        text = text,
+        color = Color.Gray,
+        fontSize = 13.sp,
+        fontWeight = FontWeight.Medium,
+        modifier = Modifier.padding(horizontal = 20.dp)
+    )
+}
 
-                Spacer(modifier = Modifier.width(8.dp))
+@Composable
+fun OptionItem(
+    text: String,
+    selected: Boolean,
+    onClick: () -> Unit
+) {
+    Surface(
+        onClick = onClick,
+        color = Color.Transparent,
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 20.dp, vertical = 14.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = text,
+                color = if (selected) Color(0xFF4CAF50) else Color.White,
+                fontSize = 15.sp,
+                fontWeight = if (selected) FontWeight.Medium else FontWeight.Normal
+            )
 
-                DropdownOption(
-                    value = effectMode,
-                    options = listOf("Low pass filt...", "Echo", "Reverb", "None"),
-                    onValueChange = onEffectModeChanged,
-                    modifier = Modifier.weight(1f)
+            if (selected) {
+                Icon(
+                    painter = painterResource(android.R.drawable.checkbox_on_background),
+                    contentDescription = "Selected",
+                    tint = Color(0xFF4CAF50),
+                    modifier = Modifier.size(20.dp)
                 )
             }
         }
@@ -477,78 +629,35 @@ fun ControlPanel(
 }
 
 @Composable
-fun TabItem(
+fun TabButton(
     text: String,
     selected: Boolean,
     onClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    TextButton(
+    Surface(
         onClick = onClick,
-        modifier = modifier
+        modifier = modifier,
+        color = Color.Transparent
     ) {
-        Text(
-            text = text,
-            color = if (selected) Color(0xFF4CAF50) else Color.White,
-            fontSize = 14.sp
-        )
-    }
-}
-
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-fun DropdownOption(
-    value: String,
-    options: List<String>,
-    onValueChange: (String) -> Unit,
-    modifier: Modifier = Modifier
-) {
-    var expanded by remember { mutableStateOf(false) }
-
-    ExposedDropdownMenuBox(
-        expanded = expanded,
-        onExpandedChange = { expanded = it },
-        modifier = modifier
-    ) {
-        TextField(
-            value = value,
-            onValueChange = {},
-            readOnly = true,
-            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
-            modifier = Modifier
-                .menuAnchor()
-                .fillMaxWidth(),
-            colors = TextFieldDefaults.colors(
-                focusedContainerColor = Color(0xFF2C2C2C),
-                unfocusedContainerColor = Color(0xFF2C2C2C),
-                focusedTextColor = Color.White,
-                unfocusedTextColor = Color.White
-            )
-        )
-
-        ExposedDropdownMenu(
-            expanded = expanded,
-            onDismissRequest = { expanded = false }
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier = Modifier.padding(vertical = 8.dp)
         ) {
-            options.forEach { option ->
-                DropdownMenuItem(
-                    text = { Text(option) },
-                    onClick = {
-                        onValueChange(option)
-                        expanded = false
-                    }
+            Text(
+                text = text,
+                color = if (selected) Color(0xFF4CAF50) else Color.White,
+                fontSize = 14.sp
+            )
+            if (selected) {
+                Spacer(modifier = Modifier.height(4.dp))
+                Box(
+                    modifier = Modifier
+                        .width(24.dp)
+                        .height(2.dp)
+                        .background(Color(0xFF4CAF50), RoundedCornerShape(1.dp))
                 )
             }
         }
     }
 }
-
-// NOTE: This class also seems unused now.
-data class Track(
-    val title: String,
-    val artist: String,
-    val bpm: Int,
-    val duration: String,
-    val albumArt: Int,
-    val audioFile: String? = null
-)
