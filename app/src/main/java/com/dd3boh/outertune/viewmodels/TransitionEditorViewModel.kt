@@ -230,23 +230,45 @@ class TransitionEditorViewModel @Inject constructor(
     ): FloatArray {
         if (waveform.isEmpty() || beatGrid.size < 2 || songDurationSeconds <= 0f) return FloatArray(0)
 
-        val out = ArrayList<Float>( (beatGrid.size - 1) * pixelsPerBeat )
-
+        // Pre-allocate exact size to avoid resizing overhead
+        val out = ArrayList<Float>((beatGrid.size - 1) * pixelsPerBeat)
         val waveformSize = waveform.size
+
         for (i in 0 until beatGrid.size - 1) {
             val startTime = beatGrid[i].coerceAtLeast(0f)
             val endTime = beatGrid[i + 1].coerceAtMost(songDurationSeconds)
 
+            // Map time to indices in the raw waveform array
             val startIndex = ((startTime / songDurationSeconds) * waveformSize).toInt().coerceIn(0, waveformSize - 1)
             val endIndex = ((endTime / songDurationSeconds) * waveformSize).toInt().coerceIn(0, waveformSize)
 
+            // How many raw samples represent this ONE beat?
             val segmentLength = (endIndex - startIndex).coerceAtLeast(1)
 
-            // Simple nearest sampling for speed (you can improve with linear interpolation)
             for (px in 0 until pixelsPerBeat) {
-                val t = px.toFloat() / pixelsPerBeat.toFloat()
-                val sampleIndex = startIndex + (t * segmentLength).toInt().coerceIn(0, segmentLength - 1)
-                out.add(waveform[sampleIndex])
+                // Calculate which raw samples cover this specific pixel
+                val pixelStartPct = px.toFloat() / pixelsPerBeat
+                val pixelEndPct = (px + 1).toFloat() / pixelsPerBeat
+
+                val rawStartOffset = (pixelStartPct * segmentLength).toInt()
+                val rawEndOffset = (pixelEndPct * segmentLength).toInt()
+
+                val searchStart = (startIndex + rawStartOffset).coerceIn(0, waveformSize - 1)
+                val searchEnd = (startIndex + rawEndOffset).coerceIn(searchStart, waveformSize)
+
+                // PEAK DETECTION: Find the loudest sample in this range
+                var maxAmp = 0f
+                // Optimization: Don't loop if the range is 0 (shouldn't happen often)
+                if (searchStart == searchEnd) {
+                    maxAmp = abs(waveform[searchStart])
+                } else {
+                    for (k in searchStart until searchEnd) {
+                        val amp = abs(waveform[k])
+                        if (amp > maxAmp) maxAmp = amp
+                    }
+                }
+
+                out.add(maxAmp)
             }
         }
 

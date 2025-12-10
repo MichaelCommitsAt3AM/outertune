@@ -1,3 +1,5 @@
+// WaveformView.kt
+
 package com.dd3boh.outertune.ui.component
 
 import android.util.Log
@@ -15,71 +17,61 @@ import kotlinx.coroutines.launch
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
-/**
- * WaveformView - supports two modes:
- *  - Beat-domain mode (isBeatDomain = true): waveformData is a beat-domain array
- *    where each element corresponds to roughly one visual pixel. Beats are uniformly spaced:
- *      pixelsPerBeat controls spacing.
- *    beatMarkers should contain the beat indices (0,1,2,...) as Floats and
- *    beatOffsetBeats shifts the deck by a number of beats (positive = move right).
- *
- *  - Time-domain mode (isBeatDomain = false): legacy behavior (kept for fallback).
- */
 @Composable
 fun WaveformView(
     waveformData: FloatArray,
-    beatMarkers: List<Float>,          // in beat-domain mode: beat indices (0,1,2,...)
+    beatMarkers: List<Float>,
     markerPosition: BeatMarkerPosition,
-    songDurationSeconds: Float?,       // in time-domain mode: track duration; in beat-domain mode can be null or ignored
+    songDurationSeconds: Float?,
     modifier: Modifier = Modifier,
-    isBeatDomain: Boolean = true,      // <-- Use beat-domain rendering by default in new system
-    pixelsPerBeat: Float = 48f,        // only used in beat-domain mode
-    beatOffsetBeats: Float = 0f,       // shift deck by this many beats (can be fractional)
+    isBeatDomain: Boolean = true,
+    pixelsPerBeat: Float = 48f,
+    beatOffsetBeats: Float = 0f,
     initialOffset: Float = 0f,
     onOffsetChanged: (Float) -> Unit = {}
 ) {
     val scope = rememberCoroutineScope()
     val horizontalOffset = remember { Animatable(initialOffset) }
 
-    // On some zoom resets we snap offset to center
-    LaunchedEffect(pixelsPerBeat) {
-        // optional: reset offset on big changes
-        // horizontalOffset.snapTo(0f)
+    // --- FIX START ---
+    // The waveform data was generated using pixelsPerBeat.toInt().
+    // We must use that EXACT integer stride for drawing, or markers will drift from the waveform.
+    val effectivePxPerBeat = remember(pixelsPerBeat, isBeatDomain) {
+        if (isBeatDomain) pixelsPerBeat.toInt().toFloat() else pixelsPerBeat
     }
+    // --- FIX END ---
 
     Canvas(
         modifier = modifier.pointerInput(Unit) {
             detectHorizontalDragGestures(
                 onDragEnd = {
-                    // snapping behavior: in beat-domain mode we snap to nearest beat (if available)
-                    if (isBeatDomain && beatMarkers.isNotEmpty()) {
-                        val width = size.width.toFloat()
-                        val totalWidth = if (waveformData.isNotEmpty()) waveformData.size.toFloat() else width
-                        val currentOffset = horizontalOffset.value
-                        val centerPixelInWaveform = -currentOffset + (width / 2f)
+                    if (isBeatDomain) {
+                        val viewCenter = size.width.toFloat() / 2f
+                        val currentScroll = horizontalOffset.value
 
-                        // center beat index in beat-domain coordinates:
-                        val centerBeatIndex = centerPixelInWaveform / pixelsPerBeat
+                        // USE EFFECTIVE PIXELS HERE
+                        val shiftPixels = beatOffsetBeats * effectivePxPerBeat
 
-                        // find closest beat index from beatMarkers (they are indices)
-                        val closestBeatIndex = beatMarkers.minByOrNull { abs(it - centerBeatIndex) }
-                        if (closestBeatIndex != null) {
-                            // compute target center pixel for that beat
-                            val beatOffsetPixels = beatOffsetBeats * pixelsPerBeat
-                            val newCenterPixel = (closestBeatIndex * pixelsPerBeat) + beatOffsetPixels
-                            val targetOffset = -(newCenterPixel - (width / 2f))
-                            scope.launch {
-                                horizontalOffset.animateTo(
-                                    targetValue = targetOffset,
-                                    animationSpec = spring(stiffness = Spring.StiffnessLow)
-                                )
-                                onOffsetChanged(targetOffset)
-                            }
+                        // Calculate exactly which beat is currently under the center line
+                        val exactBeatAtCenter = (viewCenter - currentScroll - shiftPixels) / effectivePxPerBeat
+
+                        val nearestBeatIndex = exactBeatAtCenter.roundToInt()
+
+                        // USE EFFECTIVE PIXELS HERE
+                        val targetScroll = viewCenter - (nearestBeatIndex * effectivePxPerBeat) - shiftPixels
+
+                        scope.launch {
+                            horizontalOffset.animateTo(
+                                targetValue = targetScroll,
+                                animationSpec = spring(stiffness = Spring.StiffnessMediumLow)
+                            )
+                            onOffsetChanged(targetScroll)
                         }
-                    } else if (!isBeatDomain && songDurationSeconds != null && songDurationSeconds > 0f && beatMarkers.isNotEmpty()) {
-                        // legacy snapping: time-domain
+                    }
+                    // Legacy time-domain logic...
+                    else if (!isBeatDomain && songDurationSeconds != null && songDurationSeconds > 0f) {
                         val width = size.width.toFloat()
-                        val totalWaveformWidth = (width * 1f) // zoom / speed handled externally in legacy mode
+                        val totalWaveformWidth = (width * 1f)
                         val currentOffset = horizontalOffset.value
                         val centerPixelInWaveform = -currentOffset + (width / 2f)
                         val centerTimeSeconds = (centerPixelInWaveform / totalWaveformWidth) * songDurationSeconds
@@ -108,6 +100,7 @@ fun WaveformView(
                 }
             }
         }
+
     ) {
         val width = size.width
         val height = size.height
@@ -115,7 +108,7 @@ fun WaveformView(
         val maxAmplitude = height / 2f
         val currentOffset = horizontalOffset.value
 
-        // Center visual line
+        // Center visual line (Anchor)
         drawLine(
             color = Color.White.copy(alpha = 0.8f),
             start = Offset(width / 2f, 0f),
@@ -124,19 +117,18 @@ fun WaveformView(
         )
 
         if (isBeatDomain) {
-            // ---------- BEAT-DOMAIN RENDERER ----------
-            val pxPerBeat = pixelsPerBeat
+            // USE EFFECTIVE PIXELS for drawing
+            val pxPerBeat = effectivePxPerBeat
             val beatOffsetPixels = beatOffsetBeats * pxPerBeat
 
-            // waveformData is already resampled per-pixel in beat-domain.
-            // each element represents one visual pixel (approximately).
             if (waveformData.isNotEmpty()) {
-                // visible window in indices (waveformData index ~ visual pixel)
                 val visibleStartIndex = (-currentOffset).roundToInt().coerceAtLeast(0)
                 val visibleEndIndex = (visibleStartIndex + width.roundToInt()).coerceAtMost(waveformData.size - 1)
 
                 for (i in visibleStartIndex..visibleEndIndex) {
                     val amplitude = waveformData[i]
+                    // 'i' is the index in the array. Since the array was built with an integer stride,
+                    // index 'i' corresponds exactly to pixel 'i' in the "beat domain" timeline.
                     val x = i.toFloat() + currentOffset + beatOffsetPixels
 
                     if (x < -10f || x > width + 10f) continue
@@ -153,14 +145,13 @@ fun WaveformView(
                 }
             }
 
-            // draw beat markers at integer beat indices:
             if (beatMarkers.isNotEmpty()) {
-                beatMarkers.forEachIndexed { index, beatIndexFloat ->
-                    // beatIndexFloat should be e.g. 0f, 1f, 2f... (we accept floats but treat them as indices)
-                    val beatIndex = beatIndexFloat
-                    val x = (beatIndex * pxPerBeat) + currentOffset + beatOffsetPixels
+                beatMarkers.forEachIndexed { _, beatIndexFloat ->
+                    // We simply multiply the index by the integer stride.
+                    // Beat 10 * 48px = 480px. This matches the waveform index 480 exactly.
+                    val x = (beatIndexFloat * pxPerBeat) + currentOffset + beatOffsetPixels
 
-                    val isMajorBeat = (beatIndex.roundToInt() % 4 == 0)
+                    val isMajorBeat = (beatIndexFloat.roundToInt() % 4 == 0)
                     val color = if (isMajorBeat) Color(0xFF4CAF50) else Color.Gray
                     val strokeWidth = if (isMajorBeat) 6f else 3f
                     val lineLength = if (isMajorBeat) 50f else 30f
@@ -186,8 +177,7 @@ fun WaveformView(
             }
 
         } else {
-            // ---------- TIME-DOMAIN / LEGACY RENDERER ----------
-            // Keep previous behaviour (time -> pixel mapping)
+            // TIME-DOMAIN / LEGACY RENDERER (Unchanged)
             if (waveformData.isNotEmpty() && songDurationSeconds != null && songDurationSeconds > 0f) {
                 val pixelsPerSample = (width * 1f) / waveformData.size
                 val visibleStartPixel = -currentOffset
@@ -245,6 +235,14 @@ fun WaveformView(
                 }
             }
         }
+
+        // Red Center Line (Always on top)
+        drawLine(
+            color = Color.Red,
+            start = Offset(width / 2f, 0f),
+            end = Offset(width / 2f, height),
+            strokeWidth = 4f
+        )
     }
 }
 
