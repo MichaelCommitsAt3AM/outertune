@@ -886,7 +886,11 @@ class MusicService : MediaLibraryService(),
         val currentMetadata = player.currentMetadata ?: return
         val currentId = currentMetadata.id
 
-        // 1. LOOKAHEAD: Prepare next song if we are close to end (e.g., 20s left)
+        // Retrieve current song object to get BPM
+        val currentSongObj = database.song(currentId).first()?.song
+        val currentBpm = currentSongObj?.bpm?.toFloat()
+
+        // 1. LOOKAHEAD: Prepare next song if 20s left
         // Check if we are in "Mix Mode" for this playlist
         // Note: You need to read 'isMixModeActive' from DB or Cache here.
         // For PoC, let's assume TRUE or check a simple flag.
@@ -899,11 +903,29 @@ class MusicService : MediaLibraryService(),
 
                 if (transition != null) {
                     Log.d(TAG, "Mixer: Found transition to ${nextSong.title}")
+
+                    // --- BPM MATCHING LOGIC ---
+                    var speedMultiplier: Float? = null
+
+                    // Fetch next song details for BPM
+                    val nextSongObj = database.song(nextSong.id).first()?.song
+                    val nextBpm = nextSongObj?.bpm?.toFloat()
+
+                    if (currentBpm != null && nextBpm != null && currentBpm > 0 && nextBpm > 0) {
+                        val diff = kotlin.math.abs(currentBpm - nextBpm)
+                        if (diff <= 15f) {
+                            // Calculate multiplier to make Next Song match Current Song's speed
+                            // Target Speed = Current BPM
+                            // Multiplier = Target / Original
+                            speedMultiplier = currentBpm / nextBpm
+                            Log.i(TAG, "Beatmatch: Adjusting ${nextSong.title} (BPM $nextBpm) to match $currentBpm. Speed: $speedMultiplier")
+                        }
+                    }
                     withContext(Dispatchers.Main) {
                         deckManager.prepareNext(
                             nextSong.toMediaItem(),
                             transition.entryPointMs,
-                            null
+                            speedMultiplier
                         )
                     }
                     nextSongPreparedId = currentId // Mark as handled for this song

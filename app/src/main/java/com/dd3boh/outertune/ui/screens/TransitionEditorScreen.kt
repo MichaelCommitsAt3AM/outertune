@@ -1,7 +1,7 @@
 package com.dd3boh.outertune.ui.screens
 
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
@@ -15,9 +15,8 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
+import androidx.media3.common.util.Log
 import coil3.compose.AsyncImage
 import com.dd3boh.outertune.db.entities.Song
 import com.dd3boh.outertune.ui.component.BeatMarkerPosition
@@ -33,27 +32,43 @@ fun TransitionEditorScreen(
     onSave: () -> Unit = {},
     viewModel: TransitionEditorViewModel = hiltViewModel()
 ) {
-
-    // Phase 1: Trigger Data Load
+    // Load tracks when IDs change
     LaunchedEffect(songAId, songBId) {
         viewModel.loadData(songAId, songBId)
     }
-    // Phase 2: Collect Data
+
+    // Collect state from ViewModel
     val track1 by viewModel.track1.collectAsState()
     val track2 by viewModel.track2.collectAsState()
-    val waveformData1 by viewModel.waveformData1.collectAsState()
-    val waveformData2 by viewModel.waveformData2.collectAsState()
-    val beatMarkers1 by viewModel.beatGrid1.collectAsState()
-    val beatMarkers2 by viewModel.beatGrid2.collectAsState()
-    val zoomFactor1 by viewModel.zoomFactor1.collectAsState()
-    val zoomFactor2 by viewModel.zoomFactor2.collectAsState()
+
+    // FIX: Use beat domain data
+    val waveformData1 by viewModel.waveformBeatDomain1.collectAsState()
+    val waveformData2 by viewModel.waveformBeatDomain2.collectAsState()
+
+    // FIX: Use generic beat indices (0, 1, 2...) instead of raw time grids
+    val beatIndices by viewModel.beatGridIndices.collectAsState(initial = emptyList())
+
+    // FIX: Use pixelsPerBeat instead of zoomFactor
+    val pixelsPerBeat by viewModel.pixelsPerBeatBase.collectAsState()
+
+    // FIX: Get offset for Track 2
+    val beatOffsetTrack2 by viewModel.beatOffsetForTrack2.collectAsState()
+
     val barsCount by viewModel.barsCount.collectAsState()
+    val transitionDuration by viewModel.transitionDurationSeconds.collectAsState()
+    val transitionWidthFraction by viewModel.transitionWidthFraction.collectAsState()
 
     var selectedTab by remember { mutableStateOf(0) }
     var overlapMode by remember { mutableStateOf("Overlap") }
     var eqMode by remember { mutableStateOf("None") }
     var effectMode by remember { mutableStateOf("Low pass filt...") }
 
+    LaunchedEffect(waveformData1, waveformData2, track1, track2) {
+        Log.d("TransitionEditor", "Waveform1 size: ${waveformData1.size}")
+        Log.d("TransitionEditor", "Waveform2 size: ${waveformData2.size}")
+        Log.d("TransitionEditor", "Track1 duration: ${track1?.song?.duration}")
+        Log.d("TransitionEditor", "Track2 duration: ${track2?.song?.duration}")
+    }
 
     Box(
         modifier = Modifier
@@ -61,70 +76,32 @@ fun TransitionEditorScreen(
             .background(Color.Black)
             .windowInsetsPadding(WindowInsets.safeDrawing)
     ) {
-        Column(
-            modifier = Modifier.fillMaxSize()
-        ) {
+        Column(modifier = Modifier.fillMaxSize()) {
             // Top Bar
-            TopBar(
-                onCancel = onCancel,
-                onSave = onSave
-            )
+            TopBar(onCancel, onSave)
 
             Spacer(modifier = Modifier.height(24.dp))
 
             // Track 1 Info
-            track1?.let { song ->
-                TransitionTrackInfo(song = song, modifier = Modifier.padding(horizontal = 16.dp))
-            }
+            track1?.let { TransitionTrackInfo(it, modifier = Modifier.padding(horizontal = 16.dp)) }
 
             Spacer(modifier = Modifier.height(24.dp))
 
-            // Waveforms
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(300.dp)
-            ) {
-                Column {
-                    // Track 1 Waveform - ADD zoomFactor parameter
-                    WaveformView(
-                        waveformData = waveformData1,
-                        beatMarkers = beatMarkers1,
-                        markerPosition = BeatMarkerPosition.BOTTOM,
-                        songDurationSeconds = track1?.song?.duration?.toFloat(),
-                        zoomFactor = zoomFactor1, // <-- ADD THIS
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(150.dp)
-                    )
+            // Waveforms with transition overlay
+            WaveformsSection(
+                track1 = track1,
+                track2 = track2,
+                waveformData1 = waveformData1,
+                waveformData2 = waveformData2,
+                beatMarkers = beatIndices, // Pass indices (0f, 1f, 2f...)
+                beatOffsetTrack2 = beatOffsetTrack2, // Pass offset
+                pixelsPerBeat = pixelsPerBeat,
+                transitionWidthFraction = transitionWidthFraction,
+                transitionDuration = transitionDuration,
+                barsCount = barsCount
+            )
 
-                    // Track 2 Waveform - ADD zoomFactor parameter
-                    WaveformView(
-                        waveformData = waveformData2,
-                        beatMarkers = beatMarkers2,
-                        markerPosition = BeatMarkerPosition.TOP,
-                        songDurationSeconds = track2?.song?.duration?.toFloat(),
-                        zoomFactor = zoomFactor2, // <-- ADD THIS
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(150.dp)
-                    )
-                }
-
-                // Transition Overlay (Fixed center window)
-                Box(
-                    modifier = Modifier
-                        .width(200.dp)
-                        .fillMaxHeight()
-                        .align(Alignment.Center)
-                        .background(
-                            color = Color.Black.copy(alpha = 0.25f),
-                            shape = RoundedCornerShape(4.dp)
-                        )
-                )
-            }
-
-
+            // Bars selector
             BarsDropdown(
                 selectedBars = barsCount,
                 onBarsSelected = { viewModel.setBarsCount(it) },
@@ -134,9 +111,7 @@ fun TransitionEditorScreen(
             )
 
             // Track 2 Info
-            track2?.let { song ->
-                TransitionTrackInfo(song = song, showDurationBadge = false, modifier = Modifier.padding(horizontal = 16.dp))
-            }
+            track2?.let { TransitionTrackInfo(it, showDurationBadge = false, modifier = Modifier.padding(horizontal = 16.dp)) }
 
             Spacer(modifier = Modifier.weight(1f))
 
@@ -152,6 +127,96 @@ fun TransitionEditorScreen(
                 onEffectModeChanged = { effectMode = it },
                 modifier = Modifier.padding(16.dp)
             )
+        }
+    }
+}
+
+@Composable
+fun WaveformsSection(
+    track1: Song?,
+    track2: Song?,
+    waveformData1: FloatArray, // Changed List<Float> to FloatArray to match ViewModel
+    waveformData2: FloatArray,
+    beatMarkers: List<Float>,
+    beatOffsetTrack2: Float,
+    pixelsPerBeat: Float,
+    transitionWidthFraction: Float,
+    transitionDuration: Float,
+    barsCount: Int
+) {
+    Box(modifier = Modifier.fillMaxWidth().height(300.dp)) {
+        Column {
+            // Track 1 waveform
+            WaveformView(
+                waveformData = waveformData1,
+                beatMarkers = beatMarkers,
+                markerPosition = BeatMarkerPosition.BOTTOM,
+                songDurationSeconds = null, // Not needed for beat domain
+                isBeatDomain = true,
+                pixelsPerBeat = pixelsPerBeat,
+                beatOffsetBeats = 0f, // Track 1 is the anchor, offset 0
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(150.dp)
+            )
+            // Track 2 waveform
+            WaveformView(
+                waveformData = waveformData2,
+                beatMarkers = beatMarkers,
+                markerPosition = BeatMarkerPosition.TOP,
+                songDurationSeconds = null,
+                isBeatDomain = true,
+                pixelsPerBeat = pixelsPerBeat,
+                beatOffsetBeats = beatOffsetTrack2, // Shift Track 2 to match Track 1's grid
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(150.dp)
+            )
+        }
+
+        // Transition overlay
+        BoxWithConstraints(modifier = Modifier.fillMaxSize().align(Alignment.Center)) {
+            val screenWidth = maxWidth
+            val transitionWidth = screenWidth * transitionWidthFraction
+
+            Box(
+                modifier = Modifier
+                    .width(transitionWidth)
+                    .fillMaxHeight()
+                    .align(Alignment.Center)
+            ) {
+                // Background + border
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(Color(0xFF4CAF50).copy(alpha = 0.15f), RoundedCornerShape(12.dp))
+                        .border(2.dp, Color(0xFF4CAF50).copy(alpha = 0.6f), RoundedCornerShape(12.dp))
+                )
+
+                // Labels
+                Surface(
+                    modifier = Modifier.align(Alignment.TopCenter).padding(top = 8.dp),
+                    shape = RoundedCornerShape(16.dp),
+                    color = Color(0xFF4CAF50).copy(alpha = 0.9f)
+                ) {
+                    Text("Transition Zone", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp))
+                }
+
+                Surface(
+                    modifier = Modifier.align(Alignment.Center),
+                    shape = RoundedCornerShape(20.dp),
+                    color = Color(0xFF2C2C2C).copy(alpha = 0.95f)
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
+                        Text("$barsCount bars", color = Color(0xFF4CAF50), fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                        Text("%.1fs".format(transitionDuration), color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                    }
+                }
+
+                // Edge markers
+                Box(modifier = Modifier.width(2.dp).fillMaxHeight().align(Alignment.CenterStart).background(Color(0xFF4CAF50).copy(alpha = 0.8f)))
+                Box(modifier = Modifier.width(2.dp).fillMaxHeight().align(Alignment.CenterEnd).background(Color(0xFF4CAF50).copy(alpha = 0.8f)))
+            }
         }
     }
 }
@@ -187,7 +252,6 @@ fun TopBar(
             )
 
             Spacer(modifier = Modifier.height(4.dp))
-
         }
 
         TextButton(onClick = onSave) {
@@ -210,7 +274,6 @@ fun TransitionTrackInfo(
         modifier = modifier.fillMaxWidth(),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        // FIX: Access .song.getThumbnailModel()
         AsyncImage(
             model = song.song.getThumbnailModel(),
             contentDescription = "Album Art",
@@ -222,14 +285,14 @@ fun TransitionTrackInfo(
 
         Column(modifier = Modifier.weight(1f)) {
             Text(
-                text = song.title, // Accessing from wrapper (overridden property) is fine
+                text = song.title,
                 color = Color.White,
                 fontSize = 18.sp,
                 fontWeight = FontWeight.Bold,
                 maxLines = 1
             )
             Text(
-                text = song.artists.joinToString { it.name }, // Accessing from wrapper is fine
+                text = song.artists.joinToString { it.name },
                 color = Color(0xFFAAAAAA),
                 fontSize = 14.sp,
                 maxLines = 1
@@ -237,14 +300,12 @@ fun TransitionTrackInfo(
         }
 
         Column(horizontalAlignment = Alignment.End) {
-            // FIX: Access .song.bpm
             Text(
                 text = song.song.bpm?.let { "${it.toInt()} bpm" } ?: "-- bpm",
                 color = Color.White,
                 fontSize = 12.sp
             )
 
-            // FIX: Access .song.key
             song.song.key?.let { key ->
                 Text(text = key, color = Color.Gray, fontSize = 12.sp)
             }
@@ -255,7 +316,6 @@ fun TransitionTrackInfo(
                     shape = RoundedCornerShape(4.dp),
                     color = Color(0xFF3949AB)
                 ) {
-                    // FIX: Access .song.duration
                     Text(
                         text = makeTimeString(song.song.duration * 1000L),
                         color = Color.White,
@@ -577,8 +637,6 @@ fun ModernOptionItem(
         }
     }
 }
-
-
 
 @Composable
 fun OptionHeader(text: String) {
