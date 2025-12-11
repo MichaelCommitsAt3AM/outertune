@@ -8,6 +8,7 @@ import com.dd3boh.outertune.db.entities.Song
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
@@ -16,7 +17,14 @@ import kotlinx.coroutines.launch
 import java.io.File
 import javax.inject.Inject
 import kotlin.math.abs
-import kotlin.math.roundToInt
+
+/**
+ * Data class to store waveform samples with their beat positions
+ */
+data class BeatSample(
+    val beatIndex: Float,  // Position in beats (0.0, 0.25, 0.5, etc.)
+    val amplitude: Float   // Amplitude value (0.0 to 1.0)
+)
 
 @HiltViewModel
 class TransitionEditorViewModel @Inject constructor(
@@ -33,21 +41,23 @@ class TransitionEditorViewModel @Inject constructor(
 
     private val _waveformData1 = MutableStateFlow(FloatArray(0))
     private val _waveformData2 = MutableStateFlow(FloatArray(0))
-    val waveformData1 = _waveformData1.asStateFlow() // Keep for legacy if needed
+
+    // Keep for legacy if needed
+    val waveformData1 = _waveformData1.asStateFlow()
     val waveformData2 = _waveformData2.asStateFlow()
 
     private val _beatGrid1 = MutableStateFlow<List<Float>>(emptyList())
     val beatGrid1 = _beatGrid1.asStateFlow()
     private val _beatGrid2 = MutableStateFlow<List<Float>>(emptyList())
 
-    // --- Beat-domain state flows ---
-    private val _waveformBeatDomain1 = MutableStateFlow(FloatArray(0))
+    // --- Beat-domain state flows (FIXED) ---
+    private val _waveformBeatDomain1 = MutableStateFlow<List<BeatSample>>(emptyList())
     val waveformBeatDomain1 = _waveformBeatDomain1.asStateFlow()
 
-    private val _waveformBeatDomain2 = MutableStateFlow(FloatArray(0))
+    private val _waveformBeatDomain2 = MutableStateFlow<List<BeatSample>>(emptyList())
     val waveformBeatDomain2 = _waveformBeatDomain2.asStateFlow()
 
-    // Replaces "ZoomFactor"
+    // Base resolution for waveform generation (can be fixed now)
     private val _pixelsPerBeatBase = MutableStateFlow(48f)
     val pixelsPerBeatBase = _pixelsPerBeatBase.asStateFlow()
 
@@ -74,26 +84,39 @@ class TransitionEditorViewModel @Inject constructor(
         List(maxBeats) { it.toFloat() }
     }
 
-    // --- Helpers ---
+    // INTERNAL: Store screen width to calculate zoom
+    private var currentScreenWidthPx: Float = 0f
+    private var regenerationJob: Job? = null
 
-    /**
-     * Estimate a stable BPM from a beat grid (uses 16 beats to measure).
-     * grid is in seconds.
-     */
+    fun setScreenWidth(widthPx: Float) {
+        if (currentScreenWidthPx != widthPx) {
+            currentScreenWidthPx = widthPx
+            recalculateZoom()
+        }
+    }
 
+    // NOTE: We no longer need to regenerate waveforms when zoom changes!
+    // The beat-indexed waveform can be rendered at any zoom level.
+    private fun recalculateZoom() {
+        if (currentScreenWidthPx <= 0) return
 
-    /**
-     * Convert a time-domain waveform array into a beat-domain waveform.
-     *
-     * - waveform: amplitude array for the whole track (length = some resolution)
-     * - beatGrid: beat timestamps in seconds for that track (size = beatCount)
-     * - songDurationSeconds: duration of the track in seconds
-     * - pixelsPerBeat: number of visual pixels to allocate for each beat (uniform)
-     *
-     * Returns a FloatArray whose length ≈ (beatCount-1) * pixelsPerBeat.
-     * Each element corresponds to one visual pixel sample in beat space.
-     */
+        val bars = _barsCount.value
+        val transitionFraction = _transitionWidthFraction.value
 
+        // Calculate width of the green zone in pixels
+        val zoneWidthPx = currentScreenWidthPx * transitionFraction
+
+        // Calculate how many beats need to fit in that zone
+        val totalBeatsToDisplay = bars * 4
+
+        // Calculate pixels per beat for rendering
+        val newPixelsPerBeat = zoneWidthPx / totalBeatsToDisplay
+
+        // Update the rendering pixel scale (but don't regenerate waveforms)
+        _pixelsPerBeatBase.value = newPixelsPerBeat.coerceAtLeast(4f)
+
+        updateTransitionDuration()
+    }
 
     // --- Public actions ---
 
@@ -115,11 +138,11 @@ class TransitionEditorViewModel @Inject constructor(
                 _beatGrid2.value = loadBeatGrid(it.song.beatGridPath, it.id)
             }
 
-            // compute stable BPMs
+            // Compute stable BPMs
             val bpm1 = calculateStableBpm(_beatGrid1.value, songA?.song?.bpm)
             val bpm2 = calculateStableBpm(_beatGrid2.value, songB?.song?.bpm)
 
-            // set playback speed for deck B so audio would match BPM of A
+            // Set playback speed for deck B so audio would match BPM of A
             val bpmDiff = abs(bpm1 - bpm2)
             if (bpmDiff <= 20f && bpm2 > 0f) {
                 _playbackSpeed1.value = 1f
@@ -130,8 +153,7 @@ class TransitionEditorViewModel @Inject constructor(
                 _playbackSpeed2.value = 1f
             }
 
-            // compute beat offset (in beats) between the first detected beat of both tracks
-            // Using master BPM (bpm1) to express offset in beats.
+            // Compute beat offset (in beats) between the first detected beat of both tracks
             val firstA = _beatGrid1.value.firstOrNull() ?: 0f
             val firstB = _beatGrid2.value.firstOrNull() ?: 0f
             if (bpm1 > 0f) {
@@ -142,50 +164,57 @@ class TransitionEditorViewModel @Inject constructor(
                 _beatOffsetForTrack2.value = 0f
             }
 
-            // convert both waveforms to beat-domain using the same pixelsPerBeat
-            // (we use original beat timings for each track to slice its waveform, but
-            // each beat is resampled to the SAME number of pixels)
-            val pxPerBeat = _pixelsPerBeatBase.value.toInt().coerceAtLeast(4)
+            // Convert both waveforms to beat-domain
+            // Use a fixed resolution (48 pixels per beat) for generation
+            val fixedPxPerBeat = 48
 
             val durationA = songA?.song?.duration?.toFloat() ?: 1f
             val durationB = songB?.song?.duration?.toFloat() ?: 1f
 
-            val beatDomain1 = convertWaveformToBeatDomain(_waveformData1.value, _beatGrid1.value, durationA, pxPerBeat)
-            val beatDomain2 = convertWaveformToBeatDomain(_waveformData2.value, _beatGrid2.value, durationB, pxPerBeat)
+            val beatDomain1 = convertWaveformToBeatDomain(
+                _waveformData1.value,
+                _beatGrid1.value,
+                durationA,
+                fixedPxPerBeat
+            )
+            val beatDomain2 = convertWaveformToBeatDomain(
+                _waveformData2.value,
+                _beatGrid2.value,
+                durationB,
+                fixedPxPerBeat
+            )
 
             _waveformBeatDomain1.value = beatDomain1
             _waveformBeatDomain2.value = beatDomain2
 
-            // transition duration remains based on master BPM/time-span as before
+            // Transition duration based on master BPM
             val bars = _barsCount.value
             val beatsToShow = bars * 4
             val timeSpanA = beatsToShow * (60f / (if (bpm1 > 0f) bpm1 else 120f))
             _transitionDurationSeconds.value = timeSpanA
-
-            // done
         }
     }
 
-    fun setBarsCount(bars: Int) {
-        _barsCount.value = bars
-        // Recompute transition duration (UI only)
+    fun setBarsCount(newBars: Int) {
+        _barsCount.value = newBars       // FIX
+        _beatOffsetForTrack2.value = 0f  // FIX
+        updateTransitionDuration()       // Also needed so duration updates immediately
+    }
+
+
+    // Separated this logic so we can call it without re-loading files
+    private fun updateTransitionDuration() {
         val bpm1 = calculateStableBpm(_beatGrid1.value, _track1.value?.song?.bpm)
-        val beatsToShow = bars * 4
+        val beatsToShow = _barsCount.value * 4
         if (bpm1 > 0f) {
             _transitionDurationSeconds.value = beatsToShow * (60f / bpm1)
         }
     }
 
-    fun setPixelsPerBeat(pixels: Float) {
-        _pixelsPerBeatBase.value = pixels.coerceAtLeast(4f)
-        // When pixelsPerBeat changes we should re-run conversion (simple approach: reload)
-        // Trigger reconversion on the next load or call loadData again externally.
-        // If you want instant reconversion, call convertWaveformToBeatDomain here similarly.
-    }
-
-    // --- File loaders (unchanged) ---
+    // --- File loaders ---
     private fun loadWaveform(savedPath: String?, songId: String): FloatArray {
-        val file = if (savedPath != null) File(savedPath) else File(context.cacheDir, "analysis_data/${songId}_waveform.dat")
+        val file = if (savedPath != null) File(savedPath)
+        else File(context.cacheDir, "analysis_data/${songId}_waveform.dat")
         return if (file.exists()) {
             try {
                 file.readText().split(",").mapNotNull { it.toFloatOrNull() }.toFloatArray()
@@ -198,10 +227,11 @@ class TransitionEditorViewModel @Inject constructor(
     }
 
     private fun loadBeatGrid(savedPath: String?, songId: String): List<Float> {
-        val file = if (savedPath != null) File(savedPath) else File(context.cacheDir, "analysis_data/${songId}_beats.dat")
+        val file = if (savedPath != null) File(savedPath)
+        else File(context.cacheDir, "analysis_data/${songId}_beats.dat")
         return if (file.exists()) {
             try {
-                // files store milliseconds in your original code -> convert to seconds
+                // Files store milliseconds -> convert to seconds
                 file.readText().split(",").mapNotNull { it.toFloatOrNull() }.map { it / 1000f }
             } catch (e: Exception) {
                 emptyList()
@@ -222,25 +252,37 @@ class TransitionEditorViewModel @Inject constructor(
         return metadataBpm ?: 120f
     }
 
+    /**
+     * FIXED: Convert a time-domain waveform array into a beat-indexed waveform.
+     *
+     * Returns a List<BeatSample> where each sample stores:
+     * - beatIndex: its position in beats (e.g., 0.0, 0.25, 0.5, 1.0, etc.)
+     * - amplitude: the peak amplitude value
+     *
+     * This structure allows rendering at any pixelsPerBeat value without regeneration.
+     */
     private fun convertWaveformToBeatDomain(
         waveform: FloatArray,
         beatGrid: List<Float>,
         songDurationSeconds: Float,
         pixelsPerBeat: Int
-    ): FloatArray {
-        if (waveform.isEmpty() || beatGrid.size < 2 || songDurationSeconds <= 0f) return FloatArray(0)
+    ): List<BeatSample> {
+        if (waveform.isEmpty() || beatGrid.size < 2 || songDurationSeconds <= 0f) {
+            return emptyList()
+        }
 
-        // Pre-allocate exact size to avoid resizing overhead
-        val out = ArrayList<Float>((beatGrid.size - 1) * pixelsPerBeat)
+        val out = ArrayList<BeatSample>((beatGrid.size - 1) * pixelsPerBeat)
         val waveformSize = waveform.size
 
-        for (i in 0 until beatGrid.size - 1) {
-            val startTime = beatGrid[i].coerceAtLeast(0f)
-            val endTime = beatGrid[i + 1].coerceAtMost(songDurationSeconds)
+        for (beatIdx in 0 until beatGrid.size - 1) {
+            val startTime = beatGrid[beatIdx].coerceAtLeast(0f)
+            val endTime = beatGrid[beatIdx + 1].coerceAtMost(songDurationSeconds)
 
             // Map time to indices in the raw waveform array
-            val startIndex = ((startTime / songDurationSeconds) * waveformSize).toInt().coerceIn(0, waveformSize - 1)
-            val endIndex = ((endTime / songDurationSeconds) * waveformSize).toInt().coerceIn(0, waveformSize)
+            val startIndex = ((startTime / songDurationSeconds) * waveformSize).toInt()
+                .coerceIn(0, waveformSize - 1)
+            val endIndex = ((endTime / songDurationSeconds) * waveformSize).toInt()
+                .coerceIn(0, waveformSize)
 
             // How many raw samples represent this ONE beat?
             val segmentLength = (endIndex - startIndex).coerceAtLeast(1)
@@ -258,7 +300,6 @@ class TransitionEditorViewModel @Inject constructor(
 
                 // PEAK DETECTION: Find the loudest sample in this range
                 var maxAmp = 0f
-                // Optimization: Don't loop if the range is 0 (shouldn't happen often)
                 if (searchStart == searchEnd) {
                     maxAmp = abs(waveform[searchStart])
                 } else {
@@ -268,10 +309,12 @@ class TransitionEditorViewModel @Inject constructor(
                     }
                 }
 
-                out.add(maxAmp)
+                // FIXED: Store beat position instead of relying on array index
+                val beatPosition = beatIdx + (px.toFloat() / pixelsPerBeat)
+                out.add(BeatSample(beatPosition, maxAmp))
             }
         }
 
-        return out.toFloatArray()
+        return out
     }
 }

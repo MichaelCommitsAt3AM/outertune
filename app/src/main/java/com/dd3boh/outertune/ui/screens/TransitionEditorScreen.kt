@@ -23,6 +23,8 @@ import com.dd3boh.outertune.ui.component.BeatMarkerPosition
 import com.dd3boh.outertune.ui.component.WaveformView
 import com.dd3boh.outertune.utils.makeTimeString
 import com.dd3boh.outertune.viewmodels.TransitionEditorViewModel
+import com.dd3boh.outertune.viewmodels.BeatSample
+
 
 @Composable
 fun TransitionEditorScreen(
@@ -70,38 +72,54 @@ fun TransitionEditorScreen(
         Log.d("TransitionEditor", "Track2 duration: ${track2?.song?.duration}")
     }
 
-    Box(
+    BoxWithConstraints(
         modifier = Modifier
             .fillMaxSize()
             .background(Color.Black)
             .windowInsetsPadding(WindowInsets.safeDrawing)
     ) {
+        val screenWidthPx = constraints.maxWidth.toFloat()
+
+        // ------------------------
+        // COMPUTE ZOOM PROPERLY
+        // ------------------------
+        val totalBeats = (barsCount * 4).toFloat()
+        val transitionZoneWidthPx = screenWidthPx * transitionWidthFraction
+
+        // Core formula for correct zooming:
+        val computedPixelsPerBeat =
+            if (totalBeats > 0) transitionZoneWidthPx / totalBeats else 1f
+
+        // Debug print (optional)
+        Log.d("Zoom", "bars=$barsCount beats=$totalBeats ppb=$computedPixelsPerBeat width=$transitionZoneWidthPx")
+
+        // When screen width (layout) or barsCount changes, update the VM
+        LaunchedEffect(screenWidthPx, barsCount) {
+            viewModel.setScreenWidth(screenWidthPx)
+        }
+
         Column(modifier = Modifier.fillMaxSize()) {
-            // Top Bar
             TopBar(onCancel, onSave)
 
             Spacer(modifier = Modifier.height(24.dp))
 
-            // Track 1 Info
             track1?.let { TransitionTrackInfo(it, modifier = Modifier.padding(horizontal = 16.dp)) }
 
             Spacer(modifier = Modifier.height(24.dp))
 
-            // Waveforms with transition overlay
             WaveformsSection(
                 track1 = track1,
                 track2 = track2,
                 waveformData1 = waveformData1,
                 waveformData2 = waveformData2,
-                beatMarkers = beatIndices, // Pass indices (0f, 1f, 2f...)
-                beatOffsetTrack2 = beatOffsetTrack2, // Pass offset
-                pixelsPerBeat = pixelsPerBeat,
+                beatMarkers = beatIndices,
+                beatOffsetTrack2 = beatOffsetTrack2,
+                pixelsPerBeat = computedPixelsPerBeat,
                 transitionWidthFraction = transitionWidthFraction,
                 transitionDuration = transitionDuration,
                 barsCount = barsCount
             )
 
-            // Bars selector
             BarsDropdown(
                 selectedBars = barsCount,
                 onBarsSelected = { viewModel.setBarsCount(it) },
@@ -110,12 +128,10 @@ fun TransitionEditorScreen(
                     .padding(vertical = 16.dp)
             )
 
-            // Track 2 Info
             track2?.let { TransitionTrackInfo(it, showDurationBadge = false, modifier = Modifier.padding(horizontal = 16.dp)) }
 
             Spacer(modifier = Modifier.weight(1f))
 
-            // Bottom Controls
             ControlPanel(
                 selectedTab = selectedTab,
                 onTabSelected = { selectedTab = it },
@@ -135,43 +151,52 @@ fun TransitionEditorScreen(
 fun WaveformsSection(
     track1: Song?,
     track2: Song?,
-    waveformData1: FloatArray, // Changed List<Float> to FloatArray to match ViewModel
-    waveformData2: FloatArray,
+    waveformData1: List<BeatSample>,
+    waveformData2: List<BeatSample>,
     beatMarkers: List<Float>,
     beatOffsetTrack2: Float,
     pixelsPerBeat: Float,
     transitionWidthFraction: Float,
     transitionDuration: Float,
-    barsCount: Int
+    barsCount: Int,
+    initialOffset: Float = 0f,
+
 ) {
     Box(modifier = Modifier.fillMaxWidth().height(300.dp)) {
         Column {
             // Track 1 waveform
-            WaveformView(
-                waveformData = waveformData1,
-                beatMarkers = beatMarkers,
-                markerPosition = BeatMarkerPosition.BOTTOM,
-                songDurationSeconds = null, // Not needed for beat domain
-                isBeatDomain = true,
-                pixelsPerBeat = pixelsPerBeat,
-                beatOffsetBeats = 0f, // Track 1 is the anchor, offset 0
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(150.dp)
-            )
+            key(barsCount, pixelsPerBeat) {
+                WaveformView(
+                    waveformData = waveformData1,
+                    beatMarkers = beatMarkers,
+                    markerPosition = BeatMarkerPosition.BOTTOM,
+                    isBeatDomain = true,
+                    pixelsPerBeat = pixelsPerBeat,
+                    beatOffsetBeats = 0f,
+                    initialOffset = 0f,
+                    songDurationSeconds = track1?.song?.duration?.toFloat() ?: 1f,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(150.dp)
+                )
+            }
             // Track 2 waveform
-            WaveformView(
-                waveformData = waveformData2,
-                beatMarkers = beatMarkers,
-                markerPosition = BeatMarkerPosition.TOP,
-                songDurationSeconds = null,
-                isBeatDomain = true,
-                pixelsPerBeat = pixelsPerBeat,
-                beatOffsetBeats = beatOffsetTrack2, // Shift Track 2 to match Track 1's grid
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(150.dp)
-            )
+            key(barsCount, pixelsPerBeat, beatOffsetTrack2) {
+                WaveformView(
+                    waveformData = waveformData2,
+                    beatMarkers = beatMarkers,
+                    markerPosition = BeatMarkerPosition.TOP,
+                    isBeatDomain = true,
+                    pixelsPerBeat = pixelsPerBeat,
+                    beatOffsetBeats = beatOffsetTrack2,
+                    initialOffset = 0f,
+                    songDurationSeconds = track2?.song?.duration?.toFloat() ?: 1f,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(150.dp)
+                )
+
+            }
         }
 
         // Transition overlay
