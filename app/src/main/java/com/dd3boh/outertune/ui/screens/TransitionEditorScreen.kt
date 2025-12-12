@@ -73,9 +73,9 @@ fun TransitionEditorScreen(
     val transitionWidthFraction by viewModel.transitionWidthFraction.collectAsState()
 
     var selectedTab by remember { mutableStateOf(0) }
-    var overlapMode by remember { mutableStateOf("Overlap") }
-    var eqMode by remember { mutableStateOf("None") }
-    var effectMode by remember { mutableStateOf("Low pass filt...") }
+    val overlapMode by viewModel.overlapMode.collectAsState()
+    val eqMode by viewModel.eqMode.collectAsState()
+    val effectMode by viewModel.effectMode.collectAsState()
 
     val isPlaying by viewModel.isPlaying.collectAsState()
 
@@ -163,11 +163,11 @@ fun TransitionEditorScreen(
                 selectedTab = selectedTab,
                 onTabSelected = { selectedTab = it },
                 overlapMode = overlapMode,
-                onOverlapModeChanged = { overlapMode = it },
+                onOverlapModeChanged = { viewModel.setOverlapMode (it) },
                 eqMode = eqMode,
-                onEqModeChanged = { eqMode = it },
+                onEqModeChanged = { viewModel.setEqMode(it) },
                 effectMode = effectMode,
-                onEffectModeChanged = { effectMode = it },
+                onEffectModeChanged = { viewModel.setEffectMode (it) },
                 modifier = Modifier.padding(16.dp)
             )
         }
@@ -222,7 +222,7 @@ fun WaveformsSection(
                     isBeatDomain = true,
                     pixelsPerBeat = pixelsPerBeat,
                     beatOffsetBeats = 0f,
-                    initialOffset = track2Offset, // Pass track 2 specific offset
+                    initialOffset = track1Offset + track2Offset,
                     onOffsetChanged = onTrack2OffsetChanged,
                     songDurationSeconds = track2?.song?.duration?.toFloat() ?: 1f,
                     modifier = Modifier
@@ -294,11 +294,13 @@ fun WaveformsSection(
         }
 
         // GREEN LINE INDICATOR
-        if (playbackBeat != null) {
+        if (playbackBeat != null && pixelsPerBeat > 0) {
             // Draw relative to the primary track's visual position.
-            // playbackBeat is absolute. track1Offset is the beat at the left edge (or 0 point)
-            // if we assume playback matches Track 1:
+            // We use track1Offset because the UI is aligned to Track 1's perspective
             val xPosition = (playbackBeat - track1Offset) * pixelsPerBeat
+
+            // Only draw if within visible bounds (optional, but good for performance)
+            // Note: We use a larger range to ensure thick lines don't get clipped at edges
 
             Canvas(modifier = Modifier.fillMaxSize()) {
                 drawLine(
@@ -309,6 +311,7 @@ fun WaveformsSection(
                     cap = StrokeCap.Round
                 )
             }
+
         }
     }
 }

@@ -1,54 +1,63 @@
 package com.dd3boh.outertune.utils
 
+/**
+ * @param beat Relative beat index (0 = start of transition zone)
+ * @param track "A" or "B"
+ * @param volume Target volume (0f to 1f)
+ * @param type "jump" (instant change) or "ramp" (gradual fade from previous volume)
+ */
 data class DJCue(
-    val beat: Float,      // Relative beat index (0 = start of transition)
-    val action: String,   // "fade_in", "fade_out", "start", "end"
-    val volume: Float     // Volume at this beat (0..1)
-)
-
-data class TrackState(
-    val beatGrid: List<Float>
+    val beat: Float,
+    val track: String,
+    val volume: Float,
+    val type: String = "jump"
 )
 
 object DJHelper {
 
-    /**
-     * Generates DJ cues for a smooth transition.
-     * Cues are relative to the start of the transition (Beat 0).
-     * @param bars Number of bars in transition
-     * @param fadeBeats Number of beats for fade-in/out
-     */
     fun generateDJCues(
         bars: Int,
-        fadeBeats: Int = 4
+        mode: String = "Overlap" // "Overlap", "Crossfade", "Cut"
     ): List<DJCue> {
         val cues = mutableListOf<DJCue>()
-        val totalBeats = bars * 4
+        val totalBeats = bars * 4f
 
-        // Start of transition (Beat 0)
-        cues.add(DJCue(0f, "start", 1f))
+        when (mode) {
+            "Overlap" -> {
+                // 1. Track B starts immediately at full volume at the start (Beat 0)
+                cues.add(DJCue(0f, "B", 1f, "jump"))
 
-        // Track B: Fade-in (0 -> 1)
-        for (i in 0..fadeBeats) {
-            val beat = i.toFloat()
-            val vol = i.toFloat() / fadeBeats
-            cues.add(DJCue(beat, "fade_in", vol))
+                // 2. Track A plays fully until the end, then cuts to silence (Beat End)
+                cues.add(DJCue(totalBeats, "A", 0f, "jump"))
+            }
+            "Cut" -> {
+                // Switch exactly in the middle
+                val middle = totalBeats / 2f
+                cues.add(DJCue(middle, "A", 0f, "jump"))
+                cues.add(DJCue(middle, "B", 1f, "jump"))
+                // Ensure B is silent before the cut?
+                // Usually handled by initial setup, but we can be explicit:
+                cues.add(DJCue(0f, "B", 0f, "jump"))
+            }
+            "Crossfade" -> {
+                // Linear Crossfade over the whole duration
+                val fadeSteps = 16 // Resolution of fade
+                for (i in 0..fadeSteps) {
+                    val fraction = i.toFloat() / fadeSteps
+                    val beat = fraction * totalBeats
+
+                    // A goes 1 -> 0
+                    cues.add(DJCue(beat, "A", 1f - fraction, "ramp"))
+                    // B goes 0 -> 1
+                    cues.add(DJCue(beat, "B", fraction, "ramp"))
+                }
+            }
+            else -> {
+                // Default fallback (Overlap)
+                cues.add(DJCue(0f, "B", 1f, "jump"))
+                cues.add(DJCue(totalBeats, "A", 0f, "jump"))
+            }
         }
-
-        // Track A: Fade-out (1 -> 0)
-        // Starts at (totalBeats - fadeBeats)
-        val fadeOutStart = totalBeats - fadeBeats
-        for (i in 0..fadeBeats) {
-            val beat = fadeOutStart + i.toFloat()
-            val vol = 1f - (i.toFloat() / fadeBeats)
-            cues.add(DJCue(beat, "fade_out", vol))
-        }
-
-        // Track B: Full volume checkpoint (after fade in)
-        cues.add(DJCue(fadeBeats.toFloat(), "full_volume", 1f))
-
-        // End of transition
-        cues.add(DJCue(totalBeats.toFloat(), "end", 1f))
 
         return cues.sortedBy { it.beat }
     }
