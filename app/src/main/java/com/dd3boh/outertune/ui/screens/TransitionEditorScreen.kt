@@ -55,22 +55,18 @@ fun TransitionEditorScreen(
     val track1 by viewModel.track1.collectAsState()
     val track2 by viewModel.track2.collectAsState()
 
-    // FIX: Use beat domain data
     val waveformData1 by viewModel.waveformBeatDomain1.collectAsState()
     val waveformData2 by viewModel.waveformBeatDomain2.collectAsState()
 
-    // FIX: Use generic beat indices (0, 1, 2...) instead of raw time grids
     val beatIndices by viewModel.beatGridIndices.collectAsState(initial = emptyList())
 
-    // FIX: Use pixelsPerBeat instead of zoomFactor
     val pixelsPerBeat by viewModel.pixelsPerBeatBase.collectAsState()
-
-    // FIX: Get offset for Track 2
-    val beatOffsetTrack2 by viewModel.beatOffsetForTrack2.collectAsState()
 
     val playbackBeat by viewModel.playbackBeat.collectAsState()
 
-    val waveformOffset by viewModel.waveformOffsetBeats.collectAsState()
+    // Independent offsets
+    val track1Offset by viewModel.track1OffsetBeats.collectAsState()
+    val track2Offset by viewModel.track2OffsetBeats.collectAsState()
 
     val barsCount by viewModel.barsCount.collectAsState()
     val transitionDuration by viewModel.transitionDurationSeconds.collectAsState()
@@ -92,13 +88,6 @@ fun TransitionEditorScreen(
             kotlinx.coroutines.delay(3000)
             controlsVisible = false
         }
-    }
-
-    LaunchedEffect(waveformData1, waveformData2, track1, track2) {
-        Log.d("TransitionEditor", "Waveform1 size: ${waveformData1.size}")
-        Log.d("TransitionEditor", "Waveform2 size: ${waveformData2.size}")
-        Log.d("TransitionEditor", "Track1 duration: ${track1?.song?.duration}")
-        Log.d("TransitionEditor", "Track2 duration: ${track2?.song?.duration}")
     }
 
     BoxWithConstraints(
@@ -124,9 +113,6 @@ fun TransitionEditorScreen(
         val computedPixelsPerBeat =
             if (totalBeats > 0) transitionZoneWidthPx / totalBeats else 1f
 
-        // Debug print (optional)
-        Log.d("Zoom", "bars=$barsCount beats=$totalBeats ppb=$computedPixelsPerBeat width=$transitionZoneWidthPx")
-
         // When screen width (layout) or barsCount changes, update the VM
         LaunchedEffect(screenWidthPx, barsCount) {
             viewModel.setScreenWidth(screenWidthPx)
@@ -147,7 +133,6 @@ fun TransitionEditorScreen(
                 waveformData1 = waveformData1,
                 waveformData2 = waveformData2,
                 beatMarkers = beatIndices,
-                beatOffsetTrack2 = beatOffsetTrack2,
                 pixelsPerBeat = pixelsPerBeat,
                 transitionWidthFraction = transitionWidthFraction,
                 transitionDuration = transitionDuration,
@@ -155,10 +140,10 @@ fun TransitionEditorScreen(
                 isPlaying = isPlaying,
                 showControls = controlsVisible,
                 playbackBeat = playbackBeat,
-                currentWaveformOffset = waveformOffset,
-                onWaveformOffsetChanged = { pxOffset ->
-                    viewModel.setWaveformOffset(pxOffset, pixelsPerBeat) // <-- pass pixelsPerBeat here
-                },
+                track1Offset = track1Offset,
+                track2Offset = track2Offset,
+                onTrack1OffsetChanged = { px -> viewModel.setTrack1Offset(px, pixelsPerBeat) },
+                onTrack2OffsetChanged = { px -> viewModel.setTrack2Offset(px, pixelsPerBeat) },
                 onPlayPauseClick = { viewModel.togglePlayback() }
             )
 
@@ -196,20 +181,18 @@ fun WaveformsSection(
     waveformData1: List<BeatSample>,
     waveformData2: List<BeatSample>,
     beatMarkers: List<Float>,
-    beatOffsetTrack2: Float,
     pixelsPerBeat: Float,
     transitionWidthFraction: Float,
     transitionDuration: Float,
     barsCount: Int,
-    initialOffset: Float = 0f,
     isPlaying: Boolean,
     showControls: Boolean,
     playbackBeat: Float?,
-    currentWaveformOffset: Float,
-    onWaveformOffsetChanged: (Float) -> Unit,
+    track1Offset: Float,
+    track2Offset: Float,
+    onTrack1OffsetChanged: (Float) -> Unit,
+    onTrack2OffsetChanged: (Float) -> Unit,
     onPlayPauseClick: () -> Unit
-
-
 ) {
     Box(modifier = Modifier.fillMaxWidth().height(300.dp)) {
         Column {
@@ -222,8 +205,8 @@ fun WaveformsSection(
                     isBeatDomain = true,
                     pixelsPerBeat = pixelsPerBeat,
                     beatOffsetBeats = 0f,
-                    initialOffset = currentWaveformOffset,
-                    onOffsetChanged = onWaveformOffsetChanged,
+                    initialOffset = track1Offset, // Pass track 1 specific offset
+                    onOffsetChanged = onTrack1OffsetChanged,
                     songDurationSeconds = track1?.song?.duration?.toFloat() ?: 1f,
                     modifier = Modifier
                         .fillMaxWidth()
@@ -231,15 +214,16 @@ fun WaveformsSection(
                 )
             }
             // Track 2 waveform
-            key(barsCount, pixelsPerBeat, beatOffsetTrack2) {
+            key(barsCount, pixelsPerBeat) {
                 WaveformView(
                     waveformData = waveformData2,
                     beatMarkers = beatMarkers,
                     markerPosition = BeatMarkerPosition.TOP,
                     isBeatDomain = true,
                     pixelsPerBeat = pixelsPerBeat,
-                    beatOffsetBeats = beatOffsetTrack2,
-                    initialOffset = currentWaveformOffset,
+                    beatOffsetBeats = 0f,
+                    initialOffset = track2Offset, // Pass track 2 specific offset
+                    onOffsetChanged = onTrack2OffsetChanged,
                     songDurationSeconds = track2?.song?.duration?.toFloat() ?: 1f,
                     modifier = Modifier
                         .fillMaxWidth()
@@ -248,8 +232,6 @@ fun WaveformsSection(
 
             }
         }
-
-
 
         // Transition overlay
         BoxWithConstraints(modifier = Modifier.fillMaxSize().align(Alignment.Center)) {
@@ -270,8 +252,7 @@ fun WaveformsSection(
                         .border(2.dp, Color(0xFF4CAF50).copy(alpha = 0.6f), RoundedCornerShape(12.dp))
                 )
 
-                // PLAY BUTTON (Replaces old info box)
-                // Visible if: paused OR (playing AND controlsVisible)
+                // PLAY BUTTON
                 AnimatedVisibility(
                     visible = !isPlaying || showControls,
                     enter = fadeIn(),
@@ -314,9 +295,11 @@ fun WaveformsSection(
 
         // GREEN LINE INDICATOR
         if (playbackBeat != null) {
-            val xPosition = (playbackBeat * pixelsPerBeat) + currentWaveformOffset
+            // Draw relative to the primary track's visual position.
+            // playbackBeat is absolute. track1Offset is the beat at the left edge (or 0 point)
+            // if we assume playback matches Track 1:
+            val xPosition = (playbackBeat - track1Offset) * pixelsPerBeat
 
-            // Draw Line
             Canvas(modifier = Modifier.fillMaxSize()) {
                 drawLine(
                     color = Color.Green,

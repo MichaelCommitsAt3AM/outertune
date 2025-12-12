@@ -1,7 +1,7 @@
 package com.dd3boh.outertune.utils
 
 data class DJCue(
-    val beat: Float,      // Beat index
+    val beat: Float,      // Relative beat index (0 = start of transition)
     val action: String,   // "fade_in", "fade_out", "start", "end"
     val volume: Float     // Volume at this beat (0..1)
 )
@@ -13,47 +13,46 @@ data class TrackState(
 object DJHelper {
 
     /**
-     * Generates DJ cues for a smooth transition between trackA and trackB
+     * Generates DJ cues for a smooth transition.
+     * Cues are relative to the start of the transition (Beat 0).
      * @param bars Number of bars in transition
      * @param fadeBeats Number of beats for fade-in/out
      */
     fun generateDJCues(
-        trackA: TrackState,
-        trackB: TrackState,
         bars: Int,
         fadeBeats: Int = 4
     ): List<DJCue> {
         val cues = mutableListOf<DJCue>()
         val totalBeats = bars * 4
-        val lastBeatA = trackA.beatGrid.size - 1
-        val startBeatA = (lastBeatA - totalBeats).coerceAtLeast(0)
-        val startBeatB = 0
 
-        // Track A: start of transition
-        cues.add(DJCue(startBeatA.toFloat(), "start", 1f))
+        // Start of transition (Beat 0)
+        cues.add(DJCue(0f, "start", 1f))
 
-        // Track B: fade-in
+        // Track B: Fade-in (0 -> 1)
         for (i in 0..fadeBeats) {
-            val beat = startBeatB + i.toFloat()
+            val beat = i.toFloat()
             val vol = i.toFloat() / fadeBeats
             cues.add(DJCue(beat, "fade_in", vol))
         }
 
-        // Track A: fade-out
+        // Track A: Fade-out (1 -> 0)
+        // Starts at (totalBeats - fadeBeats)
+        val fadeOutStart = totalBeats - fadeBeats
         for (i in 0..fadeBeats) {
-            val beat = startBeatA + totalBeats - fadeBeats + i.toFloat()
+            val beat = fadeOutStart + i.toFloat()
             val vol = 1f - (i.toFloat() / fadeBeats)
             cues.add(DJCue(beat, "fade_out", vol))
         }
 
-        // Track B: full volume after fade-in
-        cues.add(DJCue(startBeatB + fadeBeats.toFloat(), "full_volume", 1f))
+        // Track B: Full volume checkpoint (after fade in)
+        cues.add(DJCue(fadeBeats.toFloat(), "full_volume", 1f))
 
-        // Track B: end of transition
-        cues.add(DJCue(startBeatB + totalBeats.toFloat(), "end", 1f))
+        // End of transition
+        cues.add(DJCue(totalBeats.toFloat(), "end", 1f))
 
         return cues.sortedBy { it.beat }
     }
+
     fun timeToBeat(beatGrid: List<Float>, timeSec: Float): Float {
         if (beatGrid.isEmpty()) return 0f
         val index = beatGrid.binarySearch(timeSec)
@@ -66,6 +65,4 @@ object DJHelper {
             } else insertion.toFloat()
         }
     }
-
-
 }

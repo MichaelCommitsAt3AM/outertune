@@ -66,6 +66,8 @@ class TransitionEditorViewModel @Inject constructor(
     val transitionDurationSeconds = _transitionDurationSeconds.asStateFlow()
     private val _transitionWidthFraction = MutableStateFlow(0.75f)
     val transitionWidthFraction = _transitionWidthFraction.asStateFlow()
+
+    // Derived offset for Track 2 logic if needed
     private val _beatOffsetForTrack2 = MutableStateFlow(0f)
     val beatOffsetForTrack2 = _beatOffsetForTrack2.asStateFlow()
 
@@ -86,19 +88,31 @@ class TransitionEditorViewModel @Inject constructor(
 
     private var playerA: ExoPlayer? = null
     private var playerB: ExoPlayer? = null
+
+    // BPM Sync logic
     private var targetSpeedB = 1f
+    private var initialSpeedB = 1f
+
     private var currentScreenWidthPx: Float = 0f
 
-    // --- User-set waveform offset in beats ---
-    private val _waveformOffsetBeats = MutableStateFlow(0f)
-    val waveformOffsetBeats = _waveformOffsetBeats.asStateFlow()
+    // --- Independent Waveform Offsets (in Beats) ---
+    private val _track1OffsetBeats = MutableStateFlow(0f)
+    val track1OffsetBeats = _track1OffsetBeats.asStateFlow()
 
-    fun setWaveformOffset(pxOffset: Float, pixelsPerBeat: Float) {
-        _waveformOffsetBeats.value = pxOffset / pixelsPerBeat
+    private val _track2OffsetBeats = MutableStateFlow(0f)
+    val track2OffsetBeats = _track2OffsetBeats.asStateFlow()
+
+    fun setTrack1Offset(pxOffset: Float, pixelsPerBeat: Float) {
+        // Invert pxOffset: Scrolling LEFT (negative px) means moving FORWARD in time (positive beats)
+        _track1OffsetBeats.value = -pxOffset / pixelsPerBeat
+    }
+
+    fun setTrack2Offset(pxOffset: Float, pixelsPerBeat: Float) {
+        _track2OffsetBeats.value = -pxOffset / pixelsPerBeat
     }
 
     private val PRE_ROLL_MS = 3000L
-    private val POST_ROLL_MS = 20000L
+    private val POST_ROLL_MS = 20000L // 20 seconds post-roll
 
     init { viewModelScope.launch(Dispatchers.Main) { setupPlayers() } }
 
@@ -143,12 +157,21 @@ class TransitionEditorViewModel @Inject constructor(
                 _beatGrid2.value = loadBeatGrid(it.song.beatGridPath, it.id)
             }
 
+            // BPM Sync Calculation
             val bpmA = calculateStableBpm(_beatGrid1.value, songA?.song?.bpm)
             val bpmB = calculateStableBpm(_beatGrid2.value, songB?.song?.bpm)
-            targetSpeedB = if (abs(bpmA - bpmB) <= 15f && bpmB > 0f) bpmA / bpmB else 1f
+
+            // If tracks are within 15 BPM, sync Track B to Track A
+            if (abs(bpmA - bpmB) <= 15f && bpmB > 0f) {
+                targetSpeedB = 1f // Original speed
+                initialSpeedB = bpmA / bpmB // Synced speed
+            } else {
+                targetSpeedB = 1f
+                initialSpeedB = 1f
+            }
 
             _playbackSpeed1.value = 1f
-            _playbackSpeed2.value = targetSpeedB
+            _playbackSpeed2.value = initialSpeedB
 
             val pxPerBeat = 48
             val durA = songA?.song?.duration?.toFloat() ?: 1f
@@ -191,17 +214,35 @@ class TransitionEditorViewModel @Inject constructor(
         _isPlaying.value = true
         startPlaybackTicker()
 
-        // Get the user-set waveform offset in beats
-        val waveformOffsetBeats = _waveformOffsetBeats.value // <- make this MutableStateFlow<Float> in VM
-        val beatOffsetA = waveformOffsetBeats
-        val beatOffsetB = beatOffsetA + _beatOffsetForTrack2.value
+        val beatOffsetA = _track1OffsetBeats.value
+        val beatOffsetB = _track2OffsetBeats.value
+
+        // --- Calculate Transition Alignment ---
+        // The UI centers the "Transition Zone" on screen.
+        // The waveforms are drawn starting from the left edge (x=0).
+        // The distance from Left Edge to Green Box Start is:
+        val screenWidth = currentScreenWidthPx
+        val zoneWidth = screenWidth * _transitionWidthFraction.value
+        val zoneStartPx = (screenWidth - zoneWidth) / 2f
+        val pixelsPerBeat = _pixelsPerBeatBase.value
+        val visualDelayBeats = if (pixelsPerBeat > 0) zoneStartPx / pixelsPerBeat else 0f
+
+        // The user's scroll offset (`beatOffsetA`) defines what is at x=0.
+        // The Transition Zone starts at `x = zoneStartPx`.
+        // Therefore, the transition starts at `beatOffsetA + visualDelayBeats`.
+
+        val transitionStartBeatA = beatOffsetA + visualDelayBeats
+        val transitionStartBeatB = beatOffsetB + visualDelayBeats
 
         val preRollSec = PRE_ROLL_MS / 1000f
-        val startTime = System.currentTimeMillis()
 
-        // Seek players according to waveform offset
+        // Seek relative to the user's scroll position (Left Edge) - PreRoll
         val startTimeA = (getTimestampForBeat(gridA, beatOffsetA) - preRollSec).coerceAtLeast(0f)
         val startTimeB = (getTimestampForBeat(gridB, beatOffsetB) - preRollSec).coerceAtLeast(0f)
+
+        // For cue calculation, we need the timestamp of the Transition Start
+        val transitionStartTimeA = getTimestampForBeat(gridA, transitionStartBeatA)
+        val transitionStartTimeB = getTimestampForBeat(gridB, transitionStartBeatB)
 
         pA.seekTo((startTimeA * 1000).toLong())
         pB.seekTo((startTimeB * 1000).toLong())
@@ -209,46 +250,97 @@ class TransitionEditorViewModel @Inject constructor(
         pA.volume = 1f
         pB.volume = 0f
         pA.setPlaybackSpeed(_playbackSpeed1.value)
-        pB.setPlaybackSpeed(_playbackSpeed2.value)
+
+        // Start Track B with matched BPM
+        pB.setPlaybackSpeed(initialSpeedB)
+
         pA.play()
         pB.play()
 
-        // Generate DJ cues (fade in/out)
+        val startTimeSys = System.currentTimeMillis()
+
+        // Generate RELATIVE cues (0 to totalBeats)
         val cues = DJHelper.generateDJCues(
-            TrackState(gridA),
-            TrackState(gridB),
-            _barsCount.value,
+            bars = _barsCount.value,
             fadeBeats = 4
         )
 
         viewModelScope.launch {
             for (cue in cues) {
-                val cueGrid = if (cue.action.contains("B")) gridB else gridA
-                val cueTime = getTimestampForBeat(cueGrid, cue.beat + if (cue.action.contains("B")) beatOffsetB else beatOffsetA)
-                val elapsed = (System.currentTimeMillis() - startTime) / 1000f
-                val delayMs = ((cueTime - elapsed) * 1000).toLong().coerceAtLeast(0)
+                val isTrackB = cue.action.contains("B") || cue.action == "fade_in" || cue.action == "full_volume"
+
+                // Determine absolute timestamp for this cue
+                // Cue.beat is relative to Transition Start (0)
+                // Absolute Cue Time = TransitionStartTime + (TimeDelta for Cue.beat)
+
+                // Simplification: Calculate timestamps on the fly
+                val absoluteCueBeat = if (isTrackB) transitionStartBeatB + cue.beat else transitionStartBeatA + cue.beat
+                val cueGrid = if (isTrackB) gridB else gridA
+                val cueTime = getTimestampForBeat(cueGrid, absoluteCueBeat)
+
+                // Calculate delay: CueTime - (Track Start Time) - Elapsed
+                // Track Start Time is `startTimeA` (since they started together)
+                // Note: Track B technically started at startTimeB, but we started players simultaneously.
+                val trackStartTime = if (isTrackB) startTimeB else startTimeA
+
+                val elapsed = (System.currentTimeMillis() - startTimeSys) / 1000f
+
+                // Important: Adjust for playback speed if necessary, but timestamps from grid are absolute.
+                // If player is playing faster/slower, `elapsed` real time covers different amount of audio time.
+                // However, ExoPlayer handles speed. 1 real second = 1 * speed audio seconds.
+                // This makes precise syncing hard with `delay()`.
+                // A better approach for cues is comparing `player.currentPosition`.
+                // But for simplicity with existing code structure:
+
+                // We use System time. If player is 1.05x speed, it reaches cue faster.
+                val playbackSpeed = if (isTrackB) initialSpeedB else 1f
+                val timeToReachCue = (cueTime - trackStartTime) / playbackSpeed
+
+                val delayMs = ((timeToReachCue - elapsed) * 1000).toLong().coerceAtLeast(0)
                 delay(delayMs)
 
                 when (cue.action) {
                     "fade_in" -> pB.volume = cue.volume
                     "fade_out" -> pA.volume = cue.volume
                     "full_volume" -> pB.volume = 1f
-                    "end" -> stopPreview()
                     "start" -> pA.volume = 1f
+                    "end" -> { /* Transition done */ }
                 }
             }
+
+            // Wait for Post-Roll
+            delay(POST_ROLL_MS)
+            stopPreview()
         }
 
-        rampJob = viewModelScope.launch { monitorTempoRamp() }
-    }
+        // Start Tempo Ramp AFTER the transition window
+        // Transition Duration roughly = totalBeats * (60/BPM)
+        // We can just calculate the time difference between Transition End and Start
+        val transitionEndBeatB = transitionStartBeatB + (_barsCount.value * 4)
+        val transitionEndTimeB = getTimestampForBeat(gridB, transitionEndBeatB)
+        val transitionDurationRealTime = (transitionEndTimeB - transitionStartTimeB) / initialSpeedB
+        val delayBeforeRamp = ((transitionDurationRealTime) * 1000).toLong().coerceAtLeast(0)
 
+        // Add pre-roll to the ramp delay because ramp job starts NOW
+        // Ramp Delay = Time to reach Transition Start + Duration of Transition
+        val timeToReachTransitionStart = (transitionStartTimeB - startTimeB) / initialSpeedB
+        val totalRampDelay = ((timeToReachTransitionStart + transitionDurationRealTime) * 1000).toLong()
+
+        rampJob = viewModelScope.launch {
+            delay(totalRampDelay)
+            monitorTempoRamp()
+        }
+    }
 
 
     private fun stopPreview() {
         _isPlaying.value = false
         playerA?.pause()
         playerB?.pause()
+        // Reset speeds
+        playerA?.setPlaybackSpeed(1f)
         playerB?.setPlaybackSpeed(1f)
+
         playbackTickerJob?.cancel()
         _playbackBeat.value = null
         rampJob?.cancel()
@@ -269,12 +361,14 @@ class TransitionEditorViewModel @Inject constructor(
 
     private suspend fun monitorTempoRamp() = coroutineScope {
         val pB = playerB ?: return@coroutineScope
-        val rampMs = 4000L
+        val rampMs = 4000L // 4 seconds to return to normal speed
         val startTime = System.currentTimeMillis()
 
         while (isActive && _isPlaying.value) {
             val progress = ((System.currentTimeMillis() - startTime) / rampMs.toFloat()).coerceIn(0f, 1f)
-            val speed = targetSpeedB + (1f - targetSpeedB) * progress
+            // Interpolate from initialSpeedB to 1f
+            val speed = initialSpeedB + (1f - initialSpeedB) * progress
+
             withContext(Dispatchers.Main) { pB.setPlaybackSpeed(speed) }
             if (progress >= 1f) break
             delay(50)
