@@ -1,15 +1,27 @@
 package com.dd3boh.outertune.ui.screens
 
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Pause
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
@@ -56,6 +68,10 @@ fun TransitionEditorScreen(
     // FIX: Get offset for Track 2
     val beatOffsetTrack2 by viewModel.beatOffsetForTrack2.collectAsState()
 
+    val playbackBeat by viewModel.playbackBeat.collectAsState()
+
+    val waveformOffset by viewModel.waveformOffsetBeats.collectAsState()
+
     val barsCount by viewModel.barsCount.collectAsState()
     val transitionDuration by viewModel.transitionDurationSeconds.collectAsState()
     val transitionWidthFraction by viewModel.transitionWidthFraction.collectAsState()
@@ -64,6 +80,19 @@ fun TransitionEditorScreen(
     var overlapMode by remember { mutableStateOf("Overlap") }
     var eqMode by remember { mutableStateOf("None") }
     var effectMode by remember { mutableStateOf("Low pass filt...") }
+
+    val isPlaying by viewModel.isPlaying.collectAsState()
+
+    // UI VISIBILITY STATE
+    var controlsVisible by remember { mutableStateOf(true) }
+
+    // Auto-hide timer
+    LaunchedEffect(controlsVisible, isPlaying) {
+        if (controlsVisible && isPlaying) {
+            kotlinx.coroutines.delay(3000)
+            controlsVisible = false
+        }
+    }
 
     LaunchedEffect(waveformData1, waveformData2, track1, track2) {
         Log.d("TransitionEditor", "Waveform1 size: ${waveformData1.size}")
@@ -77,6 +106,11 @@ fun TransitionEditorScreen(
             .fillMaxSize()
             .background(Color.Black)
             .windowInsetsPadding(WindowInsets.safeDrawing)
+            .pointerInput(Unit) {
+                detectTapGestures(
+                    onTap = { controlsVisible = true }
+                )
+            }
     ) {
         val screenWidthPx = constraints.maxWidth.toFloat()
 
@@ -114,10 +148,18 @@ fun TransitionEditorScreen(
                 waveformData2 = waveformData2,
                 beatMarkers = beatIndices,
                 beatOffsetTrack2 = beatOffsetTrack2,
-                pixelsPerBeat = computedPixelsPerBeat,
+                pixelsPerBeat = pixelsPerBeat,
                 transitionWidthFraction = transitionWidthFraction,
                 transitionDuration = transitionDuration,
-                barsCount = barsCount
+                barsCount = barsCount,
+                isPlaying = isPlaying,
+                showControls = controlsVisible,
+                playbackBeat = playbackBeat,
+                currentWaveformOffset = waveformOffset,
+                onWaveformOffsetChanged = { pxOffset ->
+                    viewModel.setWaveformOffset(pxOffset, pixelsPerBeat) // <-- pass pixelsPerBeat here
+                },
+                onPlayPauseClick = { viewModel.togglePlayback() }
             )
 
             BarsDropdown(
@@ -160,6 +202,13 @@ fun WaveformsSection(
     transitionDuration: Float,
     barsCount: Int,
     initialOffset: Float = 0f,
+    isPlaying: Boolean,
+    showControls: Boolean,
+    playbackBeat: Float?,
+    currentWaveformOffset: Float,
+    onWaveformOffsetChanged: (Float) -> Unit,
+    onPlayPauseClick: () -> Unit
+
 
 ) {
     Box(modifier = Modifier.fillMaxWidth().height(300.dp)) {
@@ -173,7 +222,8 @@ fun WaveformsSection(
                     isBeatDomain = true,
                     pixelsPerBeat = pixelsPerBeat,
                     beatOffsetBeats = 0f,
-                    initialOffset = 0f,
+                    initialOffset = currentWaveformOffset,
+                    onOffsetChanged = onWaveformOffsetChanged,
                     songDurationSeconds = track1?.song?.duration?.toFloat() ?: 1f,
                     modifier = Modifier
                         .fillMaxWidth()
@@ -189,7 +239,7 @@ fun WaveformsSection(
                     isBeatDomain = true,
                     pixelsPerBeat = pixelsPerBeat,
                     beatOffsetBeats = beatOffsetTrack2,
-                    initialOffset = 0f,
+                    initialOffset = currentWaveformOffset,
                     songDurationSeconds = track2?.song?.duration?.toFloat() ?: 1f,
                     modifier = Modifier
                         .fillMaxWidth()
@@ -198,6 +248,8 @@ fun WaveformsSection(
 
             }
         }
+
+
 
         // Transition overlay
         BoxWithConstraints(modifier = Modifier.fillMaxSize().align(Alignment.Center)) {
@@ -218,6 +270,33 @@ fun WaveformsSection(
                         .border(2.dp, Color(0xFF4CAF50).copy(alpha = 0.6f), RoundedCornerShape(12.dp))
                 )
 
+                // PLAY BUTTON (Replaces old info box)
+                // Visible if: paused OR (playing AND controlsVisible)
+                AnimatedVisibility(
+                    visible = !isPlaying || showControls,
+                    enter = fadeIn(),
+                    exit = fadeOut(),
+                    modifier = Modifier.align(Alignment.Center)
+                ) {
+                    Surface(
+                        onClick = onPlayPauseClick,
+                        shape = CircleShape,
+                        color = Color(0xFF2C2C2C).copy(alpha = 0.95f),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF4CAF50)),
+                        modifier = Modifier.size(64.dp),
+                        shadowElevation = 8.dp
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Icon(
+                                imageVector = if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                                contentDescription = if (isPlaying) "Pause" else "Play",
+                                tint = Color.White,
+                                modifier = Modifier.size(32.dp)
+                            )
+                        }
+                    }
+                }
+
                 // Labels
                 Surface(
                     modifier = Modifier.align(Alignment.TopCenter).padding(top = 8.dp),
@@ -227,20 +306,25 @@ fun WaveformsSection(
                     Text("Transition Zone", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp))
                 }
 
-                Surface(
-                    modifier = Modifier.align(Alignment.Center),
-                    shape = RoundedCornerShape(20.dp),
-                    color = Color(0xFF2C2C2C).copy(alpha = 0.95f)
-                ) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
-                        Text("$barsCount bars", color = Color(0xFF4CAF50), fontSize = 16.sp, fontWeight = FontWeight.Bold)
-                        Text("%.1fs".format(transitionDuration), color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Medium)
-                    }
-                }
-
                 // Edge markers
                 Box(modifier = Modifier.width(2.dp).fillMaxHeight().align(Alignment.CenterStart).background(Color(0xFF4CAF50).copy(alpha = 0.8f)))
                 Box(modifier = Modifier.width(2.dp).fillMaxHeight().align(Alignment.CenterEnd).background(Color(0xFF4CAF50).copy(alpha = 0.8f)))
+            }
+        }
+
+        // GREEN LINE INDICATOR
+        if (playbackBeat != null) {
+            val xPosition = (playbackBeat * pixelsPerBeat) + currentWaveformOffset
+
+            // Draw Line
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                drawLine(
+                    color = Color.Green,
+                    start = Offset(xPosition, 0f),
+                    end = Offset(xPosition, size.height),
+                    strokeWidth = 4.dp.toPx(),
+                    cap = StrokeCap.Round
+                )
             }
         }
     }
