@@ -51,9 +51,19 @@ class TransitionEditorViewModel @Inject constructor(
     val waveformBeatDomain2 = _waveformBeatDomain2.asStateFlow()
 
     // Derived beat indices
-    val beatGridIndices: StateFlow<List<Float>> = combine(_beatGrid1, _beatGrid2) { grid1, grid2 ->
-        (grid1.indices.map { it.toFloat() } + grid2.indices.map { it.toFloat() }).distinct().sorted()
-    }.stateIn(viewModelScope, SharingStarted.Lazily, emptyList())
+    val beatMarkers: StateFlow<List<Float>> =
+        waveformBeatDomain1.map { samples ->
+            samples
+                .map { it.beatIndex }
+                .filter { it % 1f == 0f }   // EXACT beat starts only
+                .distinct()
+                .sorted()
+        }.stateIn(
+            viewModelScope,
+            SharingStarted.Lazily,
+            emptyList()
+        )
+
 
     // Pixels per beat
     private val _pixelsPerBeatBase = MutableStateFlow(48f)
@@ -83,8 +93,8 @@ class TransitionEditorViewModel @Inject constructor(
     private val _isPlaying = MutableStateFlow(false)
     val isPlaying = _isPlaying.asStateFlow()
 
-    private val _playbackBeat = MutableStateFlow<Float?>(null)
-    val playbackBeat = _playbackBeat.asStateFlow()
+//    private val _playbackBeat = MutableStateFlow<Float?>(null)
+//    val playbackBeat = _playbackBeat.asStateFlow()
 
     private val _playbackSpeed1 = MutableStateFlow(1f)
     val playbackSpeed1 = _playbackSpeed1.asStateFlow()
@@ -106,6 +116,13 @@ class TransitionEditorViewModel @Inject constructor(
 
     private val _track2OffsetBeats = MutableStateFlow(0f)
     val track2OffsetBeats = _track2OffsetBeats.asStateFlow()
+
+    private val _playbackBeatContinuous = MutableStateFlow<Float?>(null)
+    val playbackBeatContinuous = _playbackBeatContinuous.asStateFlow()
+
+    private val _playbackBeatMarker = MutableStateFlow<Float?>(null)
+    val playbackBeatMarker = _playbackBeatMarker.asStateFlow()
+
 
     private val PRE_ROLL_MS = 3000L
     private val POST_ROLL_MS = 10000L
@@ -160,6 +177,8 @@ class TransitionEditorViewModel @Inject constructor(
             songA?.let {
                 _waveformData1.value = loadWaveform(it.song.waveformPath, it.id)
                 _beatGrid1.value = loadBeatGrid(it.song.beatGridPath, it.id)
+                // DEBUG: Log first few beat timestamps
+                Log.d("BeatGrid", "Track 1 first beats: ${_beatGrid1.value.take(10)}")
             }
             songB?.let {
                 _waveformData2.value = loadWaveform(it.song.waveformPath, it.id)
@@ -222,137 +241,137 @@ class TransitionEditorViewModel @Inject constructor(
         val beatOffsetA = _track1OffsetBeats.value
         val beatOffsetB = _track2OffsetBeats.value
 
-        // -----------------------------------------------------------------------
-        // 1. GEOMETRY & ANCHOR POINTS
-        // -----------------------------------------------------------------------
+        // ------------------------------------------------------------
+        // 1. VISUAL → BEAT GEOMETRY
+        // ------------------------------------------------------------
         val zoneFraction = _transitionWidthFraction.value
         val marginFraction = (1f - zoneFraction) / 2f
-        val totalBeatsInZone = _barsCount.value * 4f
-        val visualDelayBeats = if (zoneFraction > 0) (marginFraction / zoneFraction) * totalBeatsInZone else 0f
+        val beatsInZone = _barsCount.value * 4f
+        val visualDelayBeats =
+            if (zoneFraction > 0f) (marginFraction / zoneFraction) * beatsInZone else 0f
 
         val anchorBeatA = beatOffsetA + visualDelayBeats
         val anchorBeatB = beatOffsetB + visualDelayBeats
 
-        // -----------------------------------------------------------------------
-        // 2. CALCULATE PLAYBACK SPEEDS (BEATMATCH)
-        // -----------------------------------------------------------------------
-        val masterSpeed = _playbackSpeed1.value
-
-        // Fetch actual BPMs
+        // ------------------------------------------------------------
+        // 2. BPM / SPEED
+        // ------------------------------------------------------------
         val bpmA = _track1.value?.song?.bpm ?: 120f
         val bpmB = _track2.value?.song?.bpm ?: 120f
 
-        // Beatmatch: Track B speed = bpmA / bpmB
-        val syncSpeedB = (bpmA / bpmB) * masterSpeed
+        val speedA = 1f
+        val speedB = bpmA / bpmB
 
-        // Logging
-        Log.d("DEBUG_BPM", "Track A playback speed: $masterSpeed")
-        Log.d("DEBUG_BPM", "Track B original BPM: $bpmB, Track B sync speed (beatmatched): $syncSpeedB")
-        Log.d("DEBUG_BPM", "Track A BPM: $bpmA, Track B adjusted BPM: ${bpmB * syncSpeedB}")
+        // ------------------------------------------------------------
+        // 3. SEEK BOTH TRACKS SO ANCHORS LINE UP IN REAL TIME
+        // ------------------------------------------------------------
+        val timeAnchorA = getTimestampForBeat(gridA, anchorBeatA)
+        val timeAnchorB = getTimestampForBeat(gridB, anchorBeatB)
 
-        // -----------------------------------------------------------------------
-        // 3. CALCULATE SEEK POSITIONS
-        // -----------------------------------------------------------------------
-        val timeStartA = getTimestampForBeat(gridA, anchorBeatA)
-        val timeStartB = getTimestampForBeat(gridB, anchorBeatB)
-        val timeAtLeftEdgeA = getTimestampForBeat(gridA, beatOffsetA)
+        val preroll = PRE_ROLL_MS / 1000f
 
-        val audioDurationToAnchorA = timeStartA - timeAtLeftEdgeA
-        val realSecondsToAnchor = audioDurationToAnchorA / masterSpeed
+        val seekA = (timeAnchorA - preroll).coerceAtLeast(0f)
+        val seekB = (timeAnchorB - preroll * speedB).coerceAtLeast(0f)
 
-        val rawSeekA = timeStartA - ((realSecondsToAnchor + (PRE_ROLL_MS / 1000f)) * masterSpeed)
-        val rawSeekB = timeStartB - ((realSecondsToAnchor + (PRE_ROLL_MS / 1000f)) * syncSpeedB)
+        pA.seekTo((seekA * 1000).toLong())
+        pB.seekTo((seekB * 1000).toLong())
 
-        val overflowA = if (rawSeekA < 0) -rawSeekA / masterSpeed else 0f
-        val overflowB = if (rawSeekB < 0) -rawSeekB / syncSpeedB else 0f
-        val reducePreRollBy = maxOf(overflowA, overflowB)
-        val actualPreRollSec = ((PRE_ROLL_MS / 1000f) - reducePreRollBy).coerceAtLeast(0f)
-        val totalRealTime = realSecondsToAnchor + actualPreRollSec
-
-        val finalSeekA = (timeStartA - (totalRealTime * masterSpeed)).coerceAtLeast(0f)
-        val finalSeekB = (timeStartB - (totalRealTime * syncSpeedB)).coerceAtLeast(0f)
-
-        // -----------------------------------------------------------------------
-        // 4. PLAYER SETUP
-        // -----------------------------------------------------------------------
-        pA.seekTo((finalSeekA * 1000).toLong())
-        pB.seekTo((finalSeekB * 1000).toLong())
+        // ------------------------------------------------------------
+        // 4. START BOTH PLAYERS IMMEDIATELY (CRITICAL FIX)
+        // ------------------------------------------------------------
+        pA.setPlaybackSpeed(speedA)
+        pB.setPlaybackSpeed(speedB)
 
         pA.volume = 1f
-        pB.volume = 0f
-
-        pA.setPlaybackSpeed(masterSpeed)
-        pB.setPlaybackSpeed(syncSpeedB)
+        pB.volume = 0f   // Track B muted until entry
 
         pA.play()
         pB.play()
 
-        // log positions every 500ms to verify beat alignment
-        viewModelScope.launch {
-            while (_isPlaying.value) {
-                val beatA = DJHelper.timeToBeat(gridA, pA.currentPosition / 1000f)
-                val beatB = DJHelper.timeToBeat(gridB, pB.currentPosition / 1000f)
-
-                Log.d(
-                    "DEBUG_BPM",
-                    "Positions - TrackA: ${pA.currentPosition} ms (beat $beatA), " +
-                            "TrackB: ${pB.currentPosition} ms (beat $beatB)"
-                )
-
-                delay(500)
-            }
-        }
-
-        // -----------------------------------------------------------------------
-        // 5. CUE GENERATION
-        // -----------------------------------------------------------------------
-        val rawCues = DJHelper.generateDJCues(
-            bars = _barsCount.value,
-            mode = _overlapMode.value
-        )
-
-        val executionPlan = rawCues.map { cue ->
-            val isTrackB = cue.track == "B"
-            val grid = if (isTrackB) gridB else gridA
-            val startBeat = if (isTrackB) anchorBeatB else anchorBeatA
-            val absBeat = startBeat + cue.beat
-            val absTime = getTimestampForBeat(grid, absBeat)
-            Triple(absTime, cue, isTrackB)
-        }.sortedBy { it.first }
-
-        val stopTime = getTimestampForBeat(gridA, anchorBeatA + totalBeatsInZone) + (POST_ROLL_MS / 1000f)
-
-        // -----------------------------------------------------------------------
-        // 6. MONITORING LOOP
-        // -----------------------------------------------------------------------
+        // ------------------------------------------------------------
+        // 5. PLAYBACK MONITOR LOOP
+        // ------------------------------------------------------------
         playbackJob?.cancel()
         playbackJob = viewModelScope.launch {
-            val executed = BooleanArray(executionPlan.size) { false }
+            val entryBeatA = anchorBeatA
+            var bUnmuted = false
+            var lastLog = 0L
+
+            var lastSyncTime = 0L
+            val SYNC_INTERVAL_MS = 100L // Run correction only every 100ms
 
             while (isActive && _isPlaying.value) {
                 val posA = pA.currentPosition / 1000f
                 val posB = pB.currentPosition / 1000f
 
-                if (posA > 0) _playbackBeat.value = DJHelper.timeToBeat(gridA, posA)
+                val beatA = DJHelper.timeToBeat(gridA, posA)
+                val beatB = DJHelper.timeToBeat(gridB, posB)
 
-                executionPlan.forEachIndexed { i, (triggerTime, cue, isTrackB) ->
-                    if (!executed[i]) {
-                        val currentPos = if (isTrackB) posB else posA
-                        if (currentPos >= triggerTime) {
-                            executed[i] = true
-                            withContext(Dispatchers.Main) {
-                                val player = if (cue.track == "A") pA else pB
-                                player.volume = cue.volume
-                            }
+                _playbackBeatMarker.value = beatA
+
+                // ----------------------------------------------------
+                // UNMUTE TRACK B EXACTLY ON BEAT
+                // ----------------------------------------------------
+                if (!bUnmuted && beatA >= entryBeatA) {
+                    pB.volume = 1f
+                    bUnmuted = true
+                }
+
+                var aMuted = false  // declare near bUnmuted
+
+                // inside the while loop, after the bUnmuted block:
+                val endBeatA = anchorBeatA + beatsInZone
+                if (!aMuted && beatA >= endBeatA) {
+                    pA.volume = 0f
+                    aMuted = true
+                }
+
+                // ----------------------------------------------------
+                // OPTIONAL: PHASE CORRECTION (HIGHLY RECOMMENDED)
+                // ----------------------------------------------------
+                val now = System.currentTimeMillis()
+
+                if (bUnmuted && (now - lastSyncTime > SYNC_INTERVAL_MS)) {
+                    lastSyncTime = now
+
+                    val targetBeatB = beatA - entryBeatA
+                    val phaseError = beatB - targetBeatB
+
+                    // Increased threshold slightly to prevent micro-jitter
+                    if (kotlin.math.abs(phaseError) > 0.03f) {
+                        // Gentle correction factor (0.05f is usually safe)
+                        val correction = (phaseError * 0.05f).coerceIn(-0.05f, 0.05f)
+
+                        // Apply speed change
+                        pB.setPlaybackSpeed(speedB * (1f - correction))
+                    } else {
+                        // If error is small, snap back to base speed to ensure stability
+                        // (Only if we aren't already at base speed)
+                        if (pB.playbackParameters.speed != speedB) {
+                            pB.setPlaybackSpeed(speedB)
                         }
                     }
                 }
 
-                if (posA >= stopTime) stopPreview()
+                delay(16)
+
+                // ----------------------------------------------------
+                // DEBUG LOG (OPTIONAL)
+                // ----------------------------------------------------
+//                val now = System.currentTimeMillis()
+//                if (now - lastLog > 200 && bUnmuted) {
+//                    lastLog = now
+//                    Log.d(
+//                        "BEATMATCH",
+//                        "A=${"%.2f".format(beatA)}  B=${"%.2f".format(beatB)}  Δ=${"%.4f".format(beatB - (beatA - entryBeatA))}"
+//                    )
+//                }
+
                 delay(16)
             }
         }
     }
+
 
 
 
@@ -369,7 +388,9 @@ class TransitionEditorViewModel @Inject constructor(
 
         playbackJob?.cancel()
         playbackJob = null
-        _playbackBeat.value = null
+        _playbackBeatContinuous.value = null
+        _playbackBeatMarker.value = null
+
         rampJob?.cancel()
     }
 
@@ -414,22 +435,75 @@ class TransitionEditorViewModel @Inject constructor(
     }
 
     private fun convertWaveformToBeatDomain(
-        waveform: FloatArray, grid: List<Float>, durationSec: Float, pixelsPerBeat: Int
+        waveform: FloatArray,
+        grid: List<Float>,
+        durationSec: Float,
+        pixelsPerBeat: Int
     ): List<BeatSample> {
         if (waveform.isEmpty() || grid.size < 2 || durationSec <= 0f) return emptyList()
-        val out = ArrayList<BeatSample>((grid.size-1)*pixelsPerBeat)
+        val out = ArrayList<BeatSample>()
         val size = waveform.size
-        for (b in 0 until grid.size-1) {
-            val t0 = grid[b].coerceAtLeast(0f); val t1 = grid[b+1].coerceAtMost(durationSec)
-            val startIdx = ((t0/durationSec)*size).toInt().coerceIn(0,size-1)
-            val endIdx = ((t1/durationSec)*size).toInt().coerceIn(0,size)
-            val len = (endIdx-startIdx).coerceAtLeast(1)
-            for (px in 0 until pixelsPerBeat) {
-                val s = startIdx + (px.toFloat()/pixelsPerBeat*len).toInt()
-                val e = startIdx + ((px+1).toFloat()/pixelsPerBeat*len).toInt()
+
+        // Add pre-roll (audio before first beat)
+        if (grid[0] > 0.01f) {
+            val preRollDuration = grid[0]
+            val avgBeatInterval = (grid[1] - grid[0])
+            val preRollBeats = preRollDuration / avgBeatInterval
+
+            val startIdx = 0
+            val endIdx = ((grid[0] / durationSec) * size).toInt().coerceIn(0, size)
+            val len = (endIdx - startIdx).coerceAtLeast(1)
+
+            val preRollPixels = (preRollBeats * pixelsPerBeat).toInt().coerceAtLeast(1)
+
+            for (px in 0 until preRollPixels) {
+                val s = startIdx + (px.toFloat() / preRollPixels * len).toInt()
+                val e = startIdx + ((px + 1).toFloat() / preRollPixels * len).toInt().coerceAtMost(size)
                 var maxAmp = 0f
-                for (i in s until e.coerceAtMost(size)) maxAmp = maxOf(maxAmp, abs(waveform[i]))
-                out.add(BeatSample(b + px.toFloat()/pixelsPerBeat, maxAmp))
+                for (i in s until e) maxAmp = maxOf(maxAmp, abs(waveform[i]))
+
+                out.add(BeatSample(-preRollBeats + (px.toFloat() / pixelsPerBeat), maxAmp))
+            }
+        }
+
+        // Add waveform for each beat interval
+        for (beatIndex in 0 until grid.size - 1) {
+            val t0 = grid[beatIndex].coerceAtLeast(0f)
+            val t1 = grid[beatIndex + 1].coerceAtMost(durationSec)
+
+            val startIdx = ((t0 / durationSec) * size).toInt().coerceIn(0, size - 1)
+            val endIdx = ((t1 / durationSec) * size).toInt().coerceIn(0, size)
+            val len = (endIdx - startIdx).coerceAtLeast(1)
+
+            for (px in 0 until pixelsPerBeat) {
+                val s = startIdx + (px.toFloat() / pixelsPerBeat * len).toInt()
+                val e = startIdx + ((px + 1).toFloat() / pixelsPerBeat * len).toInt().coerceAtMost(size)
+                var maxAmp = 0f
+                for (i in s until e) maxAmp = maxOf(maxAmp, abs(waveform[i]))
+
+                out.add(BeatSample(beatIndex.toFloat() + (px.toFloat() / pixelsPerBeat), maxAmp))
+            }
+        }
+
+        // Add post-roll (audio after last beat)
+        if (grid.last() < durationSec - 0.01f) {
+            val postRollDuration = durationSec - grid.last()
+            val avgBeatInterval = (grid[grid.size - 1] - grid[grid.size - 2])
+            val postRollBeats = postRollDuration / avgBeatInterval
+
+            val startIdx = ((grid.last() / durationSec) * size).toInt().coerceIn(0, size - 1)
+            val endIdx = size
+            val len = (endIdx - startIdx).coerceAtLeast(1)
+
+            val postRollPixels = (postRollBeats * pixelsPerBeat).toInt().coerceAtLeast(1)
+
+            for (px in 0 until postRollPixels) {
+                val s = startIdx + (px.toFloat() / postRollPixels * len).toInt()
+                val e = startIdx + ((px + 1).toFloat() / postRollPixels * len).toInt().coerceAtMost(size)
+                var maxAmp = 0f
+                for (i in s until e) maxAmp = maxOf(maxAmp, abs(waveform[i]))
+
+                out.add(BeatSample(grid.size - 1 + (px.toFloat() / pixelsPerBeat), maxAmp))
             }
         }
         return out
@@ -438,6 +512,16 @@ class TransitionEditorViewModel @Inject constructor(
     private fun loadWaveform(path: String?, id: String) = File(path ?: "${context.cacheDir}/analysis_data/${id}_waveform.dat")
         .takeIf { it.exists() }?.readText()?.split(",")?.mapNotNull { it.toFloatOrNull() }?.toFloatArray() ?: FloatArray(0)
 
-    private fun loadBeatGrid(path: String?, id: String) = File(path ?: "${context.cacheDir}/analysis_data/${id}_beats.dat")
-        .takeIf { it.exists() }?.readText()?.split(",")?.mapNotNull { it.toFloatOrNull() }?.map { it / 1000f } ?: emptyList()
+    private fun loadBeatGrid(path: String?, id: String): List<Float> {
+        val timestamps = File(path ?: "${context.cacheDir}/analysis_data/${id}_beats.dat")
+            .takeIf { it.exists() }
+            ?.readText()
+            ?.split(",")
+            ?.mapNotNull { it.toFloatOrNull() }
+            ?.map { it / 1000f } // Convert ms to seconds
+            ?: emptyList()
+
+        // Return timestamps, not indices
+        return timestamps
+    }
 }

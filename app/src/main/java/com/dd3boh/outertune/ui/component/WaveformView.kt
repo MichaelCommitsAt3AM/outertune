@@ -19,7 +19,7 @@ import kotlin.math.roundToInt
 
 @Composable
 fun WaveformView(
-    waveformData: List<BeatSample>,  // FIXED: Now uses List<BeatSample>
+    waveformData: List<BeatSample>,
     beatMarkers: List<Float>,
     markerPosition: BeatMarkerPosition,
     songDurationSeconds: Float?,
@@ -114,6 +114,7 @@ fun WaveformView(
             // Calculate shift for Track 2
             val beatOffsetPixels = beatOffsetBeats * effectivePxPerBeat
 
+
             // FIXED: Render waveform using beat positions
             if (waveformData.isNotEmpty()) {
                 // Calculate visible beat range for optimization
@@ -145,10 +146,13 @@ fun WaveformView(
 
             // Beat markers rendering
             if (beatMarkers.isNotEmpty()) {
-                beatMarkers.forEachIndexed { _, beatIndexFloat ->
-                    val x = (beatIndexFloat * effectivePxPerBeat) + currentOffset + beatOffsetPixels
+                beatMarkers.forEach { beatIndexFloat ->
 
-                    val isMajorBeat = (beatIndexFloat.roundToInt() % 4 == 0)
+                    val x = (beatIndexFloat * effectivePxPerBeat) +
+                            currentOffset +
+                            beatOffsetPixels
+
+                    val isMajorBeat = (beatIndexFloat % 4f == 0f)
                     val color = if (isMajorBeat) Color(0xFF4CAF50) else Color.Gray
                     val strokeWidth = if (isMajorBeat) 6f else 3f
                     val lineLength = if (isMajorBeat) 50f else 30f

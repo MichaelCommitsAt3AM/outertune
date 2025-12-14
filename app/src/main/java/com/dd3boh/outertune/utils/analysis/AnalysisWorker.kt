@@ -64,10 +64,26 @@ class AnalysisWorker @AssistedInject constructor(
 
             // Step 2: Analyze BPM using Aubio
             Log.d(TAG, "Step 2: Running BPM analysis...")
-            val analysisResult = AudioAnalyzer.analyzeBpm(pcmData, sampleRate) ?: run {
-                Log.e(TAG, "Analysis returned null")
-                return Result.failure()
-            }
+            val analysisResult = AudioAnalyzer.analyzeBpm(pcmData, sampleRate) ?: return Result.failure()
+
+            // --- NEW PROCESSING STEP ---
+            Log.d(TAG, "Step 2.5: Refining beat grid (Snap + Backfill)...")
+
+            val finalBeatGrid = processBeatGrid(
+                analysisResult.beatGrid,
+                pcmData,
+                sampleRate,
+                analysisResult.bpm
+            )
+
+            Log.d(TAG, "Grid size increased from ${analysisResult.beatGrid.size} to ${finalBeatGrid.size}")
+
+            Log.d(TAG, "Step 2.5: Snapping beats to transients...")
+            val alignedBeatGrid = alignBeatsToTransients(
+                analysisResult.beatGrid,
+                pcmData,
+                sampleRate
+            )
 
             // Step 3: Get waveform for visualization (Amplituda)
             Log.d(TAG, "Step 3: Extracting waveform...")
@@ -89,7 +105,7 @@ class AnalysisWorker @AssistedInject constructor(
 
             // Save beat grid (timestamps in seconds)
             val beatFile = File(cacheDir, "${songId}_beats.dat")
-            beatFile.writeText(analysisResult.beatGrid.joinToString(","))
+            beatFile.writeText(alignedBeatGrid.joinToString(","))
             Log.d(TAG, "Beat grid: ${analysisResult.beatGrid.size} beats, sample=${analysisResult.beatGrid.take(5)}")
 
             // Step 5: Update SongEntity
@@ -108,5 +124,112 @@ class AnalysisWorker @AssistedInject constructor(
             e.printStackTrace()
             Result.failure()
         }
+    }
+
+    private fun processBeatGrid(
+        roughGrid: LongArray,
+        pcmData: FloatArray,
+        sampleRate: Int,
+        bpm: Float
+    ): LongArray {
+        if (roughGrid.isEmpty()) return roughGrid
+
+        // 1. SNAP TO TRANSIENTS (Fixes misalignment)
+        // We look for the "attack" (sharpest rise in energy), not just max volume.
+        val snappedGrid = roughGrid.map { beatTimeMs ->
+            findTransient(beatTimeMs, pcmData, sampleRate)
+        }.toLongArray()
+
+        // 2. BACK-FILL MISSING START BEATS (Fixes missing first 3-5 seconds)
+        // We calculate where beats *should* be before the first detected beat.
+        val firstBeat = snappedGrid.first()
+        val beatIntervalMs = (60_000f / bpm).toLong()
+
+        val newBeats = ArrayList<Long>()
+
+        // Extrapolate backwards from the first valid beat
+        var currentBeat = firstBeat - beatIntervalMs
+        while (currentBeat >= 0) {
+            // Optional: Attempt to snap this theoretical beat to a real transient too
+            val realTransient = findTransient(currentBeat, pcmData, sampleRate)
+
+            // Only accept the snap if it's close (within 50ms) to the grid,
+            // otherwise strict time is safer for intros with no drums.
+            if (kotlin.math.abs(realTransient - currentBeat) < 50) {
+                newBeats.add(0, realTransient)
+            } else {
+                newBeats.add(0, currentBeat)
+            }
+            currentBeat -= beatIntervalMs
+        }
+
+        // Combine back-filled beats with original aligned beats
+        return (newBeats + snappedGrid.toList()).toLongArray()
+    }
+
+    private fun findTransient(targetTimeMs: Long, pcmData: FloatArray, sampleRate: Int): Long {
+        val centerSample = (targetTimeMs * sampleRate / 1000).toInt()
+        val windowMs = 80
+        val windowSamples = (windowMs * sampleRate / 1000).toInt()
+
+        // FIX 1: Ensure start is at least 1, because we access pcmData[i-1] below
+        val start = (centerSample - windowSamples).coerceAtLeast(1)
+
+        // FIX 2: Ensure end does not exceed array bounds
+        val end = (centerSample + windowSamples).coerceAtMost(pcmData.size - 1)
+
+        // Safety: If the window is invalid (e.g., song is empty), return original time
+        if (start >= end) return targetTimeMs
+
+        var maxEnergyRise = -1f
+        var bestIndex = centerSample
+
+        for (i in start until end) {
+            val currentAmp = kotlin.math.abs(pcmData[i])
+            val prevAmp = kotlin.math.abs(pcmData[i-1]) // Safe now because i >= 1
+            val rise = currentAmp - prevAmp
+
+            if (rise > maxEnergyRise) {
+                maxEnergyRise = rise
+                bestIndex = i
+            }
+        }
+
+        return (bestIndex.toLong() * 1000) / sampleRate
+    }
+
+    private fun alignBeatsToTransients(
+        roughGrid: LongArray,
+        pcmData: FloatArray,
+        sampleRate: Int,
+        searchWindowMs: Long = 100 // Look +/- 50ms around the detected beat
+    ): LongArray {
+        val windowSamples = (searchWindowMs * sampleRate / 1000).toInt()
+        val halfWindow = windowSamples / 2
+        val maxIndex = pcmData.size - 1
+
+        return roughGrid.map { beatTimeMs ->
+            // Convert ms to sample index
+            val centerSample = (beatTimeMs * sampleRate / 1000).toInt()
+
+            // Define search range (safely within array bounds)
+            val start = (centerSample - halfWindow).coerceAtLeast(0)
+            val end = (centerSample + halfWindow).coerceAtMost(maxIndex)
+
+            // Find the index of the maximum amplitude in this window
+            var maxAmp = -1f
+            var maxAmpIndex = centerSample
+
+            for (i in start..end) {
+                val amp = kotlin.math.abs(pcmData[i])
+                if (amp > maxAmp) {
+                    maxAmp = amp
+                    maxAmpIndex = i
+                }
+            }
+
+            // Convert back to milliseconds
+            (maxAmpIndex.toLong() * 1000) / sampleRate
+        }.toLongArray()
     }
 }

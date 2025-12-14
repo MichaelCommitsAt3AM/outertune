@@ -58,11 +58,13 @@ fun TransitionEditorScreen(
     val waveformData1 by viewModel.waveformBeatDomain1.collectAsState()
     val waveformData2 by viewModel.waveformBeatDomain2.collectAsState()
 
-    val beatIndices by viewModel.beatGridIndices.collectAsState(initial = emptyList())
+    val beatMarkers by viewModel.beatMarkers.collectAsState(initial = emptyList())
+
 
     val pixelsPerBeat by viewModel.pixelsPerBeatBase.collectAsState()
 
-    val playbackBeat by viewModel.playbackBeat.collectAsState()
+    val playbackBeatMarker by viewModel.playbackBeatMarker.collectAsState()
+
 
     // Independent offsets
     val track1Offset by viewModel.track1OffsetBeats.collectAsState()
@@ -132,14 +134,14 @@ fun TransitionEditorScreen(
                 track2 = track2,
                 waveformData1 = waveformData1,
                 waveformData2 = waveformData2,
-                beatMarkers = beatIndices,
+                beatMarkers = beatMarkers,
                 pixelsPerBeat = pixelsPerBeat,
                 transitionWidthFraction = transitionWidthFraction,
                 transitionDuration = transitionDuration,
                 barsCount = barsCount,
                 isPlaying = isPlaying,
                 showControls = controlsVisible,
-                playbackBeat = playbackBeat,
+                playbackBeatMarker = playbackBeatMarker,
                 track1Offset = track1Offset,
                 track2Offset = track2Offset,
                 onTrack1OffsetChanged = { px -> viewModel.setTrack1Offset(px, pixelsPerBeat) },
@@ -187,7 +189,7 @@ fun WaveformsSection(
     barsCount: Int,
     isPlaying: Boolean,
     showControls: Boolean,
-    playbackBeat: Float?,
+    playbackBeatMarker: Float?,
     track1Offset: Float,
     track2Offset: Float,
     onTrack1OffsetChanged: (Float) -> Unit,
@@ -294,13 +296,8 @@ fun WaveformsSection(
         }
 
         // GREEN LINE INDICATOR
-        if (playbackBeat != null && pixelsPerBeat > 0) {
-            // Draw relative to the primary track's visual position.
-            // We use track1Offset because the UI is aligned to Track 1's perspective
-            val xPosition = (playbackBeat - track1Offset) * pixelsPerBeat
-
-            // Only draw if within visible bounds (optional, but good for performance)
-            // Note: We use a larger range to ensure thick lines don't get clipped at edges
+        if (playbackBeatMarker != null && pixelsPerBeat > 0) {
+            val xPosition = (playbackBeatMarker - track1Offset) * pixelsPerBeat
 
             Canvas(modifier = Modifier.fillMaxSize()) {
                 drawLine(
@@ -311,8 +308,8 @@ fun WaveformsSection(
                     cap = StrokeCap.Round
                 )
             }
-
         }
+
     }
 }
 
