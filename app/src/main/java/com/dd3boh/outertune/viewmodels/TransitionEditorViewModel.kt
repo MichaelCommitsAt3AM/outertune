@@ -174,20 +174,30 @@ class TransitionEditorViewModel @Inject constructor(
             _track1.value = songA
             _track2.value = songB
 
+            // 1. Load Raw Data
             songA?.let {
                 _waveformData1.value = loadWaveform(it.song.waveformPath, it.id)
                 _beatGrid1.value = loadBeatGrid(it.song.beatGridPath, it.id)
-                // DEBUG: Log first few beat timestamps
-                Log.d("BeatGrid", "Track 1 first beats: ${_beatGrid1.value.take(10)}")
             }
             songB?.let {
                 _waveformData2.value = loadWaveform(it.song.waveformPath, it.id)
                 _beatGrid2.value = loadBeatGrid(it.song.beatGridPath, it.id)
             }
 
+            // 2. Refine Beats (Snap to Peak)
+            val durA = songA?.song?.duration?.toFloat() ?: 1f
+            if (_waveformData1.value.isNotEmpty() && _beatGrid1.value.isNotEmpty()) {
+                _beatGrid1.value = refineBeatGrid(_beatGrid1.value, _waveformData1.value, durA)
+            }
+
+            val durB = songB?.song?.duration?.toFloat() ?: 1f
+            if (_waveformData2.value.isNotEmpty() && _beatGrid2.value.isNotEmpty()) {
+                _beatGrid2.value = refineBeatGrid(_beatGrid2.value, _waveformData2.value, durB)
+            }
+
+            // 3. Continue with existing setup...
             val bpmA = calculateStableBpm(_beatGrid1.value, songA?.song?.bpm)
             val bpmB = calculateStableBpm(_beatGrid2.value, songB?.song?.bpm)
-
 
             if (abs(bpmA - bpmB) <= 15f && bpmB > 0f) {
                 initialSpeedB = bpmA / bpmB
@@ -199,8 +209,7 @@ class TransitionEditorViewModel @Inject constructor(
             _playbackSpeed2.value = initialSpeedB
 
             val pxPerBeat = 48
-            val durA = songA?.song?.duration?.toFloat() ?: 1f
-            val durB = songB?.song?.duration?.toFloat() ?: 1f
+            // (Note: durA and durB are already defined above, you can reuse them)
 
             _waveformBeatDomain1.value = convertWaveformToBeatDomain(_waveformData1.value, _beatGrid1.value, durA, pxPerBeat)
             _waveformBeatDomain2.value = convertWaveformToBeatDomain(_waveformData2.value, _beatGrid2.value, durB, pxPerBeat)
@@ -523,5 +532,47 @@ class TransitionEditorViewModel @Inject constructor(
 
         // Return timestamps, not indices
         return timestamps
+    }
+
+    /**
+     * Refines beat timestamps by snapping them to the nearest local waveform peak.
+     * This corrects the offset between the "onset" (start of sound) and "transient" (visual peak).
+     */
+    private fun refineBeatGrid(
+        roughGrid: List<Float>,
+        waveform: FloatArray,
+        durationSec: Float
+    ): List<Float> {
+        if (waveform.isEmpty() || roughGrid.isEmpty() || durationSec <= 0) return roughGrid
+
+        val sampleRate = waveform.size / durationSec
+        // Search window: Look 30ms before and 30ms after the detected timestamp
+        // 30ms is enough to cover the rise time of a kick drum without jumping to a different beat
+        val windowSizeMs = 30
+        val windowSamples = (windowSizeMs / 1000f * sampleRate).toInt()
+
+        return roughGrid.map { timestamp ->
+            // Convert time to sample index
+            val centerIndex = (timestamp * sampleRate).toInt()
+
+            // Define search bounds (clamped to array size)
+            val start = (centerIndex - windowSamples).coerceAtLeast(0)
+            val end = (centerIndex + windowSamples).coerceAtMost(waveform.size - 1)
+
+            // Find the index of the maximum amplitude in this window
+            var maxIndex = centerIndex
+            var maxAmp = -1f
+
+            for (i in start..end) {
+                val amp = kotlin.math.abs(waveform[i])
+                if (amp > maxAmp) {
+                    maxAmp = amp
+                    maxIndex = i
+                }
+            }
+
+            // Convert back to seconds
+            (maxIndex / sampleRate)
+        }
     }
 }

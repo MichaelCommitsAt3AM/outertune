@@ -36,7 +36,7 @@ Java_com_dd3boh_outertune_utils_analysis_AudioAnalyzer_analyzeBpm(
     LOGD("PCM length: %d samples (%.2f seconds)", length, (float)length / sampleRate);
 
     // Setup Aubio Tempo
-    uint_t win_size = 1024;
+    uint_t win_size = 2048;
     uint_t hop_size = 512;
     aubio_tempo_t* tempo = new_aubio_tempo("default", win_size, hop_size, (uint_t)sampleRate);
 

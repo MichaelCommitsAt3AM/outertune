@@ -12,6 +12,9 @@ import kotlinx.coroutines.flow.first
 import linc.com.amplituda.Amplituda
 import linc.com.amplituda.Compress
 import java.io.File
+import kotlin.math.abs
+import kotlin.math.pow
+import kotlin.math.roundToLong
 
 @HiltWorker
 class AnalysisWorker @AssistedInject constructor(
@@ -66,7 +69,7 @@ class AnalysisWorker @AssistedInject constructor(
             Log.d(TAG, "Step 2: Running BPM analysis...")
             val analysisResult = AudioAnalyzer.analyzeBpm(pcmData, sampleRate) ?: return Result.failure()
 
-            // --- NEW PROCESSING STEP ---
+            // --- STEP 2.5: PROCESSING STEP ---
             Log.d(TAG, "Step 2.5: Refining beat grid (Snap + Backfill)...")
 
             val finalBeatGrid = processBeatGrid(
@@ -78,12 +81,12 @@ class AnalysisWorker @AssistedInject constructor(
 
             Log.d(TAG, "Grid size increased from ${analysisResult.beatGrid.size} to ${finalBeatGrid.size}")
 
-            Log.d(TAG, "Step 2.5: Snapping beats to transients...")
-            val alignedBeatGrid = alignBeatsToTransients(
-                analysisResult.beatGrid,
-                pcmData,
-                sampleRate
-            )
+//            Log.d(TAG, "Step 2.5: Snapping beats to transients...")
+//            val alignedBeatGrid = alignBeatsToTransients(
+//                analysisResult.beatGrid,
+//                pcmData,
+//                sampleRate
+//            )
 
             // Step 3: Get waveform for visualization (Amplituda)
             Log.d(TAG, "Step 3: Extracting waveform...")
@@ -104,8 +107,9 @@ class AnalysisWorker @AssistedInject constructor(
             waveformFile.writeText(normalizedWaveform.joinToString(","))
 
             // Save beat grid (timestamps in seconds)
+            val quantizedGrid = quantizeBeatGrid(finalBeatGrid, analysisResult.bpm)
             val beatFile = File(cacheDir, "${songId}_beats.dat")
-            beatFile.writeText(alignedBeatGrid.joinToString(","))
+            beatFile.writeText(quantizedGrid.joinToString(","))
             Log.d(TAG, "Beat grid: ${analysisResult.beatGrid.size} beats, sample=${analysisResult.beatGrid.take(5)}")
 
             // Step 5: Update SongEntity
@@ -143,24 +147,27 @@ class AnalysisWorker @AssistedInject constructor(
         // 2. BACK-FILL MISSING START BEATS (Fixes missing first 3-5 seconds)
         // We calculate where beats *should* be before the first detected beat.
         val firstBeat = snappedGrid.first()
-        val beatIntervalMs = (60_000f / bpm).toLong()
+        val beatIntervalMs = (60_000f / bpm)
 
         val newBeats = ArrayList<Long>()
 
         // Extrapolate backwards from the first valid beat
-        var currentBeat = firstBeat - beatIntervalMs
-        while (currentBeat >= 0) {
-            // Optional: Attempt to snap this theoretical beat to a real transient too
+        var i = 1
+        while (true) {
+            val theoreticalBeatDouble = firstBeat - (i * beatIntervalMs)
+            if (theoreticalBeatDouble < 0) break
+
+            val currentBeat = theoreticalBeatDouble.roundToLong()
+
+            // Optional: Attempt to snap
             val realTransient = findTransient(currentBeat, pcmData, sampleRate)
 
-            // Only accept the snap if it's close (within 50ms) to the grid,
-            // otherwise strict time is safer for intros with no drums.
-            if (kotlin.math.abs(realTransient - currentBeat) < 50) {
+            if (abs(realTransient - currentBeat) < 50) {
                 newBeats.add(0, realTransient)
             } else {
                 newBeats.add(0, currentBeat)
             }
-            currentBeat -= beatIntervalMs
+            i++
         }
 
         // Combine back-filled beats with original aligned beats
@@ -169,13 +176,10 @@ class AnalysisWorker @AssistedInject constructor(
 
     private fun findTransient(targetTimeMs: Long, pcmData: FloatArray, sampleRate: Int): Long {
         val centerSample = (targetTimeMs * sampleRate / 1000).toInt()
-        val windowMs = 80
+        val windowMs = 40
         val windowSamples = (windowMs * sampleRate / 1000).toInt()
 
-        // FIX 1: Ensure start is at least 1, because we access pcmData[i-1] below
-        val start = (centerSample - windowSamples).coerceAtLeast(1)
-
-        // FIX 2: Ensure end does not exceed array bounds
+        val start = (centerSample - windowSamples).coerceAtLeast(0)
         val end = (centerSample + windowSamples).coerceAtMost(pcmData.size - 1)
 
         // Safety: If the window is invalid (e.g., song is empty), return original time
@@ -186,8 +190,8 @@ class AnalysisWorker @AssistedInject constructor(
 
         for (i in start until end) {
             val currentAmp = kotlin.math.abs(pcmData[i])
-            val prevAmp = kotlin.math.abs(pcmData[i-1]) // Safe now because i >= 1
-            val rise = currentAmp - prevAmp
+            val prevAmp = if (i == 0) 0f else kotlin.math.abs(pcmData[i - 1])
+            val rise = currentAmp * currentAmp - prevAmp * prevAmp
 
             if (rise > maxEnergyRise) {
                 maxEnergyRise = rise
@@ -231,5 +235,38 @@ class AnalysisWorker @AssistedInject constructor(
             // Convert back to milliseconds
             (maxAmpIndex.toLong() * 1000) / sampleRate
         }.toLongArray()
+    }
+
+    private fun quantizeBeatGrid(beatGrid: LongArray, bpm: Float): LongArray {
+        if (beatGrid.size < 2) return beatGrid
+
+        // Calculate differences
+        val diffs = LongArray(beatGrid.size - 1) { i -> beatGrid[i + 1] - beatGrid[i] }
+
+        // FIX: Calculate mean as Double and keep it that way
+        val meanDiffDouble = diffs.average()
+
+        // Calculate standard deviation using the Double mean
+        val stdDiff = diffs.map { (it - meanDiffDouble).pow(2) }.average().pow(0.5)
+
+        // Check variance (using Double math)
+        // If low variance (e.g., <2% of mean), force even grid
+        if (stdDiff / meanDiffDouble < 0.02) {
+            Log.d(TAG, "Quantizing grid (low variance: std=$stdDiff, mean=$meanDiffDouble)")
+
+            // FIX: Reconstruct grid using Double precision arithmetic
+            // This prevents the "0.75ms per beat" error from accumulating
+            val quantized = LongArray(beatGrid.size) { i ->
+                (beatGrid[0] + i * meanDiffDouble).roundToLong()
+            }
+
+            // Ensure calculated interval matches BPM estimate roughly
+            val expectedInterval = 60_000.0 / bpm
+            if (abs(meanDiffDouble - expectedInterval) < 10) {
+                return quantized
+            }
+        }
+
+        return beatGrid
     }
 }
