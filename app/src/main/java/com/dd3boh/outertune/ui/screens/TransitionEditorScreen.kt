@@ -67,8 +67,8 @@ fun TransitionEditorScreen(
 
 
     // Independent offsets
-    val track1Offset by viewModel.track1OffsetBeats.collectAsState()
-    val track2Offset by viewModel.track2OffsetBeats.collectAsState()
+    val track1OffsetBeats by viewModel.track1OffsetBeats.collectAsState()
+    val track2OffsetBeats by viewModel.track2OffsetBeats.collectAsState()
 
     val barsCount by viewModel.barsCount.collectAsState()
     val transitionDuration by viewModel.transitionDurationSeconds.collectAsState()
@@ -129,6 +129,9 @@ fun TransitionEditorScreen(
 
             Spacer(modifier = Modifier.height(24.dp))
 
+            val track1OffsetPixels = -track1OffsetBeats * pixelsPerBeat
+            val track2OffsetPixels = -track2OffsetBeats * pixelsPerBeat
+
             WaveformsSection(
                 track1 = track1,
                 track2 = track2,
@@ -142,8 +145,8 @@ fun TransitionEditorScreen(
                 isPlaying = isPlaying,
                 showControls = controlsVisible,
                 playbackBeatMarker = playbackBeatMarker,
-                track1Offset = track1Offset,
-                track2Offset = track2Offset,
+                track1OffsetPixels = track1OffsetPixels,
+                track2OffsetPixels = track2OffsetPixels,
                 onTrack1OffsetChanged = { px -> viewModel.setTrack1Offset(px, pixelsPerBeat) },
                 onTrack2OffsetChanged = { px -> viewModel.setTrack2Offset(px, pixelsPerBeat) },
                 onPlayPauseClick = { viewModel.togglePlayback() }
@@ -190,8 +193,8 @@ fun WaveformsSection(
     isPlaying: Boolean,
     showControls: Boolean,
     playbackBeatMarker: Float?,
-    track1Offset: Float,
-    track2Offset: Float,
+    track1OffsetPixels: Float,
+    track2OffsetPixels: Float,
     onTrack1OffsetChanged: (Float) -> Unit,
     onTrack2OffsetChanged: (Float) -> Unit,
     onPlayPauseClick: () -> Unit
@@ -207,7 +210,7 @@ fun WaveformsSection(
                     isBeatDomain = true,
                     pixelsPerBeat = pixelsPerBeat,
                     beatOffsetBeats = 0f,
-                    initialOffset = track1Offset, // Pass track 1 specific offset
+                    initialOffset = track1OffsetPixels, // Pass track 1 specific offset
                     onOffsetChanged = onTrack1OffsetChanged,
                     songDurationSeconds = track1?.song?.duration?.toFloat() ?: 1f,
                     modifier = Modifier
@@ -224,7 +227,7 @@ fun WaveformsSection(
                     isBeatDomain = true,
                     pixelsPerBeat = pixelsPerBeat,
                     beatOffsetBeats = 0f,
-                    initialOffset = track1Offset + track2Offset,
+                    initialOffset = track2OffsetPixels,
                     onOffsetChanged = onTrack2OffsetChanged,
                     songDurationSeconds = track2?.song?.duration?.toFloat() ?: 1f,
                     modifier = Modifier
@@ -297,7 +300,7 @@ fun WaveformsSection(
 
         // GREEN LINE INDICATOR
         if (playbackBeatMarker != null && pixelsPerBeat > 0) {
-            val xPosition = (playbackBeatMarker - track1Offset) * pixelsPerBeat
+            val xPosition = (playbackBeatMarker * pixelsPerBeat) + track1OffsetPixels
 
             Canvas(modifier = Modifier.fillMaxSize()) {
                 drawLine(

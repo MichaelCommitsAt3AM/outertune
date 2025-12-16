@@ -13,7 +13,6 @@ import linc.com.amplituda.Amplituda
 import linc.com.amplituda.Compress
 import java.io.File
 import kotlin.math.abs
-import kotlin.math.pow
 import kotlin.math.roundToLong
 
 @HiltWorker
@@ -34,93 +33,74 @@ class AnalysisWorker @AssistedInject constructor(
 
         val songId = inputData.getString("songId") ?: return Result.failure()
 
-        // FIX: Get SongEntity first to check for localPath
         val song = database.song(songId).first()?.song ?: run {
             Log.e(TAG, "Song not found in DB: $songId")
             return Result.failure()
         }
 
-        // FIX: Use the song's localPath directly (works for Local and Downloaded songs)
         val path = song.localPath ?: run {
             Log.e(TAG, "No local path for song: $songId")
             return Result.failure()
         }
 
-        val file = File(path)
+        // Add leading slash if missing
+        val absolutePath = if (path.startsWith("/")) path else "/$path"
+        val file = File(absolutePath)
+
         if (!file.exists()) {
-            Log.e(TAG, "Audio file does not exist: $path")
+            Log.e(TAG, "Audio file does not exist: $absolutePath")
             return Result.failure()
         }
 
-        // Add leading slash if missing (sometimes needed for absolute paths)
-        val absolutePath = if (path.startsWith("/")) path else "/$path"
-
-        Log.i(TAG, "Starting analysis for songId=$songId, path=$absolutePath")
+        Log.i(TAG, "Starting analysis for songId=$songId")
 
         return try {
-            // Step 1: Decode audio using MediaCodec
-            Log.d(TAG, "Step 1: Decoding audio file...")
-            val (pcmData, sampleRate) = AudioDecoder.decodeToMono(absolutePath) ?: run {
-                Log.e(TAG, "Failed to decode audio file")
-                return Result.failure()
-            }
+            // 1. Decode Raw Audio
+            val (pcmData, sampleRate) = AudioDecoder.decodeToMono(absolutePath) ?: return Result.failure()
 
-            // Step 2: Analyze BPM using Aubio
-            Log.d(TAG, "Step 2: Running BPM analysis...")
+            // 2. Calculate EXACT Duration
+            // Metadata duration is often rounded. We need the exact duration to prevent visual drift.
+            val exactDurationSeconds = pcmData.size.toFloat() / sampleRate.toFloat()
+
+            // 3. Analyze BPM (Native BTrack)
             val analysisResult = AudioAnalyzer.analyzeBpm(pcmData, sampleRate) ?: return Result.failure()
 
-            // --- STEP 2.5: PROCESSING STEP ---
-            Log.d(TAG, "Step 2.5: Refining beat grid (Snap + Backfill)...")
+            // 4. Backfill Start Beats (Mathematical)
+            val filledGrid = backfillStartBeats(analysisResult.beatGrid, analysisResult.bpm)
 
-            val finalBeatGrid = processBeatGrid(
-                analysisResult.beatGrid,
-                pcmData,
-                sampleRate,
-                analysisResult.bpm
-            )
+            // 5. SNAP TO PEAKS (The "Spotify" Look)
+            // We use the High-Res PCM data to align the beat to the loudest sample nearby.
+            val snappedGrid = snapGridToTransients(filledGrid, pcmData, sampleRate)
 
-            Log.d(TAG, "Grid size increased from ${analysisResult.beatGrid.size} to ${finalBeatGrid.size}")
-
-//            Log.d(TAG, "Step 2.5: Snapping beats to transients...")
-//            val alignedBeatGrid = alignBeatsToTransients(
-//                analysisResult.beatGrid,
-//                pcmData,
-//                sampleRate
-//            )
-
-            // Step 3: Get waveform for visualization (Amplituda)
-            Log.d(TAG, "Step 3: Extracting waveform...")
+            // 6. Generate Visual Waveform
             val waveformResult = amplituda.processAudio(absolutePath, Compress.withParams(Compress.AVERAGE, 100)).get()
             val amplitudes = waveformResult.amplitudesAsList()
-
-            // CRITICAL FIX: Normalize to 0.0-1.0 range
             val maxAmplitude = amplitudes.maxOrNull()?.toFloat() ?: 1f
             val normalizedWaveform = amplitudes.map { it.toFloat() / maxAmplitude }
 
-            Log.d(TAG, "Waveform: ${amplitudes.size} points, max=$maxAmplitude, sample=${normalizedWaveform.take(5)}")
-
-            // Save normalized waveform
+            // 7. Save Data
             val cacheDir = File(applicationContext.cacheDir, "analysis_data")
             cacheDir.mkdirs()
 
-            val waveformFile = File(cacheDir, "${songId}_waveform.dat")
-            waveformFile.writeText(normalizedWaveform.joinToString(","))
+            // --- NEW: Save exact duration to metadata file ---
+            // We read this in the ViewModel to prevent drift, ignoring the rounded DB value.
+            File(cacheDir, "${songId}_metadata.dat").writeText(exactDurationSeconds.toString())
 
-            // Save beat grid (timestamps in seconds)
-            val quantizedGrid = quantizeBeatGrid(finalBeatGrid, analysisResult.bpm)
-            val beatFile = File(cacheDir, "${songId}_beats.dat")
-            beatFile.writeText(quantizedGrid.joinToString(","))
-            Log.d(TAG, "Beat grid: ${analysisResult.beatGrid.size} beats, sample=${analysisResult.beatGrid.take(5)}")
+            File(cacheDir, "${songId}_waveform.dat").writeText(normalizedWaveform.joinToString(","))
+            File(cacheDir, "${songId}_beats.dat").writeText(snappedGrid.joinToString(","))
 
-            // Step 5: Update SongEntity
+            // 8. Update DB
             val updated = song.copy(
-                waveformPath = waveformFile.absolutePath,
-                beatGridPath = beatFile.absolutePath,
+                waveformPath = File(cacheDir, "${songId}_waveform.dat").absolutePath,
+                beatGridPath = File(cacheDir, "${songId}_beats.dat").absolutePath,
                 bpm = analysisResult.bpm,
-                firstBeatMs = analysisResult.firstBeatMs
+                firstBeatMs = if (snappedGrid.isNotEmpty()) (snappedGrid[0] * 1000).toLong() else 0L,
+
+                // FIX: Cast to Int to satisfy DB type requirement.
+                // (The ViewModel will look for the metadata file first to get the Float value)
+                duration = exactDurationSeconds.toInt()
             )
             database.update(updated)
-            Log.i(TAG, "=== Analysis SUCCESSFUL for $songId ===")
 
             Result.success()
         } catch (e: Exception) {
@@ -130,143 +110,63 @@ class AnalysisWorker @AssistedInject constructor(
         }
     }
 
-    private fun processBeatGrid(
-        roughGrid: LongArray,
-        pcmData: FloatArray,
-        sampleRate: Int,
-        bpm: Float
-    ): LongArray {
-        if (roughGrid.isEmpty()) return roughGrid
+    /**
+     * Aligns the mathematical BTrack timestamp to the nearest amplitude peak
+     * within a +/- 50ms window.
+     */
+    private fun snapGridToTransients(grid: LongArray, pcm: FloatArray, sampleRate: Int): LongArray {
+        val windowMs = 50
+        val windowSamples = (windowMs * sampleRate / 1000)
 
-        // 1. SNAP TO TRANSIENTS (Fixes misalignment)
-        // We look for the "attack" (sharpest rise in energy), not just max volume.
-        val snappedGrid = roughGrid.map { beatTimeMs ->
-            findTransient(beatTimeMs, pcmData, sampleRate)
-        }.toLongArray()
-
-        // 2. BACK-FILL MISSING START BEATS (Fixes missing first 3-5 seconds)
-        // We calculate where beats *should* be before the first detected beat.
-        val firstBeat = snappedGrid.first()
-        val beatIntervalMs = (60_000f / bpm)
-
-        val newBeats = ArrayList<Long>()
-
-        // Extrapolate backwards from the first valid beat
-        var i = 1
-        while (true) {
-            val theoreticalBeatDouble = firstBeat - (i * beatIntervalMs)
-            if (theoreticalBeatDouble < 0) break
-
-            val currentBeat = theoreticalBeatDouble.roundToLong()
-
-            // Optional: Attempt to snap
-            val realTransient = findTransient(currentBeat, pcmData, sampleRate)
-
-            if (abs(realTransient - currentBeat) < 50) {
-                newBeats.add(0, realTransient)
-            } else {
-                newBeats.add(0, currentBeat)
-            }
-            i++
-        }
-
-        // Combine back-filled beats with original aligned beats
-        return (newBeats + snappedGrid.toList()).toLongArray()
-    }
-
-    private fun findTransient(targetTimeMs: Long, pcmData: FloatArray, sampleRate: Int): Long {
-        val centerSample = (targetTimeMs * sampleRate / 1000).toInt()
-        val windowMs = 40
-        val windowSamples = (windowMs * sampleRate / 1000).toInt()
-
-        val start = (centerSample - windowSamples).coerceAtLeast(0)
-        val end = (centerSample + windowSamples).coerceAtMost(pcmData.size - 1)
-
-        // Safety: If the window is invalid (e.g., song is empty), return original time
-        if (start >= end) return targetTimeMs
-
-        var maxEnergyRise = -1f
-        var bestIndex = centerSample
-
-        for (i in start until end) {
-            val currentAmp = kotlin.math.abs(pcmData[i])
-            val prevAmp = if (i == 0) 0f else kotlin.math.abs(pcmData[i - 1])
-            val rise = currentAmp * currentAmp - prevAmp * prevAmp
-
-            if (rise > maxEnergyRise) {
-                maxEnergyRise = rise
-                bestIndex = i
-            }
-        }
-
-        return (bestIndex.toLong() * 1000) / sampleRate
-    }
-
-    private fun alignBeatsToTransients(
-        roughGrid: LongArray,
-        pcmData: FloatArray,
-        sampleRate: Int,
-        searchWindowMs: Long = 100 // Look +/- 50ms around the detected beat
-    ): LongArray {
-        val windowSamples = (searchWindowMs * sampleRate / 1000).toInt()
-        val halfWindow = windowSamples / 2
-        val maxIndex = pcmData.size - 1
-
-        return roughGrid.map { beatTimeMs ->
+        return grid.map { beatTimeMs ->
             // Convert ms to sample index
-            val centerSample = (beatTimeMs * sampleRate / 1000).toInt()
+            val centerIndex = (beatTimeMs * sampleRate / 1000).toInt()
 
-            // Define search range (safely within array bounds)
-            val start = (centerSample - halfWindow).coerceAtLeast(0)
-            val end = (centerSample + halfWindow).coerceAtMost(maxIndex)
+            // Define search bounds
+            val start = (centerIndex - windowSamples).coerceAtLeast(0)
+            val end = (centerIndex + windowSamples).coerceAtMost(pcm.size - 1)
 
-            // Find the index of the maximum amplitude in this window
+            // Find max amplitude in window
+            var maxIndex = centerIndex
             var maxAmp = -1f
-            var maxAmpIndex = centerSample
 
             for (i in start..end) {
-                val amp = kotlin.math.abs(pcmData[i])
+                val amp = abs(pcm[i])
                 if (amp > maxAmp) {
                     maxAmp = amp
-                    maxAmpIndex = i
+                    maxIndex = i
                 }
             }
 
-            // Convert back to milliseconds
-            (maxAmpIndex.toLong() * 1000) / sampleRate
+            // Convert back to ms
+            (maxIndex.toLong() * 1000) / sampleRate
         }.toLongArray()
     }
 
-    private fun quantizeBeatGrid(beatGrid: LongArray, bpm: Float): LongArray {
-        if (beatGrid.size < 2) return beatGrid
+    /**
+     * BTrack takes time to settle, often missing the first few seconds of beats.
+     * This fills in the gap from 0 to the first detected beat using pure math.
+     */
+    private fun backfillStartBeats(detectedGrid: LongArray, bpm: Float): LongArray {
+        if (detectedGrid.isEmpty() || bpm <= 0) return detectedGrid
 
-        // Calculate differences
-        val diffs = LongArray(beatGrid.size - 1) { i -> beatGrid[i + 1] - beatGrid[i] }
+        val beatIntervalMs = (60_000.0 / bpm)
+        val firstDetected = detectedGrid[0]
 
-        // FIX: Calculate mean as Double and keep it that way
-        val meanDiffDouble = diffs.average()
+        // If the first beat is already near the start, do nothing
+        if (firstDetected < beatIntervalMs) return detectedGrid
 
-        // Calculate standard deviation using the Double mean
-        val stdDiff = diffs.map { (it - meanDiffDouble).pow(2) }.average().pow(0.5)
+        val newBeats = ArrayList<Long>()
+        var currentBeat = firstDetected.toDouble()
 
-        // Check variance (using Double math)
-        // If low variance (e.g., <2% of mean), force even grid
-        if (stdDiff / meanDiffDouble < 0.02) {
-            Log.d(TAG, "Quantizing grid (low variance: std=$stdDiff, mean=$meanDiffDouble)")
-
-            // FIX: Reconstruct grid using Double precision arithmetic
-            // This prevents the "0.75ms per beat" error from accumulating
-            val quantized = LongArray(beatGrid.size) { i ->
-                (beatGrid[0] + i * meanDiffDouble).roundToLong()
-            }
-
-            // Ensure calculated interval matches BPM estimate roughly
-            val expectedInterval = 60_000.0 / bpm
-            if (abs(meanDiffDouble - expectedInterval) < 10) {
-                return quantized
+        // Work backwards until we hit 0
+        while (currentBeat > beatIntervalMs) {
+            currentBeat -= beatIntervalMs
+            if (currentBeat >= 0) {
+                newBeats.add(0, currentBeat.roundToLong())
             }
         }
 
-        return beatGrid
+        return (newBeats + detectedGrid.toList()).toLongArray()
     }
 }

@@ -1,5 +1,3 @@
-// WaveformView.kt
-
 package com.dd3boh.outertune.ui.component
 
 import androidx.compose.animation.core.Animatable
@@ -20,21 +18,25 @@ import kotlin.math.roundToInt
 @Composable
 fun WaveformView(
     waveformData: List<BeatSample>,
-    beatMarkers: List<Float>,
+    beatMarkers: List<Float>, // unused now, generated locally
     markerPosition: BeatMarkerPosition,
     songDurationSeconds: Float?,
     modifier: Modifier = Modifier,
     isBeatDomain: Boolean = true,
     pixelsPerBeat: Float = 48f,
     beatOffsetBeats: Float = 0f,
-    initialOffset: Float,
+    initialOffset: Float, // This now receives PIXELS
     onOffsetChanged: (Float) -> Unit = {}
 ) {
     val scope = rememberCoroutineScope()
     val horizontalOffset = remember { Animatable(initialOffset) }
 
-    // Use the pixelsPerBeat directly (no need to convert to int now)
-    val effectivePxPerBeat = pixelsPerBeat
+    // Ensure we start at the passed initial offset
+    LaunchedEffect(initialOffset) {
+        if (abs(horizontalOffset.value - initialOffset) > 1f && !horizontalOffset.isRunning) {
+            horizontalOffset.snapTo(initialOffset)
+        }
+    }
 
     Canvas(
         modifier = modifier.pointerInput(Unit) {
@@ -43,16 +45,15 @@ fun WaveformView(
                     if (isBeatDomain) {
                         val viewCenter = size.width.toFloat() / 2f
                         val currentScroll = horizontalOffset.value
+                        val shiftPixels = beatOffsetBeats * pixelsPerBeat
 
-                        // Calculate offset for Track 2 (if any) in pixels
-                        val shiftPixels = beatOffsetBeats * effectivePxPerBeat
-
-                        // Find which beat index is closest to the center
-                        val exactBeatAtCenter = (viewCenter - currentScroll - shiftPixels) / effectivePxPerBeat
+                        // Snap to nearest beat
+                        // Note: beatIndex increases as we scroll left (negative offset)
+                        val exactBeatAtCenter = (viewCenter - currentScroll - shiftPixels) / pixelsPerBeat
                         val nearestBeatIndex = exactBeatAtCenter.roundToInt()
 
-                        // Calculate the target scroll position to snap that beat to center
-                        val targetScroll = viewCenter - (nearestBeatIndex * effectivePxPerBeat) - shiftPixels
+                        // Recalculate offset to center that beat
+                        val targetScroll = viewCenter - (nearestBeatIndex * pixelsPerBeat) - shiftPixels
 
                         scope.launch {
                             horizontalOffset.animateTo(
@@ -60,29 +61,6 @@ fun WaveformView(
                                 animationSpec = spring(stiffness = Spring.StiffnessMediumLow)
                             )
                             onOffsetChanged(targetScroll)
-                        }
-                    }
-                    // Legacy time-domain logic (Unchanged)
-                    else if (songDurationSeconds != null && songDurationSeconds > 0f) {
-                        val width = size.width.toFloat()
-                        val totalWaveformWidth = width * 1f
-                        val currentOffset = horizontalOffset.value
-                        val centerPixelInWaveform = -currentOffset + (width / 2f)
-                        val centerTimeSeconds = (centerPixelInWaveform / totalWaveformWidth) * songDurationSeconds
-                        val closestBeat = beatMarkers.minByOrNull { abs(it - centerTimeSeconds) }
-                        if (closestBeat != null) {
-                            val diffSeconds = abs(closestBeat - centerTimeSeconds)
-                            if (diffSeconds < 0.5f) {
-                                val newCenterPixel = (closestBeat / songDurationSeconds) * totalWaveformWidth
-                                val targetOffset = -(newCenterPixel - (width / 2f))
-                                scope.launch {
-                                    horizontalOffset.animateTo(
-                                        targetValue = targetOffset,
-                                        animationSpec = spring(stiffness = Spring.StiffnessLow)
-                                    )
-                                    onOffsetChanged(targetOffset)
-                                }
-                            }
                         }
                     }
                 }
@@ -94,43 +72,37 @@ fun WaveformView(
                 }
             }
         }
-
     ) {
         val width = size.width
         val height = size.height
         val centerY = height / 2f
         val maxAmplitude = height / 2f
         val currentOffset = horizontalOffset.value
+        val beatOffsetPixels = beatOffsetBeats * pixelsPerBeat
 
-        // Center visual line (Anchor)
+        // 1. Calculate Visible Beat Range (Optimization)
+        // We only draw beats that are actually on screen
+        val totalShift = currentOffset + beatOffsetPixels
+        // Inverse formula: x = beat * px + shift  ->  beat = (x - shift) / px
+        val startVisibleBeat = (-totalShift / pixelsPerBeat) - 1f
+        val endVisibleBeat = ((-totalShift + width) / pixelsPerBeat) + 1f
+
+        // Center line (Anchor)
         drawLine(
-            color = Color.White.copy(alpha = 0.8f),
+            color = Color.White.copy(alpha = 0.5f),
             start = Offset(width / 2f, 0f),
             end = Offset(width / 2f, height),
             strokeWidth = 2f
         )
 
-        if (isBeatDomain) {
-            // Calculate shift for Track 2
-            val beatOffsetPixels = beatOffsetBeats * effectivePxPerBeat
+        if (isBeatDomain && waveformData.isNotEmpty()) {
 
-
-            // FIXED: Render waveform using beat positions
-            if (waveformData.isNotEmpty()) {
-                // Calculate visible beat range for optimization
-                val visibleStartBeat = ((-currentOffset - beatOffsetPixels) / effectivePxPerBeat) - 1f
-                val visibleEndBeat = visibleStartBeat + (width / effectivePxPerBeat) + 2f
-
-                waveformData.forEach { sample ->
-                    // Skip samples outside visible range
-                    if (sample.beatIndex < visibleStartBeat || sample.beatIndex > visibleEndBeat) {
-                        return@forEach
-                    }
-
-                    // FIXED: Calculate x position from beat index (not array index!)
-                    val x = (sample.beatIndex * effectivePxPerBeat) + currentOffset + beatOffsetPixels
-
-                    if (x < -10f || x > width + 10f) return@forEach
+            // 2. Waveform Drawing
+            // Simply iterate. Since we filtered logic inside, this is fast enough for <10k points.
+            // For huge arrays, you'd use binary search to find start index.
+            waveformData.forEach { sample ->
+                if (sample.beatIndex >= startVisibleBeat && sample.beatIndex <= endVisibleBeat) {
+                    val x = (sample.beatIndex * pixelsPerBeat) + totalShift
 
                     val normalizedAmp = sample.amplitude.coerceIn(0f, 1f)
                     val scaledAmplitude = normalizedAmp * maxAmplitude
@@ -144,86 +116,45 @@ fun WaveformView(
                 }
             }
 
-            // Beat markers rendering
-            if (beatMarkers.isNotEmpty()) {
-                beatMarkers.forEach { beatIndexFloat ->
+            // 3. Grid Markers (Generated strictly from Integers)
+            // This guarantees markers are mathematically perfect relative to the beats
+            val firstMarker = startVisibleBeat.toInt().coerceAtLeast(0)
+            val lastMarker = endVisibleBeat.toInt()
 
-                    val x = (beatIndexFloat * effectivePxPerBeat) +
-                            currentOffset +
-                            beatOffsetPixels
+            for (i in firstMarker..lastMarker) {
+                val x = (i * pixelsPerBeat) + totalShift
+                val isMajorBeat = (i % 4 == 0)
 
-                    val isMajorBeat = (beatIndexFloat % 4f == 0f)
-                    val color = if (isMajorBeat) Color(0xFF4CAF50) else Color.Gray
-                    val strokeWidth = if (isMajorBeat) 6f else 3f
-                    val lineLength = if (isMajorBeat) 50f else 30f
+                val color = if (isMajorBeat) Color(0xFF4CAF50) else Color.Gray.copy(alpha=0.5f)
+                val strokeWidth = if (isMajorBeat) 4f else 2f
+                // Full height for major lines aids alignment visual
+                val lineLength = if (isMajorBeat) height else 30f
 
-                    if (x in -50f..(width + 50f)) {
-                        if (markerPosition == BeatMarkerPosition.BOTTOM) {
-                            drawLine(
-                                color = color,
-                                start = Offset(x, height),
-                                end = Offset(x, height - lineLength),
-                                strokeWidth = strokeWidth
-                            )
-                        } else {
-                            drawLine(
-                                color = color,
-                                start = Offset(x, 0f),
-                                end = Offset(x, lineLength),
-                                strokeWidth = strokeWidth
-                            )
-                        }
-                    }
-                }
-            }
-
-        } else {
-            // TIME-DOMAIN / LEGACY RENDERER (Unchanged - but now expects List<BeatSample>)
-            // Note: This branch won't work with BeatSample data structure
-            // Keep for compatibility but it should use the old FloatArray if needed
-            if (songDurationSeconds != null && songDurationSeconds > 0f) {
-                // Legacy rendering would need the old FloatArray structure
-                // For now, this is just a placeholder
-            }
-
-            if (beatMarkers.isNotEmpty() && songDurationSeconds != null && songDurationSeconds > 0f) {
-                val totalWaveformWidth = width
-                beatMarkers.forEachIndexed { index, beatTimeSeconds ->
-                    val normalizedPosition = beatTimeSeconds / songDurationSeconds
-                    val x = (normalizedPosition * totalWaveformWidth) + currentOffset
-
-                    if (x in -50f..(width + 50f)) {
-                        val isMajorBeat = index % 4 == 0
-                        val color = if (isMajorBeat) Color(0xFF4CAF50) else Color.Gray
-                        val strokeWidth = if (isMajorBeat) 6f else 3f
-                        val lineLength = if (isMajorBeat) 50f else 30f
-
-                        if (markerPosition == BeatMarkerPosition.BOTTOM) {
-                            drawLine(
-                                color = color,
-                                start = Offset(x, height),
-                                end = Offset(x, height - lineLength),
-                                strokeWidth = strokeWidth
-                            )
-                        } else {
-                            drawLine(
-                                color = color,
-                                start = Offset(x, 0f),
-                                end = Offset(x, lineLength),
-                                strokeWidth = strokeWidth
-                            )
-                        }
-                    }
+                // Draw Marker Line
+                if (markerPosition == BeatMarkerPosition.BOTTOM) {
+                    drawLine(
+                        color = color,
+                        start = Offset(x, height),
+                        end = Offset(x, height - lineLength),
+                        strokeWidth = strokeWidth
+                    )
+                } else {
+                    drawLine(
+                        color = color,
+                        start = Offset(x, 0f),
+                        end = Offset(x, lineLength),
+                        strokeWidth = strokeWidth
+                    )
                 }
             }
         }
 
-        // Red Center Line (Always on top)
+        // Red Center Indicator (Playhead)
         drawLine(
             color = Color.Red,
             start = Offset(width / 2f, 0f),
             end = Offset(width / 2f, height),
-            strokeWidth = 4f
+            strokeWidth = 3f
         )
     }
 }
