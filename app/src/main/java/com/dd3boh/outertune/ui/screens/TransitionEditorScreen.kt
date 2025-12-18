@@ -6,7 +6,9 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -18,6 +20,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
@@ -33,6 +36,7 @@ import coil3.compose.AsyncImage
 import com.dd3boh.outertune.db.entities.Song
 import com.dd3boh.outertune.ui.component.BeatMarkerPosition
 import com.dd3boh.outertune.ui.component.WaveformView
+import com.dd3boh.outertune.utils.TransitionMixer
 import com.dd3boh.outertune.utils.makeTimeString
 import com.dd3boh.outertune.viewmodels.TransitionEditorViewModel
 import com.dd3boh.outertune.viewmodels.BeatSample
@@ -147,6 +151,11 @@ fun TransitionEditorScreen(
                 playbackBeatMarker = playbackBeatMarker,
                 track1OffsetPixels = track1OffsetPixels,
                 track2OffsetPixels = track2OffsetPixels,
+                // --- ADD THESE 3 LINES ---
+                overlapMode = overlapMode,
+                eqMode = eqMode,
+                effectMode = effectMode,
+                // -------------------------
                 onTrack1OffsetChanged = { px -> viewModel.setTrack1Offset(px, pixelsPerBeat) },
                 onTrack2OffsetChanged = { px -> viewModel.setTrack2Offset(px, pixelsPerBeat) },
                 onPlayPauseClick = { viewModel.togglePlayback() }
@@ -195,6 +204,11 @@ fun WaveformsSection(
     playbackBeatMarker: Float?,
     track1OffsetPixels: Float,
     track2OffsetPixels: Float,
+    // --- NEW PARAMETERS ---
+    overlapMode: String,
+    eqMode: String,
+    effectMode: String,
+    // ----------------------
     onTrack1OffsetChanged: (Float) -> Unit,
     onTrack2OffsetChanged: (Float) -> Unit,
     onPlayPauseClick: () -> Unit
@@ -210,7 +224,7 @@ fun WaveformsSection(
                     isBeatDomain = true,
                     pixelsPerBeat = pixelsPerBeat,
                     beatOffsetBeats = 0f,
-                    initialOffset = track1OffsetPixels, // Pass track 1 specific offset
+                    initialOffset = track1OffsetPixels,
                     onOffsetChanged = onTrack1OffsetChanged,
                     songDurationSeconds = track1?.song?.duration?.toFloat() ?: 1f,
                     modifier = Modifier
@@ -257,6 +271,61 @@ fun WaveformsSection(
                         .border(2.dp, Color(0xFF4CAF50).copy(alpha = 0.6f), RoundedCornerShape(12.dp))
                 )
 
+                // ----------------------------------------------------
+                // VISUALIZATION CURVES
+                // ----------------------------------------------------
+                Canvas(modifier = Modifier.fillMaxSize().padding(horizontal = 4.dp)) {
+                    val w = size.width
+                    val h = size.height
+
+                    val steps = 50
+                    val pathAVol = Path()
+                    val pathBVol = Path()
+                    val pathABass = Path()
+                    val pathBBass = Path()
+
+                    // Note: In Canvas Y=0 is top.
+                    // We want volume 1.0 to be at Top (0) and 0.0 to be at Bottom (h)
+
+                    for (i in 0..steps) {
+                        val p = i / steps.toFloat()
+                        val x = p * w
+
+                        // Get States using the PASSED parameters
+                        val stateA = TransitionMixer.getMixState("A", p, overlapMode, eqMode, effectMode)
+                        val stateB = TransitionMixer.getMixState("B", p, overlapMode, eqMode, effectMode)
+
+                        // Y coordinates
+                        val yVolA = h - (stateA.volume * h)
+                        val yVolB = h - (stateB.volume * h)
+                        val yBassA = h - (stateA.bass * h)
+                        val yBassB = h - (stateB.bass * h)
+
+                        if (i == 0) {
+                            pathAVol.moveTo(x, yVolA)
+                            pathBVol.moveTo(x, yVolB)
+                            pathABass.moveTo(x, yBassA)
+                            pathBBass.moveTo(x, yBassB)
+                        } else {
+                            pathAVol.lineTo(x, yVolA)
+                            pathBVol.lineTo(x, yVolB)
+                            pathABass.lineTo(x, yBassA)
+                            pathBBass.lineTo(x, yBassB)
+                        }
+                    }
+
+                    // Draw Volume (Track A = White, Track B = Cyan)
+                    drawPath(pathAVol, Color.White.copy(alpha=0.7f), style = androidx.compose.ui.graphics.drawscope.Stroke(width=3.dp.toPx()))
+                    drawPath(pathBVol, Color.Cyan.copy(alpha=0.7f), style = androidx.compose.ui.graphics.drawscope.Stroke(width=3.dp.toPx()))
+
+                    // Draw Bass (Red) - Only if EQ active
+                    if (eqMode != "None") {
+                        drawPath(pathABass, Color(0xFFFF5252).copy(alpha=0.8f), style = androidx.compose.ui.graphics.drawscope.Stroke(width=4.dp.toPx()))
+                        drawPath(pathBBass, Color(0xFFFF5252).copy(alpha=0.4f), style = androidx.compose.ui.graphics.drawscope.Stroke(width=4.dp.toPx()))
+                    }
+                }
+                // ----------------------------------------------------
+
                 // PLAY BUTTON
                 AnimatedVisibility(
                     visible = !isPlaying || showControls,
@@ -298,7 +367,7 @@ fun WaveformsSection(
             }
         }
 
-        // GREEN LINE INDICATOR
+        // GREEN LINE INDICATOR (Playback Head)
         if (playbackBeatMarker != null && pixelsPerBeat > 0) {
             val xPosition = (playbackBeatMarker * pixelsPerBeat) + track1OffsetPixels
 
@@ -312,7 +381,6 @@ fun WaveformsSection(
                 )
             }
         }
-
     }
 }
 
@@ -396,7 +464,7 @@ fun TransitionTrackInfo(
 
         Column(horizontalAlignment = Alignment.End) {
             Text(
-                text = song.song.bpm?.let { "${it.toInt()} bpm" } ?: "-- bpm",
+                text = song.song.bpm?.let { "%.0f BPM".format(it) } ?: "-- BPM",
                 color = Color.White,
                 fontSize = 12.sp
             )
@@ -493,12 +561,12 @@ fun ControlPanel(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(12.dp),
+                .padding(vertical = 6.dp),
             horizontalArrangement = Arrangement.SpaceEvenly
         ) {
-            TabButton(
-                text = "Volume",
-                selected = selectedTab == 0,
+            ControlSelector(
+                title = "Volume",
+                value = overlapMode,
                 onClick = {
                     onTabSelected(0)
                     showBottomSheet = true
@@ -506,9 +574,10 @@ fun ControlPanel(
                 modifier = Modifier.weight(1f)
             )
 
-            TabButton(
-                text = "EQ",
-                selected = selectedTab == 1,
+
+            ControlSelector(
+                title = "EQ",
+                value = displayEqLabel(eqMode),
                 onClick = {
                     onTabSelected(1)
                     showBottomSheet = true
@@ -516,15 +585,16 @@ fun ControlPanel(
                 modifier = Modifier.weight(1f)
             )
 
-            TabButton(
-                text = "Effect",
-                selected = selectedTab == 2,
+            ControlSelector(
+                title = "Effect",
+                value = displayEffectLabel(effectMode),
                 onClick = {
                     onTabSelected(2)
                     showBottomSheet = true
                 },
                 modifier = Modifier.weight(1f)
             )
+
         }
     }
 
@@ -734,83 +804,78 @@ fun ModernOptionItem(
 }
 
 @Composable
-fun OptionHeader(text: String) {
-    Text(
-        text = text,
-        color = Color.Gray,
-        fontSize = 13.sp,
-        fontWeight = FontWeight.Medium,
-        modifier = Modifier.padding(horizontal = 20.dp)
-    )
-}
-
-@Composable
-fun OptionItem(
-    text: String,
-    selected: Boolean,
-    onClick: () -> Unit
-) {
-    Surface(
-        onClick = onClick,
-        color = Color.Transparent,
-        modifier = Modifier.fillMaxWidth()
-    ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 20.dp, vertical = 14.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text(
-                text = text,
-                color = if (selected) Color(0xFF4CAF50) else Color.White,
-                fontSize = 15.sp,
-                fontWeight = if (selected) FontWeight.Medium else FontWeight.Normal
-            )
-
-            if (selected) {
-                Icon(
-                    painter = painterResource(android.R.drawable.checkbox_on_background),
-                    contentDescription = "Selected",
-                    tint = Color(0xFF4CAF50),
-                    modifier = Modifier.size(20.dp)
-                )
-            }
-        }
-    }
-}
-
-@Composable
-fun TabButton(
-    text: String,
-    selected: Boolean,
+fun ControlSelector(
+    title: String,
+    value: String,
     onClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    Surface(
-        onClick = onClick,
-        modifier = modifier,
-        color = Color.Transparent
+    Column(
+        modifier = modifier
+            .clickable(
+                indication = null, // no ripple
+                interactionSource = remember { MutableInteractionSource() }
+            ) { onClick() }
+            .padding(vertical = 10.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Column(
-            horizontalAlignment = Alignment.CenterHorizontally,
-            modifier = Modifier.padding(vertical = 8.dp)
+
+        // Small title
+        Text(
+            text = title,
+            fontSize = 12.sp,
+            color = Color(0xFF9A9A9A)
+        )
+
+        Spacer(modifier = Modifier.height(6.dp))
+
+        // Value row (text + chevron)
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
         ) {
             Text(
-                text = text,
-                color = if (selected) Color(0xFF4CAF50) else Color.White,
-                fontSize = 14.sp
+                text = value,
+                fontSize = 15.sp,
+                fontWeight = FontWeight.Medium,
+                color = Color.White
             )
-            if (selected) {
-                Spacer(modifier = Modifier.height(4.dp))
-                Box(
-                    modifier = Modifier
-                        .width(24.dp)
-                        .height(2.dp)
-                        .background(Color(0xFF4CAF50), RoundedCornerShape(1.dp))
-                )
-            }
+
+            Text(
+                text = "⌄",
+                fontSize = 14.sp,
+                color = Color(0xFF7A7A7A)
+            )
         }
+
+        Spacer(modifier = Modifier.height(10.dp))
+
+        // Subtle divider
+        Box(
+            modifier = Modifier
+                .width(32.dp)
+                .height(1.dp)
+                .background(
+                    Color.White.copy(alpha = 0.12f),
+                    RoundedCornerShape(1.dp)
+                )
+        )
     }
 }
+
+private fun displayEqLabel(mode: String): String =
+    when (mode) {
+        "Centre Bass swap" -> "Centre bass"
+        "End Bass Swap" -> "End Bass"
+        "Onset Bass Swap" -> "Onset Bass"
+        else -> mode
+    }
+
+private fun displayEffectLabel(mode: String): String =
+    when (mode) {
+        "Low pass in" -> "LP in"
+        "Low Pass out" -> "LP out"
+        "High Pass in" -> "HP in"
+        "High Pass Out" -> "HP out"
+        else -> mode
+    }

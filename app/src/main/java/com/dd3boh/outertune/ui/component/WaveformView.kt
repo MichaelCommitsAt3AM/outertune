@@ -127,8 +127,8 @@ fun WaveformView(
 
                 val color = if (isMajorBeat) Color(0xFF4CAF50) else Color.Gray.copy(alpha=0.5f)
                 val strokeWidth = if (isMajorBeat) 4f else 2f
-                // Full height for major lines aids alignment visual
-                val lineLength = if (isMajorBeat) height else 30f
+                // Fixed small length instead of full height (Modified to 30f)
+                val lineLength = if (isMajorBeat) 30f else 20f
 
                 // Draw Marker Line
                 if (markerPosition == BeatMarkerPosition.BOTTOM) {
