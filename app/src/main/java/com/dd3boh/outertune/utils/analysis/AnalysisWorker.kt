@@ -111,36 +111,81 @@ class AnalysisWorker @AssistedInject constructor(
     }
 
     /**
-     * Aligns the mathematical BTrack timestamp to the nearest amplitude peak
-     * within a +/- 50ms window.
+     * Aligns the timestamp to the nearest onset (sudden rise in energy)
+     * within a +/- window.
+     *
+     * IMPORVED LOGIC: Instead of looking for the loudest sample (Max Amplitude),
+     * this looks for the sharpest *rise* in energy (Max Flux).
+     * This fixes issues in intros/outros where a quiet beat (hi-hat/kick) might be
+     * overpowered by a loud swelling synth pad.
      */
     private fun snapGridToTransients(grid: LongArray, pcm: FloatArray, sampleRate: Int): LongArray {
         val windowMs = 50
         val windowSamples = (windowMs * sampleRate / 1000)
+
+        // Smoothing factor (acts as a Low Pass Filter on the envelope)
+        // Helps ignore high-frequency noise spikes.
+        val alpha = 0.90f
 
         return grid.map { beatTimeMs ->
             // Convert ms to sample index
             val centerIndex = (beatTimeMs * sampleRate / 1000).toInt()
 
             // Define search bounds
-            val start = (centerIndex - windowSamples).coerceAtLeast(0)
+            val start = (centerIndex - windowSamples).coerceAtLeast(1)
             val end = (centerIndex + windowSamples).coerceAtMost(pcm.size - 1)
 
-            // Find max amplitude in window
-            var maxIndex = centerIndex
-            var maxAmp = -1f
+            var maxFluxIndex = centerIndex
+            var maxFlux = -1f
+
+            // Initialize a simple envelope follower
+            var previousEnvelope = abs(pcm[start - 1])
 
             for (i in start..end) {
-                val amp = abs(pcm[i])
-                if (amp > maxAmp) {
-                    maxAmp = amp
-                    maxIndex = i
+                val currentAbs = abs(pcm[i])
+
+                // 1. Calculate Envelope (Low-pass filter the waveform)
+                // If signal rises, track it instantly (Attack). If it falls, decay slowly.
+                // This preserves the "hit" while smoothing the "tail".
+                val currentEnvelope = if (currentAbs > previousEnvelope) {
+                    currentAbs // Fast Attack
+                } else {
+                    previousEnvelope * alpha + currentAbs * (1 - alpha) // Slow Decay
                 }
+
+                // 2. Calculate Flux (Derivative)
+                // How much did the energy rise compared to the previous step?
+                // We only care about positive rises (attacks), not drops.
+                val flux = (currentEnvelope - previousEnvelope).coerceAtLeast(0f)
+
+                // 3. Find the peak of the "Rise", not the peak of the "Volume"
+                if (flux > maxFlux) {
+                    maxFlux = flux
+                    maxFluxIndex = i
+                }
+
+                previousEnvelope = currentEnvelope
             }
 
             // Convert back to ms
-            (maxIndex.toLong() * 1000) / sampleRate
+            (maxFluxIndex.toLong() * 1000) / sampleRate
         }.toLongArray()
+    }
+
+    private fun applyLowPassFilter(pcm: FloatArray, sampleRate: Int): FloatArray {
+        val filtered = FloatArray(pcm.size)
+        val dt = 1.0f / sampleRate
+        val rc = 1.0f / (2.0f * Math.PI.toFloat() * 150.0f) // 150Hz Cutoff
+        val alpha = dt / (rc + dt)
+
+        var previous = pcm[0]
+        for (i in pcm.indices) {
+            // Basic Low Pass: y[i] = y[i-1] + α * (x[i] - y[i-1])
+            val current = previous + alpha * (pcm[i] - previous)
+            filtered[i] = current
+            previous = current
+        }
+        return filtered
     }
 
     /**
