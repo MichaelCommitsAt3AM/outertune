@@ -46,6 +46,69 @@ object BeatGridNormalizer {
         return normalizedGrid
     }
 
+    fun normalizeWithSections(detectedGrid: List<Float>, threshold: Float = 2.0f): List<Float> {
+        if (detectedGrid.isEmpty()) return emptyList()
+
+        val normalizedGrid = mutableListOf<Float>()
+
+        // 1. Group beats into "sections" separated by silence/gaps
+        val sections = mutableListOf<MutableList<Float>>()
+        var currentSection = mutableListOf<Float>()
+
+        // Always add the first beat
+        currentSection.add(detectedGrid.first())
+
+        detectedGrid.zipWithNext { current, next ->
+            // If the gap is huge (e.g. breakdown/silence), Start NEW Section
+            if (next - current > threshold) {
+                sections.add(currentSection)
+                currentSection = mutableListOf()
+            }
+            currentSection.add(next)
+        }
+        sections.add(currentSection) // Add the final section
+
+        // 2. Normalize each section individually
+        sections.forEachIndexed { index, section ->
+            if (section.isNotEmpty()) {
+                val localBpm = calculateBpmFor(section)
+                val perfectInterval = 60f / localBpm
+
+                // For the very first section, we might want to backfill to 0.0s
+                // For later sections, we strictly stick to the start/end of the section
+                val startBeat = section.first()
+                val endBeat = section.last()
+
+                var beat = startBeat
+
+                // Backfill logic (Only for the very first section)
+                if (index == 0) {
+                    while (beat >= perfectInterval) {
+                        beat -= perfectInterval
+                        normalizedGrid.add(0, beat)
+                    }
+                    beat = startBeat // Reset to start forward fill
+                }
+
+                // Forward fill logic
+                while (beat <= endBeat + (perfectInterval * 0.5f)) {
+                    normalizedGrid.add(beat)
+                    beat += perfectInterval
+                }
+            }
+        }
+
+        return normalizedGrid.sorted().distinct()
+    }
+
+    private fun calculateBpmFor(section: List<Float>): Float {
+        if (section.size < 2) return 120f // Fallback
+        val duration = section.last() - section.first()
+        val intervals = section.size - 1
+        val avgInterval = duration / intervals
+        return if (avgInterval > 0) 60f / avgInterval else 120f
+    }
+
     /**
      * Alternative: Use MEDIAN of all intervals for more stable results
      * if BTrack's BPM detection is slightly off.

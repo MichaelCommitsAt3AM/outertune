@@ -40,6 +40,7 @@ import com.dd3boh.outertune.utils.TransitionMixer
 import com.dd3boh.outertune.utils.makeTimeString
 import com.dd3boh.outertune.viewmodels.TransitionEditorViewModel
 import com.dd3boh.outertune.viewmodels.BeatSample
+import com.dd3boh.outertune.ui.component.BeatGridMarker
 
 
 @Composable
@@ -194,7 +195,7 @@ fun WaveformsSection(
     track2: Song?,
     waveformData1: List<BeatSample>,
     waveformData2: List<BeatSample>,
-    beatMarkers: List<Float>,
+    beatMarkers: List<BeatGridMarker>,
     pixelsPerBeat: Float,
     transitionWidthFraction: Float,
     transitionDuration: Float,

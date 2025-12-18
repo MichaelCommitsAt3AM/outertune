@@ -15,10 +15,18 @@ import kotlinx.coroutines.launch
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
+// 1. New Data Model for Markers
+// Use this to define exactly where beats are and what they look like
+data class BeatGridMarker(
+    val beatIndex: Float,      // The X position (in beats)
+    val isDownbeat: Boolean,   // TRUE = Green/Big (Major), FALSE = Gray/Small (Minor)
+    val isGhost: Boolean = false // Optional: For beats estimated during silence
+)
+
 @Composable
 fun WaveformView(
     waveformData: List<BeatSample>,
-    beatMarkers: List<Float>, // Now properly used
+    beatMarkers: List<BeatGridMarker>, // 2. Updated signature
     markerPosition: BeatMarkerPosition,
     songDurationSeconds: Float?,
     modifier: Modifier = Modifier,
@@ -106,16 +114,22 @@ fun WaveformView(
             }
 
             // ============================================
-            // FIX: Draw markers at ACTUAL beat positions
+            // 3. Updated Drawing Logic
             // ============================================
-            // beatMarkers contains integer indices (0, 1, 2, 3...)
-            // We draw them at their corresponding pixel positions
-            beatMarkers.forEach { beatIndex ->
-                if (beatIndex >= startVisibleBeat && beatIndex <= endVisibleBeat) {
-                    val x = (beatIndex * pixelsPerBeat) + totalShift
-                    val isMajorBeat = (beatIndex.toInt() % 4 == 0)
+            beatMarkers.forEach { marker ->
+                // Check visibility using the marker's explicit index
+                if (marker.beatIndex >= startVisibleBeat && marker.beatIndex <= endVisibleBeat) {
+                    val x = (marker.beatIndex * pixelsPerBeat) + totalShift
 
-                    val color = if (isMajorBeat) Color(0xFF4CAF50) else Color.Gray.copy(alpha = 0.5f)
+                    // Use the property from the object, NOT modulo math
+                    val isMajorBeat = marker.isDownbeat
+
+                    val color = when {
+                        isMajorBeat -> Color(0xFF4CAF50) // Green
+                        marker.isGhost -> Color.DarkGray // Faint for ghost beats
+                        else -> Color.Gray.copy(alpha = 0.5f)
+                    }
+
                     val strokeWidth = if (isMajorBeat) 4f else 2f
                     val lineLength = if (isMajorBeat) 30f else 20f
 

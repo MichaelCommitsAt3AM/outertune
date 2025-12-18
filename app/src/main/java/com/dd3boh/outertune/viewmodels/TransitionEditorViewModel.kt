@@ -9,8 +9,10 @@ import androidx.media3.common.MediaItem
 import androidx.media3.exoplayer.ExoPlayer
 import com.dd3boh.outertune.db.MusicDatabase
 import com.dd3boh.outertune.db.entities.Song
+import com.dd3boh.outertune.ui.component.BeatGridMarker // <--- IMPORT ADDED
 import com.dd3boh.outertune.utils.DJHelper
 import com.dd3boh.outertune.utils.TransitionMixer
+import com.dd3boh.outertune.utils.analysis.BeatGridNormalizer
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.*
@@ -18,8 +20,12 @@ import kotlinx.coroutines.flow.*
 import java.io.File
 import javax.inject.Inject
 import kotlin.math.abs
+import kotlin.math.max
 
 data class BeatSample(val beatIndex: Float, val amplitude: Float)
+
+// REMOVED DUPLICATE DATA CLASS DEFINITION
+// It is now imported from com.dd3boh.outertune.ui.component.BeatGridMarker
 
 @HiltViewModel
 class TransitionEditorViewModel @Inject constructor(
@@ -44,13 +50,21 @@ class TransitionEditorViewModel @Inject constructor(
     private var eqA: Equalizer? = null
     private var eqB: Equalizer? = null
 
-    // Derived beat indices for UI markers (Pure Integer Grid 0.0, 1.0, 2.0...)
-    val beatMarkers: StateFlow<List<Float>> =
+    // Derived beat indices for UI markers
+    val beatMarkers: StateFlow<List<BeatGridMarker>> =
         waveformBeatDomain1.map { samples ->
             if (samples.isEmpty()) emptyList()
             else {
                 val maxBeat = samples.last().beatIndex
-                (0..maxBeat.toInt()).map { it.toFloat() }
+                // Iterate through integer beats
+                (0..maxBeat.toInt()).map { index ->
+                    BeatGridMarker(
+                        beatIndex = index.toFloat(),
+                        // Logic: Every 4th beat is a "Downbeat" (Major)
+                        isDownbeat = index % 4 == 0,
+                        isGhost = false
+                    )
+                }
             }
         }.stateIn(viewModelScope, SharingStarted.Lazily, emptyList())
 
@@ -110,7 +124,6 @@ class TransitionEditorViewModel @Inject constructor(
     init { viewModelScope.launch(Dispatchers.Main) { setupPlayers() } }
 
     private fun setupPlayers() {
-        // Initialize Players without EQ first
         if (playerA == null) {
             playerA = ExoPlayer.Builder(context).build().apply { volume = 1f }
         }
@@ -152,7 +165,6 @@ class TransitionEditorViewModel @Inject constructor(
     }
 
     // --- Data Loading ---
-    // Update loadData function:
     fun loadData(songAId: String, songBId: String) {
         viewModelScope.launch(Dispatchers.IO) {
             val songA = database.song(songAId).firstOrNull()
@@ -180,8 +192,13 @@ class TransitionEditorViewModel @Inject constructor(
             }
 
             // Store SYNC grid for playback (perfect timing)
-            rawGrid1 = syncGridA
-            rawGrid2 = syncGridB
+            // Fallback to visual grid if sync grid is missing
+            rawGrid1 = if (syncGridA.isNotEmpty()) syncGridA else visualGridA
+            rawGrid2 = if (syncGridB.isNotEmpty()) syncGridB else visualGridB
+
+            // Use visual grid if available for waveform, otherwise refine roughly
+            val gridForWaveformA = if (visualGridA.isNotEmpty()) visualGridA else BeatGridNormalizer.normalize(syncGridA, songA?.song?.bpm ?: 120f, songA?.song?.duration?.toFloat() ?: 1f)
+            val gridForWaveformB = if (visualGridB.isNotEmpty()) visualGridB else BeatGridNormalizer.normalize(syncGridB, songB?.song?.bpm ?: 120f, songB?.song?.duration?.toFloat() ?: 1f)
 
             val durA = songA?.let { loadExactDuration(it.id) }
                 ?: songA?.song?.duration?.toFloat() ?: 1f
@@ -193,19 +210,17 @@ class TransitionEditorViewModel @Inject constructor(
             val bpmB = songB?.song?.bpm ?: 120f
             initialSpeedB = if (bpmB > 0) bpmA / bpmB else 1f
 
-            // Generate Beat-Domain Waveforms using VISUAL grid
-            // This shows the waveform aligned to actual transients
             val samplesPerBeat = 64
 
             _waveformBeatDomain1.value = convertWaveformToBeatDomain(
                 pcmA,
-                visualGridA, // Use visual grid for accurate waveform rendering
+                gridForWaveformA,
                 durA,
                 samplesPerBeat
             )
             _waveformBeatDomain2.value = convertWaveformToBeatDomain(
                 pcmB,
-                visualGridB,
+                gridForWaveformB,
                 durB,
                 samplesPerBeat
             )
@@ -241,9 +256,6 @@ class TransitionEditorViewModel @Inject constructor(
         val gridB = rawGrid2
         if (gridA.isEmpty() || gridB.isEmpty()) return
 
-        // --- 1. INITIALIZE AUDIO FX (Lazy Load) ---
-        // We initialize here because audioSessionId is guaranteed to be valid after prepare/interaction
-        // If we try this in 'init', audioSessionId is often 0 (invalid)
         if (eqA == null && pA.audioSessionId != 0) {
             try { eqA = Equalizer(0, pA.audioSessionId).apply { enabled = true } } catch (e: Exception) { e.printStackTrace() }
         }
@@ -253,7 +265,6 @@ class TransitionEditorViewModel @Inject constructor(
 
         _isPlaying.value = true
 
-        // --- CALCULATE SYNC POINTS ---
         val beatOffsetA = _track1OffsetBeats.value
         val beatOffsetB = _track2OffsetBeats.value
 
@@ -262,22 +273,17 @@ class TransitionEditorViewModel @Inject constructor(
         val beatsInZone = _barsCount.value * 4f
         val visualDelayBeats = if (zoneFraction > 0f) (marginFraction / zoneFraction) * beatsInZone else 0f
 
-        // The "Anchor" is the start of the Transition Zone (Green Box)
         val anchorBeatA = beatOffsetA + visualDelayBeats
         val anchorBeatB = beatOffsetB + visualDelayBeats
 
-        // 1. Calculate Exact Timestamp of the Anchor
         val timeAnchorA = getTimestampForBeat(gridA, anchorBeatA)
         val timeAnchorB = getTimestampForBeat(gridB, anchorBeatB)
 
-        // 2. Set Speeds
         val speedA = 1f
         val speedB = initialSpeedB
         pA.setPlaybackSpeed(speedA)
         pB.setPlaybackSpeed(speedB)
 
-        // 3. SEEK EARLIER (The "Stabilization" Trick)
-        // Seek 3.5s before the transition to let audio engine warm up
         val STABILIZATION_MS = 500L
         val prerollSeconds = (PRE_ROLL_MS + STABILIZATION_MS) / 1000f
 
@@ -287,7 +293,6 @@ class TransitionEditorViewModel @Inject constructor(
         pA.seekTo((seekA * 1000).toLong())
         pB.seekTo((seekB * 1000).toLong())
 
-        // 4. Start SILENTLY (Volume will be handled in loop)
         pA.volume = 0f
         pB.volume = 0f
 
@@ -299,13 +304,11 @@ class TransitionEditorViewModel @Inject constructor(
             val entryBeatA = anchorBeatA
             val transitionDurationBeats = beatsInZone
 
-            // Pre-roll calculation: We unmute A exactly PRE_ROLL_MS before the Anchor
             val bpmA = _track1.value?.song?.bpm ?: 120f
             val beatsPerSec = bpmA / 60f
             val preRollBeats = (PRE_ROLL_MS / 1000f) * beatsPerSec
             val unmuteBeatA = anchorBeatA - preRollBeats
 
-            // Cache EQ ranges for performance
             val bandsA = eqA?.numberOfBands ?: 0.toShort()
             val bandsB = eqB?.numberOfBands ?: 0.toShort()
             val minEQ = eqA?.bandLevelRange?.get(0) ?: -1500
@@ -313,72 +316,43 @@ class TransitionEditorViewModel @Inject constructor(
             var bUnmuted = false
 
             while (isActive && _isPlaying.value) {
-                // Monitor position based on Track A (Master)
                 val posA = pA.currentPosition / 1000f
                 val currentBeatA = DJHelper.timeToBeat(gridA, posA)
 
                 _playbackBeatMarker.value = currentBeatA
 
-                // Calculate Progress (0.0 to 1.0) inside the Transition Zone
-                // (currentBeatA - entryBeatA) gives 0 at the start of the green box
                 val progress = if (transitionDurationBeats > 0)
                     (currentBeatA - entryBeatA) / transitionDurationBeats
                 else 0f
 
-                // --- MIXING LOGIC ---
-
                 if (progress < 0f) {
-                    // === PRE-TRANSITION (Pre-roll) ===
-
-                    // Track A: Handle "Stabilization" Unmute
-                    // It starts silent (-3.5s) and unmutes at (-3.0s)
                     if (currentBeatA >= unmuteBeatA) {
                         pA.volume = 1f
                     } else {
                         pA.volume = 0f
                     }
-
-                    // Track B: Silent
                     pB.volume = 0f
-
-                    // Reset EQs to clean state
                     resetEQ(eqA)
                     resetEQ(eqB)
-
                 } else if (progress <= 1f) {
-                    // === INSIDE TRANSITION ZONE ===
-
-                    // 1. Get Target States from helper
                     val stateA = TransitionMixer.getMixState("A", progress, _overlapMode.value, _eqMode.value, _effectMode.value)
                     val stateB = TransitionMixer.getMixState("B", progress, _overlapMode.value, _eqMode.value, _effectMode.value)
 
-                    // 2. Apply Volume
                     pA.volume = stateA.volume
                     pB.volume = stateB.volume
 
-                    // 3. Apply EQ & Effects
                     applyDeckStateToEQ(eqA, stateA, minEQ, bandsA, _effectMode.value)
                     applyDeckStateToEQ(eqB, stateB, minEQ, bandsB, _effectMode.value)
 
-                    // 4. Sync Correction
                     if (!bUnmuted) {
                         bUnmuted = true
                     }
-
                 } else {
-                    // === POST-TRANSITION ===
-
-                    // Track A: Done
                     pA.volume = 0f
-
-                    // Track B: Full
                     pB.volume = 1f
-
-                    // Reset EQ for B (it's now the main track)
                     resetEQ(eqB)
                 }
-
-                delay(20) // Update loop ~50fps
+                delay(20)
             }
         }
     }
@@ -397,7 +371,6 @@ class TransitionEditorViewModel @Inject constructor(
         _playbackBeatMarker.value = null
     }
 
-    // Reset EQ (flat)
     private fun resetEQ(eq: Equalizer?) {
         if (eq == null) return
         try {
@@ -407,7 +380,6 @@ class TransitionEditorViewModel @Inject constructor(
         }
     }
 
-    // Helper to apply mixing state to EQ
     private fun applyDeckStateToEQ(
         eq: Equalizer?,
         state: com.dd3boh.outertune.utils.DeckState,
@@ -418,51 +390,34 @@ class TransitionEditorViewModel @Inject constructor(
         if (eq == null || bands < 1) return
 
         try {
-            // 1. BASS LOGIC (Bass Kill)
-            // Standard EQ limits (-15dB) are weak for a kill. We cut Band 0 AND Band 1.
-            val bassLevel = state.bass // 1.0 = Full, 0.0 = Cut
+            val bassLevel = state.bass
             val bassCut = (minEQ * (1f - bassLevel)).toInt().toShort()
 
             eq.setBandLevel(0.toShort(), bassCut)
             if (bands > 1) {
-                // Cut Low-Mids by 80% of the bass cut amount to make it sound cleaner
                 eq.setBandLevel(1.toShort(), (bassCut * 0.8).toInt().toShort())
             }
 
-            // 2. FILTER LOGIC
             val isLPF = effectMode.contains("Low pass")
             val isHPF = effectMode.contains("High Pass")
-            val filterLevel = state.filterHigh // 1.0 = Open, 0.0 = Closed
+            val filterLevel = state.filterHigh
 
             if (isLPF) {
-                // Low Pass: Cut High Frequencies
                 val cut = (minEQ * (1f - filterLevel)).toInt().toShort()
                 val lastBand = (bands - 1).toShort()
-
-                // Cut highest band
                 eq.setBandLevel(lastBand, cut)
-
-                // Cut second highest band significantly
                 if (bands > 2) {
                     val prevBand = (bands - 2).toShort()
                     eq.setBandLevel(prevBand, (cut * 0.7).toInt().toShort())
                 }
             } else if (isHPF) {
-                // High Pass: Cut Low Frequencies
-                // This overlaps with Bass logic. We apply the stronger of the two cuts.
                 val cut = (minEQ * (1f - filterLevel)).toInt().toShort()
-
-                // Band 0
                 val currentBand0 = eq.getBandLevel(0.toShort())
                 if (cut < currentBand0) eq.setBandLevel(0.toShort(), cut)
-
-                // Band 1
                 if (bands > 1) {
                     val currentBand1 = eq.getBandLevel(1.toShort())
                     if (cut < currentBand1) eq.setBandLevel(1.toShort(), cut)
                 }
-
-                // Band 2 (Mids) - optional for stronger HPF effect
                 if (bands > 2) {
                     eq.setBandLevel(2.toShort(), (cut * 0.5).toInt().toShort())
                 }
@@ -472,42 +427,6 @@ class TransitionEditorViewModel @Inject constructor(
         }
     }
 
-    /**
-     * SNAPS BTrack timestamps to the nearest loud amplitude peak.
-     */
-    private fun refineBeatGrid(
-        roughGrid: List<Float>,
-        waveform: FloatArray,
-        durationSec: Float
-    ): List<Float> {
-        if (waveform.isEmpty() || roughGrid.isEmpty() || durationSec <= 0) return roughGrid
-
-        val sampleRate = waveform.size / durationSec
-        val windowSizeMs = 50
-        val windowSamples = (windowSizeMs / 1000f * sampleRate).toInt()
-
-        return roughGrid.map { timestamp ->
-            val centerIndex = (timestamp * sampleRate).toInt()
-            val start = (centerIndex - windowSamples).coerceAtLeast(0)
-            val end = (centerIndex + windowSamples).coerceAtMost(waveform.size - 1)
-
-            var maxIndex = centerIndex
-            var maxAmp = -1f
-
-            for (i in start..end) {
-                val amp = abs(waveform[i])
-                if (amp > maxAmp) {
-                    maxAmp = amp
-                    maxIndex = i
-                }
-            }
-            (maxIndex / sampleRate)
-        }
-    }
-
-    /**
-     * Converts Time-Domain Audio -> Beat-Domain Visualization.
-     */
     private fun convertWaveformToBeatDomain(
         waveform: FloatArray,
         grid: List<Float>,
