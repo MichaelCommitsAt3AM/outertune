@@ -72,6 +72,16 @@ class AnalysisWorker @AssistedInject constructor(
             // We use the High-Res PCM data to align the beat to the loudest sample nearby.
             val snappedGrid = snapGridToTransients(filledGrid, pcmData, sampleRate)
 
+            // Convert to seconds for normalization
+            val snappedGridSeconds = snappedGrid.map { it / 1000f }
+
+            // 5.5 NORMALIZE THE GRID for beat matching
+            val dualGrid = BeatGridNormalizer.createDualGrid(
+                detectedGrid = snappedGridSeconds,
+                bpm = analysisResult.bpm,
+                durationSec = exactDurationSeconds
+            )
+
             // 6. Generate Visual Waveform
             val waveformResult = amplituda.processAudio(absolutePath, Compress.withParams(Compress.AVERAGE, 100)).get()
             val amplitudes = waveformResult.amplitudesAsList()
@@ -87,18 +97,26 @@ class AnalysisWorker @AssistedInject constructor(
             File(cacheDir, "${songId}_metadata.dat").writeText(exactDurationSeconds.toString())
 
             File(cacheDir, "${songId}_waveform.dat").writeText(normalizedWaveform.joinToString(","))
-            File(cacheDir, "${songId}_beats.dat").writeText(snappedGrid.joinToString(","))
+
+            // Saving BOTH grids:
+            // - visual grid: for drawing waveform aligned to actual transients
+            // - sync grid: for playback timing and beat matching
+            File(cacheDir, "${songId}_beats_visual.dat")
+                .writeText(dualGrid.visual.map { (it * 1000).toLong() }.joinToString(","))
+
+            File(cacheDir, "${songId}_beats_sync.dat")
+                .writeText(dualGrid.sync.map { (it * 1000).toLong() }.joinToString(","))
+
+            //File(cacheDir, "${songId}_beats.dat").writeText(snappedGrid.joinToString(","))
 
             // 8. Update DB
             val updated = song.copy(
                 waveformPath = File(cacheDir, "${songId}_waveform.dat").absolutePath,
-                beatGridPath = File(cacheDir, "${songId}_beats.dat").absolutePath,
+                beatGridPath = File(cacheDir, "${songId}_beats_sync.dat").absolutePath,
                 bpm = analysisResult.bpm,
-                firstBeatMs = if (snappedGrid.isNotEmpty()) (snappedGrid[0] * 1000).toLong() else 0L,
-
-                // FIX: Cast to Int to satisfy DB type requirement.
-                // (The ViewModel will look for the metadata file first to get the Float value)
+                firstBeatMs = if (dualGrid.sync.isNotEmpty()) (dualGrid.sync[0] * 1000).toLong() else 0L,
                 duration = exactDurationSeconds.toInt()
+
             )
             database.update(updated)
 
@@ -215,3 +233,7 @@ class AnalysisWorker @AssistedInject constructor(
         return (newBeats + detectedGrid.toList()).toLongArray()
     }
 }
+
+// Add helper in companion object or as extension
+private fun List<Float>.toMillisLongArray() = map { (it * 1000).toLong() }.toLongArray()
+

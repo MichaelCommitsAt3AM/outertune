@@ -152,6 +152,7 @@ class TransitionEditorViewModel @Inject constructor(
     }
 
     // --- Data Loading ---
+    // Update loadData function:
     fun loadData(songAId: String, songBId: String) {
         viewModelScope.launch(Dispatchers.IO) {
             val songA = database.song(songAId).firstOrNull()
@@ -159,47 +160,58 @@ class TransitionEditorViewModel @Inject constructor(
             _track1.value = songA
             _track2.value = songB
 
-            // 1. Load Raw Data
             var pcmA = FloatArray(0)
             var pcmB = FloatArray(0)
-            var gridA = emptyList<Float>()
-            var gridB = emptyList<Float>()
+            var visualGridA = emptyList<Float>()
+            var visualGridB = emptyList<Float>()
+            var syncGridA = emptyList<Float>()
+            var syncGridB = emptyList<Float>()
 
             songA?.let {
                 pcmA = loadWaveform(it.song.waveformPath, it.id)
-                gridA = loadBeatGrid(it.song.beatGridPath, it.id)
+                // Load BOTH grids
+                visualGridA = loadBeatGrid(null, it.id, suffix = "_visual")
+                syncGridA = loadBeatGrid(it.song.beatGridPath, it.id)
             }
             songB?.let {
                 pcmB = loadWaveform(it.song.waveformPath, it.id)
-                gridB = loadBeatGrid(it.song.beatGridPath, it.id)
+                visualGridB = loadBeatGrid(null, it.id, suffix = "_visual")
+                syncGridB = loadBeatGrid(it.song.beatGridPath, it.id)
             }
 
-            // Store for playback
-            rawGrid1 = gridA
-            rawGrid2 = gridB
+            // Store SYNC grid for playback (perfect timing)
+            rawGrid1 = syncGridA
+            rawGrid2 = syncGridB
 
-            // 2. Load EXACT duration from metadata file to prevent drift
             val durA = songA?.let { loadExactDuration(it.id) }
                 ?: songA?.song?.duration?.toFloat() ?: 1f
 
             val durB = songB?.let { loadExactDuration(it.id) }
                 ?: songB?.song?.duration?.toFloat() ?: 1f
 
-            // 3. Calculate speeds
             val bpmA = songA?.song?.bpm ?: 120f
             val bpmB = songB?.song?.bpm ?: 120f
             initialSpeedB = if (bpmB > 0) bpmA / bpmB else 1f
 
-            // 4. Generate Beat-Domain Waveforms (Elastic Audio)
-            // We use 64 samples per beat to allow high-res drawing even when zoomed in
+            // Generate Beat-Domain Waveforms using VISUAL grid
+            // This shows the waveform aligned to actual transients
             val samplesPerBeat = 64
 
-            _waveformBeatDomain1.value = convertWaveformToBeatDomain(pcmA, gridA, durA, samplesPerBeat)
-            _waveformBeatDomain2.value = convertWaveformToBeatDomain(pcmB, gridB, durB, samplesPerBeat)
+            _waveformBeatDomain1.value = convertWaveformToBeatDomain(
+                pcmA,
+                visualGridA, // Use visual grid for accurate waveform rendering
+                durA,
+                samplesPerBeat
+            )
+            _waveformBeatDomain2.value = convertWaveformToBeatDomain(
+                pcmB,
+                visualGridB,
+                durB,
+                samplesPerBeat
+            )
 
             updateTransitionDuration()
 
-            // Prepare Players
             withContext(Dispatchers.Main) {
                 songA?.song?.localPath?.let { filePath ->
                     File(filePath).takeIf { it.exists() }?.let {
@@ -562,9 +574,18 @@ class TransitionEditorViewModel @Inject constructor(
     private fun loadWaveform(path: String?, id: String) = File(path ?: "${context.cacheDir}/analysis_data/${id}_waveform.dat")
         .takeIf { it.exists() }?.readText()?.split(",")?.mapNotNull { it.toFloatOrNull() }?.toFloatArray() ?: FloatArray(0)
 
-    private fun loadBeatGrid(path: String?, id: String): List<Float> {
-        return File(path ?: "${context.cacheDir}/analysis_data/${id}_beats.dat")
-            .takeIf { it.exists() }
+    private fun loadBeatGrid(
+        path: String?,
+        id: String,
+        suffix: String = "_sync"
+    ): List<Float> {
+        val file = if (path != null) {
+            File(path)
+        } else {
+            File("${context.cacheDir}/analysis_data/${id}_beats${suffix}.dat")
+        }
+
+        return file.takeIf { it.exists() }
             ?.readText()
             ?.split(",")
             ?.mapNotNull { it.toFloatOrNull() }
