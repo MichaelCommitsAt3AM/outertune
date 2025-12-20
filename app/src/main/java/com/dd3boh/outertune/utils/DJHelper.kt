@@ -24,36 +24,25 @@ object DJHelper {
 
         when (mode) {
             "Overlap" -> {
-                // 1. Track B starts immediately at full volume at the start (Beat 0)
                 cues.add(DJCue(0f, "B", 1f, "jump"))
-
-                // 2. Track A plays fully until the end, then cuts to silence (Beat End)
                 cues.add(DJCue(totalBeats, "A", 0f, "jump"))
             }
             "Cut" -> {
-                // Switch exactly in the middle
                 val middle = totalBeats / 2f
                 cues.add(DJCue(middle, "A", 0f, "jump"))
                 cues.add(DJCue(middle, "B", 1f, "jump"))
-                // Ensure B is silent before the cut?
-                // Usually handled by initial setup, but we can be explicit:
                 cues.add(DJCue(0f, "B", 0f, "jump"))
             }
             "Crossfade" -> {
-                // Linear Crossfade over the whole duration
-                val fadeSteps = 16 // Resolution of fade
+                val fadeSteps = 16
                 for (i in 0..fadeSteps) {
                     val fraction = i.toFloat() / fadeSteps
                     val beat = fraction * totalBeats
-
-                    // A goes 1 -> 0
                     cues.add(DJCue(beat, "A", 1f - fraction, "ramp"))
-                    // B goes 0 -> 1
                     cues.add(DJCue(beat, "B", fraction, "ramp"))
                 }
             }
             else -> {
-                // Default fallback (Overlap)
                 cues.add(DJCue(0f, "B", 1f, "jump"))
                 cues.add(DJCue(totalBeats, "A", 0f, "jump"))
             }
@@ -62,16 +51,58 @@ object DJHelper {
         return cues.sortedBy { it.beat }
     }
 
+    // Recommendation 1: Trust the Grid
+    // Converts a timestamp (seconds) into a precise beat index (e.g., 4.5 beats)
+    // using interpolation between the closest known beats.
     fun timeToBeat(beatGrid: List<Float>, timeSec: Float): Float {
         if (beatGrid.isEmpty()) return 0f
+
+        // Find the insertion point
         val index = beatGrid.binarySearch(timeSec)
-        return if (index >= 0) index.toFloat() else {
-            val insertion = -(index + 1)
-            if (insertion > 0 && insertion < beatGrid.size) {
-                val t1 = beatGrid[insertion - 1]
-                val t2 = beatGrid[insertion]
-                (insertion - 1) + (timeSec - t1) / (t2 - t1)
-            } else insertion.toFloat()
+        if (index >= 0) return index.toFloat() // Exact match
+
+        val insertion = -(index + 1)
+
+        // Interpolate between the surrounding beats
+        if (insertion > 0 && insertion < beatGrid.size) {
+            val t1 = beatGrid[insertion - 1]
+            val t2 = beatGrid[insertion]
+
+            // Percentage progress between previous beat and next beat
+            val fraction = (timeSec - t1) / (t2 - t1)
+            return (insertion - 1) + fraction
         }
+
+        // Fallback: Estimate based on the last known interval if outside the grid
+        if (insertion >= beatGrid.size && beatGrid.size > 1) {
+            val lastInterval = beatGrid.last() - beatGrid[beatGrid.size - 2]
+            val diff = timeSec - beatGrid.last()
+            return (beatGrid.size - 1) + (diff / lastInterval)
+        }
+
+        return insertion.toFloat()
+    }
+
+    // Recommendation 1: Trust the Grid (Inverse)
+    // Allows looking up exactly when beat #X happens, even if tempo changes.
+    fun beatToTime(beatGrid: List<Float>, beatIndex: Float): Float {
+        if (beatGrid.isEmpty()) return 0f
+
+        val i = beatIndex.toInt()
+        val fraction = beatIndex - i
+
+        if (i >= 0 && i < beatGrid.size - 1) {
+            val t1 = beatGrid[i]
+            val t2 = beatGrid[i+1]
+            return t1 + (t2 - t1) * fraction
+        }
+
+        // Fallback for out of bounds
+        if (i >= beatGrid.size - 1 && beatGrid.size > 1) {
+            val lastInterval = beatGrid.last() - beatGrid[beatGrid.size - 2]
+            return beatGrid.last() + (beatIndex - (beatGrid.size - 1)) * lastInterval
+        }
+
+        return if (beatGrid.isNotEmpty()) beatGrid[0] else 0f
     }
 }

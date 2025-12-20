@@ -43,7 +43,7 @@ object AudioDecoder {
                 if (mime.startsWith("audio/")) {
                     audioTrackIndex = i
                     audioFormat = format
-                    Log.d(TAG, "Found audio track at index 0")
+                    Log.d(TAG, "Found audio track at index $i")
                     break
                 }
             }
@@ -57,13 +57,14 @@ object AudioDecoder {
             extractor.selectTrack(audioTrackIndex)
             Log.d(TAG, "Audio track selected")
 
-            val sampleRate = audioFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
-            val channelCount = audioFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+            // Initialize with Extractor's format (Header info), but keep mutable for Decoder updates
+            var sampleRate = audioFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+            var channelCount = audioFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
             val duration = audioFormat.getLong(MediaFormat.KEY_DURATION) // in microseconds
 
             // Estimate array size (add 10% buffer for safety)
             val estimatedSamples = ((duration / 1_000_000.0) * sampleRate * 1.1).toInt()
-            Log.d(TAG, "Audio format: sampleRate=$sampleRate, channels=$channelCount, duration=${duration/1_000_000}s")
+            Log.d(TAG, "Initial format: sampleRate=$sampleRate, channels=$channelCount, duration=${duration/1_000_000}s")
             Log.d(TAG, "Estimated samples: $estimatedSamples")
 
             // Create decoder
@@ -139,10 +140,12 @@ object AudioDecoder {
                     // Write directly to array
                     for (i in shorts.indices step channelCount) {
                         var sample = 0f
-                        for (ch in 0 until min(channelCount, shorts.size - i)) {
+                        // Safely sum available channels (in case format lies or changes mid-stream slightly)
+                        val actualChannels = min(channelCount, shorts.size - i)
+                        for (ch in 0 until actualChannels) {
                             sample += shorts[i + ch] / 32768f
                         }
-                        pcmSamples[currentIndex++] = sample / channelCount
+                        pcmSamples[currentIndex++] = sample / actualChannels
                     }
 
                     decoder.releaseOutputBuffer(outputIndex, false)
@@ -152,7 +155,24 @@ object AudioDecoder {
                         break
                     }
                 } else if (outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                    Log.d(TAG, "Output format changed: ${decoder.outputFormat}")
+                    val newFormat = decoder.outputFormat
+                    Log.d(TAG, "Output format changed: $newFormat")
+
+                    // CRITICAL FIX: Update sample rate and channels to what the decoder is actually producing
+                    if (newFormat.containsKey(MediaFormat.KEY_SAMPLE_RATE)) {
+                        val newSampleRate = newFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+                        if (newSampleRate != sampleRate) {
+                            Log.i(TAG, "Sample rate updated: $sampleRate -> $newSampleRate")
+                            sampleRate = newSampleRate
+                        }
+                    }
+                    if (newFormat.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) {
+                        val newChannelCount = newFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+                        if (newChannelCount != channelCount) {
+                            Log.i(TAG, "Channel count updated: $channelCount -> $newChannelCount")
+                            channelCount = newChannelCount
+                        }
+                    }
                 } else if (outputIndex == MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED) {
                     Log.d(TAG, "Output buffers changed")
                 }
