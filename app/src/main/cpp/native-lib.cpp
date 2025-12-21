@@ -13,8 +13,8 @@
 // --- Constants ---
 const int HOP_SIZE = 512;
 const int FRAME_SIZE = 1024;
-const double MIN_BPM = 80.0;
-const double MAX_BPM = 160.0;
+const double MIN_BPM = 40.0;
+const double MAX_BPM = 200.0;
 
 /**
  * Helper: Post-process the raw beat grid to improve reliability (Recommendation #3).

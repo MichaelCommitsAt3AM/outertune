@@ -71,39 +71,54 @@ class AnalysisWorker @AssistedInject constructor(
             // A. Calculate Baseline Score
             // We evaluate how well the Raw BPM aligns with the Flux (Kick attacks)
             val originalGrid = generateSteadyGrid(firstBeatMs, rawBpm, exactDurationSeconds)
-            val originalScore = calculateGridScore(originalGrid, pcmData, sampleRate)
+            val originalScore = calculateGridScore(originalGrid, pcmData, sampleRate, rawBpm)
 
             Log.d(TAG, "Baseline (Original) BPM: $rawBpm | Flux Score: $originalScore")
 
-            // B. Define Candidates
+            // B. Define Candidates - Smart Octave Detection
             val candidates = mutableMapOf<String, Float>()
 
-            // Standard Octave Checks
-            if (rawBpm < 95) candidates["Double"] = rawBpm * 2
-            if (rawBpm > 175) candidates["Half"] = rawBpm / 2
+            // Standard Octave Checks (expanded logic)
+            // Test halving if BPM is high
+            if (rawBpm > 150) {
+                candidates["Half"] = rawBpm / 2
+            }
 
-            // The Polyrhythm Candidate (115 -> 152)
-            // We still GENERATE this candidate to test it, but we won't give it special bias.
-            if (rawBpm in 110f..120f) {
-                candidates["Polyrhythm_Check"] = rawBpm * (4f / 3f)
+            // Test doubling if BPM is low
+            if (rawBpm < 100) {
+                candidates["Double"] = rawBpm * 2
+            }
+
+            // NEW: Test both directions in the "ambiguous zone" (80-120 BPM)
+            // This is where BTrack often locks onto snares instead of kicks
+            if (rawBpm in 80f..120f) {
+                candidates["Double_AmbiguousZone"] = rawBpm * 2
+                // Only test half if we're on the higher end
+                if (rawBpm > 100) {
+                    candidates["Half_AmbiguousZone"] = rawBpm / 2
+                }
+            }
+
+            // NEW: Quarter/quadruple for extreme misdetections
+            if (rawBpm < 60) {
+                candidates["Quadruple"] = rawBpm * 4
+            }
+            if (rawBpm > 180) {
+                candidates["Quarter"] = rawBpm / 4
             }
 
             var bestBpm = rawBpm
             var currentBestScore = originalScore
 
-            // C. Test Candidates
+            // C. Test Candidates (keep your existing logic)
             for ((type, candidateBpm) in candidates) {
                 val testGrid = generateSteadyGrid(firstBeatMs, candidateBpm, exactDurationSeconds)
-                val candidateScore = calculateGridScore(testGrid, pcmData, sampleRate)
+                val candidateScore = calculateGridScore(testGrid, pcmData, sampleRate, candidateBpm)
 
-                // DECISION LOGIC:
-                // All candidates must be significantly better (> 5%) than the original to justify
-                // overriding the native analysis. No special treatment for specific genres.
+                // Require 2% improvement to override native detection
                 val threshold = originalScore * 1.02f
 
                 if (candidateScore > threshold) {
-                    // It qualifies! Now does it beat the *current* best?
-                    // (e.g., if Double and Polyrhythm both qualify, pick the highest score)
                     if (bestBpm == rawBpm || candidateScore > currentBestScore) {
                         bestBpm = candidateBpm
                         currentBestScore = candidateScore
@@ -132,7 +147,7 @@ class AnalysisWorker @AssistedInject constructor(
             }
 
             // Snap to exact transients (using Raw PCM for precision)
-            val snappedGrid = snapGridToTransients(processingGrid, pcmData, sampleRate)
+            val snappedGrid = snapGridToTransients(processingGrid, pcmData, sampleRate, correctedBpm)
 
             // Backfill start
             val finalGrid = backfillStartBeats(snappedGrid, correctedBpm)
@@ -173,7 +188,7 @@ class AnalysisWorker @AssistedInject constructor(
         }
     }
 
-    private fun calculateGridScore(grid: LongArray, pcm: FloatArray, sampleRate: Int): Float {
+    private fun calculateGridScore(grid: LongArray, pcm: FloatArray, sampleRate: Int, currentBpm: Float): Float {
         if (grid.isEmpty()) return 0f
 
         // 1. Filter: Isolate Kick/Bass (< 150Hz)
@@ -182,8 +197,10 @@ class AnalysisWorker @AssistedInject constructor(
         var totalFlux = 0f
         var samplesChecked = 0
 
-        // Window: 20ms (Tight window to find the attack)
-        val windowMs = 20
+        // ADAPTIVE Window: Scale with BPM
+        // At 60 BPM: ~40ms, At 180 BPM: ~13ms
+        val beatIntervalMs = 60_000.0 / currentBpm
+        val windowMs = (beatIntervalMs * 0.08).toInt().coerceIn(10, 50) // 8% of beat interval
         val windowSamples = (windowMs * sampleRate / 1000)
 
         for (beatTimeMs in grid) {
@@ -195,10 +212,10 @@ class AnalysisWorker @AssistedInject constructor(
             var maxFlux = 0f
 
             for (i in (centerIndex - windowSamples)..(centerIndex + windowSamples)) {
+                if (i <= 0) continue
                 val current = abs(bassPcm[i])
-                val previous = abs(bassPcm[i-1]) // Simple 1-sample derivative
+                val previous = abs(bassPcm[i-1])
 
-                // Only count positive increases (Attacks)
                 val flux = (current - previous).coerceAtLeast(0f)
 
                 if (flux > maxFlux) maxFlux = flux
@@ -258,11 +275,10 @@ class AnalysisWorker @AssistedInject constructor(
      * This fixes issues in intros/outros where a quiet beat (hi-hat/kick) might be
      * overpowered by a loud swelling synth pad.
      */
-    private fun snapGridToTransients(grid: LongArray, pcm: FloatArray, sampleRate: Int): LongArray {
-        // This function is critical: it takes the "Steady Grid" and wiggles every beat
-        // to land on the loudest nearby sample.
-
-        val windowMs = 50
+    private fun snapGridToTransients(grid: LongArray, pcm: FloatArray, sampleRate: Int, currentBpm: Float): LongArray {
+        // ADAPTIVE Window based on BPM
+        val beatIntervalMs = 60_000.0 / currentBpm
+        val windowMs = (beatIntervalMs * 0.12).toInt().coerceIn(15, 80) // 12% of beat interval
         val windowSamples = (windowMs * sampleRate / 1000)
         val alpha = 0.90f
 
@@ -277,7 +293,8 @@ class AnalysisWorker @AssistedInject constructor(
 
             for (i in start..end) {
                 val currentAbs = abs(pcm[i])
-                val currentEnvelope = if (currentAbs > previousEnvelope) currentAbs else previousEnvelope * alpha + currentAbs * (1 - alpha)
+                val currentEnvelope = if (currentAbs > previousEnvelope) currentAbs
+                else previousEnvelope * alpha + currentAbs * (1 - alpha)
                 val flux = (currentEnvelope - previousEnvelope).coerceAtLeast(0f)
 
                 if (flux > maxFlux) {
