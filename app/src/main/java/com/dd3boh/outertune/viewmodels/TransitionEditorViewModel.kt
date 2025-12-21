@@ -46,7 +46,7 @@ class TransitionEditorViewModel @Inject constructor(
     private var eqA: Equalizer? = null
     private var eqB: Equalizer? = null
 
-    // Derived beat indices for UI markers
+    // Derived beat indices for UI markers — keep this driven by waveform domain so UI matches what is drawn
     val beatMarkers: StateFlow<List<BeatGridMarker>> =
         waveformBeatDomain1.map { samples ->
             if (samples.isEmpty()) emptyList()
@@ -61,7 +61,6 @@ class TransitionEditorViewModel @Inject constructor(
                 }
             }
         }.stateIn(viewModelScope, SharingStarted.Lazily, emptyList())
-
 
     // Pixels per beat (Zoom level)
     private val _pixelsPerBeatBase = MutableStateFlow(48f)
@@ -94,8 +93,7 @@ class TransitionEditorViewModel @Inject constructor(
     private val _playbackBeatMarker = MutableStateFlow<Float?>(null)
     val playbackBeatMarker = _playbackBeatMarker.asStateFlow()
 
-    // Independent Waveform Offsets (Stored as Double internally for precision, exposed as float? or kept float for UI)
-    // Keeping Float for UI bindings, but we will convert to Double during math
+    // Independent Waveform Offsets
     private val _track1OffsetBeats = MutableStateFlow(0f)
     val track1OffsetBeats = _track1OffsetBeats.asStateFlow()
 
@@ -113,7 +111,7 @@ class TransitionEditorViewModel @Inject constructor(
     private var trackBGridScalar = 1.0 // Changed to Double
 
     // Cache raw refined grids to perform time lookups during playback
-    // CHANGED: Using Double for high precision timing
+    // Using Double for high precision timing
     private var rawGrid1: List<Double> = emptyList()
     private var rawGrid2: List<Double> = emptyList()
 
@@ -174,7 +172,6 @@ class TransitionEditorViewModel @Inject constructor(
             var pcmB = FloatArray(0)
             var visualGridA = emptyList<Float>()
             var visualGridB = emptyList<Float>()
-            // We use Double for the sync grids now
             var syncGridA = emptyList<Double>()
             var syncGridB = emptyList<Double>()
 
@@ -189,23 +186,49 @@ class TransitionEditorViewModel @Inject constructor(
                 syncGridB = loadBeatGridDouble(it.song.beatGridPath, it.id)
             }
 
-            // Fallback to visual grid (converted to double) if sync grid missing
-            rawGrid1 = if (syncGridA.isNotEmpty()) syncGridA else visualGridA.map { it.toDouble() }
-            rawGrid2 = if (syncGridB.isNotEmpty()) syncGridB else visualGridB.map { it.toDouble() }
+            // Determine analysis and display BPM (displayBpm field if present, else fallback)
+            val analysisBpmA = songA?.song?.bpm ?: 120f
+            val analysisBpmB = songB?.song?.bpm ?: 120f
+            val displayBpmA = songA?.song?.displayBpm ?: analysisBpmA
+            val displayBpmB = songB?.song?.displayBpm ?: analysisBpmB
 
-            val gridForWaveformA = if (visualGridA.isNotEmpty()) visualGridA else BeatGridNormalizer.normalize(syncGridA.map{it.toFloat()}, songA?.song?.bpm ?: 120f, songA?.song?.duration?.toFloat() ?: 1f)
-            val gridForWaveformB = if (visualGridB.isNotEmpty()) visualGridB else BeatGridNormalizer.normalize(syncGridB.map{it.toFloat()}, songB?.song?.bpm ?: 120f, songB?.song?.duration?.toFloat() ?: 1f)
+            // durations (use exact if available)
+            val durA = songA?.let { loadExactDuration(it.id) } ?: songA?.song?.duration?.toFloat() ?: 1f
+            val durB = songB?.let { loadExactDuration(it.id) } ?: songB?.song?.duration?.toFloat() ?: 1f
 
-            val durA = songA?.let { loadExactDuration(it.id) }
-                ?: songA?.song?.duration?.toFloat() ?: 1f
+            // Build detected visual grid fallback (prefer visual file, else fall back to sync file)
+            val detectedVisualA = if (visualGridA.isNotEmpty()) visualGridA else syncGridA.map { it.toFloat() }
+            val detectedVisualB = if (visualGridB.isNotEmpty()) visualGridB else syncGridB.map { it.toFloat() }
 
-            val durB = songB?.let { loadExactDuration(it.id) }
-                ?: songB?.song?.duration?.toFloat() ?: 1f
+            // Resolve Dual Grids using BeatGridNormalizer (phase-preserving)
+            val dualA = BeatGridNormalizer.resolveDjGrids(
+                detectedGrid = detectedVisualA,
+                analysisBpm = analysisBpmA,
+                displayBpm = displayBpmA,
+                durationSec = durA,
+                promoteVisual = false // keep waveform transients visually intact by default
+            )
 
-            val bpmA = songA?.song?.bpm ?: 120f
-            val bpmB = songB?.song?.bpm ?: 120f
+            val dualB = BeatGridNormalizer.resolveDjGrids(
+                detectedGrid = detectedVisualB,
+                analysisBpm = analysisBpmB,
+                displayBpm = displayBpmB,
+                durationSec = durB,
+                promoteVisual = false
+            )
 
-            val rawRatio = if (bpmB > 0) bpmA / bpmB else 1f
+            // Use sync grids for playback (high precision)
+            rawGrid1 = dualA.sync.map { it.toDouble() }
+            rawGrid2 = dualB.sync.map { it.toDouble() }
+
+            // Use visual grids for waveform drawing (Float)
+            val gridForWaveformA = dualA.visual
+            val gridForWaveformB = dualB.visual
+
+            // Compute scalar between tracks for visual display matching (unchanged)
+            val bpmA = displayBpmA
+            val bpmB = displayBpmB
+            val rawRatio = if (bpmB > 0f) bpmA / bpmB else 1f
 
             val candidates = listOf(0.5f, 1.0f, 1.5f, 2.0f, 4.0f)
             val bestMultiplier = candidates.minByOrNull { k ->
@@ -237,6 +260,7 @@ class TransitionEditorViewModel @Inject constructor(
             updateTransitionDuration()
 
             withContext(Dispatchers.Main) {
+                // Prepare players with local files
                 songA?.song?.localPath?.let { filePath ->
                     File(filePath).takeIf { it.exists() }?.let {
                         playerA?.setMediaItem(MediaItem.fromUri(Uri.fromFile(it)))
@@ -280,15 +304,12 @@ class TransitionEditorViewModel @Inject constructor(
         val zoneFraction = _transitionWidthFraction.value
         val marginFraction = (1f - zoneFraction) / 2f
         val beatsInZone = (_barsCount.value * 4).toDouble()
-        // Visual delay calculation using Doubles
         val visualDelayBeats = if (zoneFraction > 0f) (marginFraction / zoneFraction) * beatsInZone else 0.0
 
         val anchorBeatA = beatOffsetA + visualDelayBeats
         val anchorBeatB = beatOffsetB + visualDelayBeats
 
-        // Precise timestamp lookup from Grid (No BPM assumption)
         val timeAnchorA = getTimestampForBeat(gridA, anchorBeatA)
-        // Adjust anchor B by scalar to find the true index in grid B
         val timeAnchorB = getTimestampForBeat(gridB, anchorBeatB / trackBGridScalar)
 
         val speedA = 1.0f
@@ -299,9 +320,7 @@ class TransitionEditorViewModel @Inject constructor(
         val STABILIZATION_MS = 500L
         val prerollSeconds = (PRE_ROLL_MS + STABILIZATION_MS) / 1000.0
 
-        // Calculate Seek positions
         val seekA = (timeAnchorA - prerollSeconds).coerceAtLeast(0.0)
-        // For B, we must account for its playback speed in the preroll duration
         val seekB = (timeAnchorB - (prerollSeconds * initialSpeedB)).coerceAtLeast(0.0)
 
         pA.seekTo((seekA * 1000).toLong())
@@ -318,8 +337,6 @@ class TransitionEditorViewModel @Inject constructor(
             val entryBeatA = anchorBeatA
             val transitionDurationBeats = beatsInZone
 
-            // REPLACEMENT: Instead of using BPM to find pre-roll beats,
-            // we use the grid to find exactly which beat corresponds to the seek time.
             val unmuteBeatA = getBeatForTimestamp(gridA, seekA + (STABILIZATION_MS/1000.0))
 
             val bandsA = eqA?.numberOfBands ?: 0.toShort()
@@ -328,41 +345,29 @@ class TransitionEditorViewModel @Inject constructor(
 
             var bUnmuted = false
 
-            // Sync Correction State
             var nextCorrectionBeat = unmuteBeatA + 16.0 // First correction 16 beats after start
 
             while (isActive && _isPlaying.value) {
-                // Use Double for position
                 val posA = pA.currentPosition / 1000.0
-                // Grid-based beat lookup
                 val currentBeatA = getBeatForTimestamp(gridA, posA)
 
                 _playbackBeatMarker.value = currentBeatA.toFloat()
 
-                // --- Phase Drift Correction Loop (Every 16 beats) ---
                 if (currentBeatA > nextCorrectionBeat) {
                     val posB = pB.currentPosition / 1000.0
 
-                    // 1. Calculate where Track B *should* be based on Track A's current beat
-                    // Formula: (CurrentA - OffsetA + OffsetB) gives visual alignment.
-                    // Scale by gridScalar to get Grid B index.
                     val relativeProgressBeats = currentBeatA - beatOffsetA
                     val targetBeatB = (relativeProgressBeats + beatOffsetB) / trackBGridScalar
                     val expectedTimeB = getTimestampForBeat(gridB, targetBeatB)
 
-                    // 2. Calculate Drift
                     val driftSeconds = posB - expectedTimeB
 
-                    // 3. Apply Nudge (Pitch Bend) if drift is significant (> 5ms)
                     if (abs(driftSeconds) > 0.005) {
-                        // If drift is positive (B is ahead), slow down. If negative (B is behind), speed up.
-                        // We apply a gentle correction factor (e.g. 2% change)
                         val correctionFactor =
                             (1.0 - (driftSeconds.coerceIn(-0.02, 0.02) * 0.05)).toFloat()
                         val newSpeed = (initialSpeedB * correctionFactor).toFloat()
                         pB.setPlaybackSpeed(newSpeed)
 
-                        // Revert to normal speed after a short delay (e.g. 500ms) to complete the nudge
                         launch {
                             delay(500)
                             if (isActive && _isPlaying.value) {
@@ -373,14 +378,11 @@ class TransitionEditorViewModel @Inject constructor(
 
                     nextCorrectionBeat += 16.0
                 }
-                // ----------------------------------------------------
-
                 val progress = if (transitionDurationBeats > 0)
                     ((currentBeatA - entryBeatA) / transitionDurationBeats).toFloat()
                 else 0f
 
                 if (progress < 0f) {
-                    // Logic to unmute after the stabilization pre-roll
                     if (currentBeatA >= unmuteBeatA) {
                         pA.volume = 1f
                     } else {
@@ -529,7 +531,6 @@ class TransitionEditorViewModel @Inject constructor(
         _transitionDurationSeconds.value = (beats * interval).toFloat()
     }
 
-
     // --- Double Precision Helpers ---
 
     private fun getTimestampForBeat(grid: List<Double>, beatIndex: Double): Double {
@@ -549,28 +550,22 @@ class TransitionEditorViewModel @Inject constructor(
         return t1 + (t2 - t1) * (beatIndex - idx)
     }
 
-    // Inverse of getTimestampForBeat: Finds beat index for a given time
     private fun getBeatForTimestamp(grid: List<Double>, time: Double): Double {
         if (grid.isEmpty()) return 0.0
-        // Use binary search for efficiency
         val ip = grid.binarySearch(time)
-        if (ip >= 0) return ip.toDouble() // Exact match
+        if (ip >= 0) return ip.toDouble()
 
-        // Inverted insertion point: -(insertion point) - 1
         val idx = -(ip + 1) - 1
 
         if (idx < 0) {
-            // Before start of grid, extrapolate backwards using first beat duration
             val step = if (grid.size > 1) grid[1] - grid[0] else 0.5
             return (time - grid[0]) / step
         }
         if (idx >= grid.size - 1) {
-            // After end of grid, extrapolate forwards
             val step = if (grid.size > 1) grid[grid.size - 1] - grid[grid.size - 2] else 0.5
             return (grid.size - 1) + (time - grid.last()) / step
         }
 
-        // Linear interpolation between grid[idx] and grid[idx+1]
         val t1 = grid[idx]
         val t2 = grid[idx + 1]
         val fraction = (time - t1) / (t2 - t1)
@@ -585,13 +580,11 @@ class TransitionEditorViewModel @Inject constructor(
     private fun loadWaveform(path: String?, id: String) = File(path ?: "${context.cacheDir}/analysis_data/${id}_waveform.dat")
         .takeIf { it.exists() }?.readText()?.split(",")?.mapNotNull { it.toFloatOrNull() }?.toFloatArray() ?: FloatArray(0)
 
-    // Helper for Visuals (Float)
     private fun loadBeatGridFloat(path: String?, id: String, suffix: String): List<Float> {
         val file = if (path != null) File(path) else File("${context.cacheDir}/analysis_data/${id}_beats${suffix}.dat")
         return file.takeIf { it.exists() }?.readText()?.split(",")?.mapNotNull { it.toFloatOrNull() }?.map { it / 1000f } ?: emptyList()
     }
 
-    // Helper for Sync (Double)
     private fun loadBeatGridDouble(path: String?, id: String): List<Double> {
         val file = if (path != null) File(path) else File("${context.cacheDir}/analysis_data/${id}_beats_sync.dat")
         return file.takeIf { it.exists() }?.readText()?.split(",")?.mapNotNull { it.toDoubleOrNull() }?.map { it / 1000.0 } ?: emptyList()

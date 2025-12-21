@@ -42,7 +42,6 @@ import com.dd3boh.outertune.viewmodels.TransitionEditorViewModel
 import com.dd3boh.outertune.viewmodels.BeatSample
 import com.dd3boh.outertune.ui.component.BeatGridMarker
 
-
 @Composable
 fun TransitionEditorScreen(
     songAId: String,
@@ -65,11 +64,9 @@ fun TransitionEditorScreen(
 
     val beatMarkers by viewModel.beatMarkers.collectAsState(initial = emptyList())
 
-
     val pixelsPerBeat by viewModel.pixelsPerBeatBase.collectAsState()
 
     val playbackBeatMarker by viewModel.playbackBeatMarker.collectAsState()
-
 
     // Independent offsets
     val track1OffsetBeats by viewModel.track1OffsetBeats.collectAsState()
@@ -85,6 +82,9 @@ fun TransitionEditorScreen(
     val effectMode by viewModel.effectMode.collectAsState()
 
     val isPlaying by viewModel.isPlaying.collectAsState()
+
+
+
 
     // UI VISIBILITY STATE
     var controlsVisible by remember { mutableStateOf(true) }
@@ -152,11 +152,9 @@ fun TransitionEditorScreen(
                 playbackBeatMarker = playbackBeatMarker,
                 track1OffsetPixels = track1OffsetPixels,
                 track2OffsetPixels = track2OffsetPixels,
-                // --- ADD THESE 3 LINES ---
                 overlapMode = overlapMode,
                 eqMode = eqMode,
                 effectMode = effectMode,
-                // -------------------------
                 onTrack1OffsetChanged = { px -> viewModel.setTrack1Offset(px, pixelsPerBeat) },
                 onTrack2OffsetChanged = { px -> viewModel.setTrack2Offset(px, pixelsPerBeat) },
                 onPlayPauseClick = { viewModel.togglePlayback() }
@@ -205,11 +203,9 @@ fun WaveformsSection(
     playbackBeatMarker: Float?,
     track1OffsetPixels: Float,
     track2OffsetPixels: Float,
-    // --- NEW PARAMETERS ---
     overlapMode: String,
     eqMode: String,
     effectMode: String,
-    // ----------------------
     onTrack1OffsetChanged: (Float) -> Unit,
     onTrack2OffsetChanged: (Float) -> Unit,
     onPlayPauseClick: () -> Unit
@@ -264,7 +260,6 @@ fun WaveformsSection(
                     .fillMaxHeight()
                     .align(Alignment.Center)
             ) {
-                // Background + border
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
@@ -272,9 +267,7 @@ fun WaveformsSection(
                         .border(2.dp, Color(0xFF4CAF50).copy(alpha = 0.6f), RoundedCornerShape(12.dp))
                 )
 
-                // ----------------------------------------------------
-                // VISUALIZATION CURVES
-                // ----------------------------------------------------
+                // Visualization curves
                 Canvas(modifier = Modifier.fillMaxSize().padding(horizontal = 4.dp)) {
                     val w = size.width
                     val h = size.height
@@ -285,18 +278,13 @@ fun WaveformsSection(
                     val pathABass = Path()
                     val pathBBass = Path()
 
-                    // Note: In Canvas Y=0 is top.
-                    // We want volume 1.0 to be at Top (0) and 0.0 to be at Bottom (h)
-
                     for (i in 0..steps) {
                         val p = i / steps.toFloat()
                         val x = p * w
 
-                        // Get States using the PASSED parameters
                         val stateA = TransitionMixer.getMixState("A", p, overlapMode, eqMode, effectMode)
                         val stateB = TransitionMixer.getMixState("B", p, overlapMode, eqMode, effectMode)
 
-                        // Y coordinates
                         val yVolA = h - (stateA.volume * h)
                         val yVolB = h - (stateB.volume * h)
                         val yBassA = h - (stateA.bass * h)
@@ -315,19 +303,15 @@ fun WaveformsSection(
                         }
                     }
 
-                    // Draw Volume (Track A = White, Track B = Cyan)
                     drawPath(pathAVol, Color.White.copy(alpha=0.7f), style = androidx.compose.ui.graphics.drawscope.Stroke(width=3.dp.toPx()))
                     drawPath(pathBVol, Color.Cyan.copy(alpha=0.7f), style = androidx.compose.ui.graphics.drawscope.Stroke(width=3.dp.toPx()))
 
-                    // Draw Bass (Red) - Only if EQ active
                     if (eqMode != "None") {
                         drawPath(pathABass, Color(0xFFFF5252).copy(alpha=0.8f), style = androidx.compose.ui.graphics.drawscope.Stroke(width=4.dp.toPx()))
                         drawPath(pathBBass, Color(0xFFFF5252).copy(alpha=0.4f), style = androidx.compose.ui.graphics.drawscope.Stroke(width=4.dp.toPx()))
                     }
                 }
-                // ----------------------------------------------------
 
-                // PLAY BUTTON
                 AnimatedVisibility(
                     visible = !isPlaying || showControls,
                     enter = fadeIn(),
@@ -353,7 +337,6 @@ fun WaveformsSection(
                     }
                 }
 
-                // Labels
                 Surface(
                     modifier = Modifier.align(Alignment.TopCenter).padding(top = 8.dp),
                     shape = RoundedCornerShape(16.dp),
@@ -362,7 +345,6 @@ fun WaveformsSection(
                     Text("Transition Zone", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp))
                 }
 
-                // Edge markers
                 Box(modifier = Modifier.width(2.dp).fillMaxHeight().align(Alignment.CenterStart).background(Color(0xFF4CAF50).copy(alpha = 0.8f)))
                 Box(modifier = Modifier.width(2.dp).fillMaxHeight().align(Alignment.CenterEnd).background(Color(0xFF4CAF50).copy(alpha = 0.8f)))
             }
@@ -434,6 +416,9 @@ fun TransitionTrackInfo(
     showDurationBadge: Boolean = true,
     modifier: Modifier = Modifier
 ) {
+    val analysisBpm = song.song.bpm ?: 0f
+    val displayBpm = song.song.displayBpm ?: analysisBpm
+
     Row(
         modifier = modifier.fillMaxWidth(),
         verticalAlignment = Alignment.CenterVertically
@@ -441,7 +426,9 @@ fun TransitionTrackInfo(
         AsyncImage(
             model = song.song.getThumbnailModel(),
             contentDescription = "Album Art",
-            modifier = Modifier.size(60.dp).clip(RoundedCornerShape(4.dp)),
+            modifier = Modifier
+                .size(60.dp)
+                .clip(RoundedCornerShape(4.dp)),
             contentScale = ContentScale.Crop
         )
 
@@ -465,10 +452,18 @@ fun TransitionTrackInfo(
 
         Column(horizontalAlignment = Alignment.End) {
             Text(
-                text = song.song.bpm?.let { "%.0f BPM".format(it) } ?: "-- BPM",
+                text = "${displayBpm.toInt()} BPM",
                 color = Color.White,
                 fontSize = 12.sp
             )
+
+            if (displayBpm != analysisBpm) {
+                Text(
+                    text = "detected: ${analysisBpm.toInt()} BPM",
+                    color = Color(0xFFAAAAAA),
+                    fontSize = 11.sp
+                )
+            }
 
             song.song.key?.let { key ->
                 Text(text = key, color = Color.Gray, fontSize = 12.sp)
@@ -491,6 +486,7 @@ fun TransitionTrackInfo(
         }
     }
 }
+
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable

@@ -33,17 +33,13 @@ class AnalysisWorker @AssistedInject constructor(
 
         val songId = inputData.getString("songId") ?: return Result.failure()
 
+        // 1. Database & File Checks
         val song = database.song(songId).first()?.song ?: run {
             Log.e(TAG, "Song not found in DB: $songId")
             return Result.failure()
         }
 
-        val path = song.localPath ?: run {
-            Log.e(TAG, "No local path for song: $songId")
-            return Result.failure()
-        }
-
-        // Add leading slash if missing
+        val path = song.localPath ?: return Result.failure()
         val absolutePath = if (path.startsWith("/")) path else "/$path"
         val file = File(absolutePath)
 
@@ -55,77 +51,202 @@ class AnalysisWorker @AssistedInject constructor(
         Log.i(TAG, "Starting analysis for songId=$songId")
 
         return try {
-            // 1. Decode Raw Audio
+            // 2. Decode Raw Audio
             val (pcmData, sampleRate) = AudioDecoder.decodeToMono(absolutePath) ?: return Result.failure()
 
-            // 2. Calculate EXACT Duration
-            // Metadata duration is often rounded. We need the exact duration to prevent visual drift.
+            // 3. Calculate EXACT Duration
             val exactDurationSeconds = pcmData.size.toFloat() / sampleRate.toFloat()
 
-            // 3. Analyze BPM (Native BTrack)
+            // 4. Raw Analysis (Native BTrack)
             val analysisResult = AudioAnalyzer.analyzeBpm(pcmData, sampleRate) ?: return Result.failure()
+            val rawBpm = analysisResult.bpm
+            val rawGrid = analysisResult.beatGrid
 
-            // 4. Backfill Start Beats (Mathematical)
-            val filledGrid = backfillStartBeats(analysisResult.beatGrid, analysisResult.bpm)
+            // =========================================================================
+            // 5. FLUX-BASED CANDIDATE SELECTION (Pure Meritocracy)
+            // =========================================================================
 
-            // 5. SNAP TO PEAKS (The "Spotify" Look)
-            // We use the High-Res PCM data to align the beat to the loudest sample nearby.
-            val snappedGrid = snapGridToTransients(filledGrid, pcmData, sampleRate)
+            val firstBeatMs = if (rawGrid.isNotEmpty()) rawGrid[0] else 0L
 
-            // Convert to seconds for normalization
-            val snappedGridSeconds = snappedGrid.map { it / 1000f }
+            // A. Calculate Baseline Score
+            // We evaluate how well the Raw BPM aligns with the Flux (Kick attacks)
+            val originalGrid = generateSteadyGrid(firstBeatMs, rawBpm, exactDurationSeconds)
+            val originalScore = calculateGridScore(originalGrid, pcmData, sampleRate)
 
-            // 5.5 NORMALIZE THE GRID for beat matching
-            val dualGrid = BeatGridNormalizer.createDualGrid(
-                detectedGrid = snappedGridSeconds,
-                bpm = analysisResult.bpm,
-                durationSec = exactDurationSeconds
-            )
+            Log.d(TAG, "Baseline (Original) BPM: $rawBpm | Flux Score: $originalScore")
 
-            // 6. Generate Visual Waveform
+            // B. Define Candidates
+            val candidates = mutableMapOf<String, Float>()
+
+            // Standard Octave Checks
+            if (rawBpm < 95) candidates["Double"] = rawBpm * 2
+            if (rawBpm > 175) candidates["Half"] = rawBpm / 2
+
+            // The Polyrhythm Candidate (115 -> 152)
+            // We still GENERATE this candidate to test it, but we won't give it special bias.
+            if (rawBpm in 110f..120f) {
+                candidates["Polyrhythm_Check"] = rawBpm * (4f / 3f)
+            }
+
+            var bestBpm = rawBpm
+            var currentBestScore = originalScore
+
+            // C. Test Candidates
+            for ((type, candidateBpm) in candidates) {
+                val testGrid = generateSteadyGrid(firstBeatMs, candidateBpm, exactDurationSeconds)
+                val candidateScore = calculateGridScore(testGrid, pcmData, sampleRate)
+
+                // DECISION LOGIC:
+                // All candidates must be significantly better (> 5%) than the original to justify
+                // overriding the native analysis. No special treatment for specific genres.
+                val threshold = originalScore * 1.02f
+
+                if (candidateScore > threshold) {
+                    // It qualifies! Now does it beat the *current* best?
+                    // (e.g., if Double and Polyrhythm both qualify, pick the highest score)
+                    if (bestBpm == rawBpm || candidateScore > currentBestScore) {
+                        bestBpm = candidateBpm
+                        currentBestScore = candidateScore
+                        Log.i(TAG, "Candidate $type ($candidateBpm) took the lead! Score: $candidateScore")
+                    }
+                } else {
+                    Log.d(TAG, "Candidate $type ($candidateBpm) rejected. Score $candidateScore vs Thresh $threshold")
+                }
+            }
+
+            Log.i(TAG, "Final Decision: $bestBpm (Raw was: $rawBpm)")
+
+            val correctedBpm = bestBpm
+            val bpmChanged = abs(correctedBpm - rawBpm) > 1.0f
+
+            // =========================================================================
+            // 6. REGENERATE & SNAP
+            // =========================================================================
+
+            val processingGrid: LongArray = if (bpmChanged) {
+                // BPM changed -> Regenerate steady grid from math
+                generateSteadyGrid(firstBeatMs, correctedBpm, exactDurationSeconds)
+            } else {
+                // BPM same -> Keep raw grid
+                rawGrid
+            }
+
+            // Snap to exact transients (using Raw PCM for precision)
+            val snappedGrid = snapGridToTransients(processingGrid, pcmData, sampleRate)
+
+            // Backfill start
+            val finalGrid = backfillStartBeats(snappedGrid, correctedBpm)
+
+            // =========================================================================
+            // 7. SAVE DATA
+            // =========================================================================
+
             val waveformResult = amplituda.processAudio(absolutePath, Compress.withParams(Compress.AVERAGE, 100)).get()
             val amplitudes = waveformResult.amplitudesAsList()
             val maxAmplitude = amplitudes.maxOrNull()?.toFloat() ?: 1f
             val normalizedWaveform = amplitudes.map { it.toFloat() / maxAmplitude }
 
-            // 7. Save Data
             val cacheDir = File(applicationContext.cacheDir, "analysis_data")
             cacheDir.mkdirs()
 
-            // --- NEW: Save exact duration to metadata file ---
-            // We read this in the ViewModel to prevent drift, ignoring the rounded DB value.
             File(cacheDir, "${songId}_metadata.dat").writeText(exactDurationSeconds.toString())
-
             File(cacheDir, "${songId}_waveform.dat").writeText(normalizedWaveform.joinToString(","))
-
-            // Saving BOTH grids:
-            // - visual grid: for drawing waveform aligned to actual transients
-            // - sync grid: for playback timing and beat matching
-            File(cacheDir, "${songId}_beats_visual.dat")
-                .writeText(dualGrid.visual.map { (it * 1000).toLong() }.joinToString(","))
-
-            File(cacheDir, "${songId}_beats_sync.dat")
-                .writeText(dualGrid.sync.map { (it * 1000).toLong() }.joinToString(","))
-
-            //File(cacheDir, "${songId}_beats.dat").writeText(snappedGrid.joinToString(","))
+            File(cacheDir, "${songId}_beats_sync.dat").writeText(finalGrid.joinToString(","))
 
             // 8. Update DB
             val updated = song.copy(
                 waveformPath = File(cacheDir, "${songId}_waveform.dat").absolutePath,
                 beatGridPath = File(cacheDir, "${songId}_beats_sync.dat").absolutePath,
-                bpm = analysisResult.bpm,
-                firstBeatMs = if (dualGrid.sync.isNotEmpty()) (dualGrid.sync[0] * 1000).toLong() else 0L,
+                bpm = correctedBpm,
+                displayBpm = correctedBpm,
+                firstBeatMs = if (finalGrid.isNotEmpty()) finalGrid[0] else 0L,
                 duration = exactDurationSeconds.toInt()
-
             )
             database.update(updated)
 
             Result.success()
+
         } catch (e: Exception) {
             Log.e(TAG, "=== ERROR analyzing song $songId ===", e)
             e.printStackTrace()
             Result.failure()
         }
+    }
+
+    private fun calculateGridScore(grid: LongArray, pcm: FloatArray, sampleRate: Int): Float {
+        if (grid.isEmpty()) return 0f
+
+        // 1. Filter: Isolate Kick/Bass (< 150Hz)
+        val bassPcm = lowPassFilter(pcm, sampleRate, 150f)
+
+        var totalFlux = 0f
+        var samplesChecked = 0
+
+        // Window: 20ms (Tight window to find the attack)
+        val windowMs = 20
+        val windowSamples = (windowMs * sampleRate / 1000)
+
+        for (beatTimeMs in grid) {
+            val centerIndex = (beatTimeMs * sampleRate / 1000).toInt()
+
+            if (centerIndex < windowSamples || centerIndex >= bassPcm.size - windowSamples) continue
+
+            // 2. Find Max Flux (Sharpest Rise) in the window
+            var maxFlux = 0f
+
+            for (i in (centerIndex - windowSamples)..(centerIndex + windowSamples)) {
+                val current = abs(bassPcm[i])
+                val previous = abs(bassPcm[i-1]) // Simple 1-sample derivative
+
+                // Only count positive increases (Attacks)
+                val flux = (current - previous).coerceAtLeast(0f)
+
+                if (flux > maxFlux) maxFlux = flux
+            }
+
+            totalFlux += maxFlux
+            samplesChecked++
+        }
+
+        return if (samplesChecked > 0) totalFlux / samplesChecked else 0f
+    }
+
+    /**
+     * Simple Low-Pass Filter (One-pole) to isolate kicks.
+     */
+    private fun lowPassFilter(input: FloatArray, sampleRate: Int, cutoffFreq: Float): FloatArray {
+        val output = FloatArray(input.size)
+        val dt = 1.0f / sampleRate
+        val rc = 1.0f / (2.0f * Math.PI.toFloat() * cutoffFreq)
+        val alpha = dt / (rc + dt)
+
+        var previous = input[0]
+        for (i in input.indices) {
+            val current = input[i]
+            val filtered = previous + alpha * (current - previous)
+            output[i] = filtered
+            previous = filtered
+        }
+        return output
+    }
+
+    /**
+     * Generates a purely mathematical grid based on a start time and BPM.
+     */
+    private fun generateSteadyGrid(startMs: Long, bpm: Float, durationSec: Float): LongArray {
+        val intervalMs = 60_000.0 / bpm
+        val durationMs = durationSec * 1000
+        val beats = ArrayList<Long>()
+
+        var current = startMs.toDouble()
+        if (current < 0) current = 0.0
+
+        while (current < durationMs) {
+            beats.add(current.roundToLong())
+            current += intervalMs
+        }
+
+        return beats.toLongArray()
     }
 
     /**
@@ -138,72 +259,35 @@ class AnalysisWorker @AssistedInject constructor(
      * overpowered by a loud swelling synth pad.
      */
     private fun snapGridToTransients(grid: LongArray, pcm: FloatArray, sampleRate: Int): LongArray {
+        // This function is critical: it takes the "Steady Grid" and wiggles every beat
+        // to land on the loudest nearby sample.
+
         val windowMs = 50
         val windowSamples = (windowMs * sampleRate / 1000)
-
-        // Smoothing factor (acts as a Low Pass Filter on the envelope)
-        // Helps ignore high-frequency noise spikes.
         val alpha = 0.90f
 
         return grid.map { beatTimeMs ->
-            // Convert ms to sample index
             val centerIndex = (beatTimeMs * sampleRate / 1000).toInt()
-
-            // Define search bounds
             val start = (centerIndex - windowSamples).coerceAtLeast(1)
             val end = (centerIndex + windowSamples).coerceAtMost(pcm.size - 1)
 
             var maxFluxIndex = centerIndex
             var maxFlux = -1f
-
-            // Initialize a simple envelope follower
             var previousEnvelope = abs(pcm[start - 1])
 
             for (i in start..end) {
                 val currentAbs = abs(pcm[i])
-
-                // 1. Calculate Envelope (Low-pass filter the waveform)
-                // If signal rises, track it instantly (Attack). If it falls, decay slowly.
-                // This preserves the "hit" while smoothing the "tail".
-                val currentEnvelope = if (currentAbs > previousEnvelope) {
-                    currentAbs // Fast Attack
-                } else {
-                    previousEnvelope * alpha + currentAbs * (1 - alpha) // Slow Decay
-                }
-
-                // 2. Calculate Flux (Derivative)
-                // How much did the energy rise compared to the previous step?
-                // We only care about positive rises (attacks), not drops.
+                val currentEnvelope = if (currentAbs > previousEnvelope) currentAbs else previousEnvelope * alpha + currentAbs * (1 - alpha)
                 val flux = (currentEnvelope - previousEnvelope).coerceAtLeast(0f)
 
-                // 3. Find the peak of the "Rise", not the peak of the "Volume"
                 if (flux > maxFlux) {
                     maxFlux = flux
                     maxFluxIndex = i
                 }
-
                 previousEnvelope = currentEnvelope
             }
-
-            // Convert back to ms
             (maxFluxIndex.toLong() * 1000) / sampleRate
         }.toLongArray()
-    }
-
-    private fun applyLowPassFilter(pcm: FloatArray, sampleRate: Int): FloatArray {
-        val filtered = FloatArray(pcm.size)
-        val dt = 1.0f / sampleRate
-        val rc = 1.0f / (2.0f * Math.PI.toFloat() * 150.0f) // 150Hz Cutoff
-        val alpha = dt / (rc + dt)
-
-        var previous = pcm[0]
-        for (i in pcm.indices) {
-            // Basic Low Pass: y[i] = y[i-1] + α * (x[i] - y[i-1])
-            val current = previous + alpha * (pcm[i] - previous)
-            filtered[i] = current
-            previous = current
-        }
-        return filtered
     }
 
     /**
@@ -216,13 +300,11 @@ class AnalysisWorker @AssistedInject constructor(
         val beatIntervalMs = (60_000.0 / bpm)
         val firstDetected = detectedGrid[0]
 
-        // If the first beat is already near the start, do nothing
         if (firstDetected < beatIntervalMs) return detectedGrid
 
         val newBeats = ArrayList<Long>()
         var currentBeat = firstDetected.toDouble()
 
-        // Work backwards until we hit 0
         while (currentBeat > beatIntervalMs) {
             currentBeat -= beatIntervalMs
             if (currentBeat >= 0) {

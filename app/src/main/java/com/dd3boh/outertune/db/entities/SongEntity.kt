@@ -47,6 +47,7 @@ data class SongEntity(
 
     // DJ feature values
     @field:ColumnInfo(name = "bpm") val bpm: Float? = null,
+    @ColumnInfo(name = "display_bpm") val displayBpm: Float? = null,
     @ColumnInfo(name = "key") val key: String? = null,
     @ColumnInfo(name = "first_beat_ms") val firstBeatMs: Long? = null,
     @ColumnInfo(name = "waveform_path") val waveformPath: String? = null,
