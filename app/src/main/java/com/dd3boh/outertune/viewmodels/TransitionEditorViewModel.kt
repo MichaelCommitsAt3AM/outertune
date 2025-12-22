@@ -48,14 +48,21 @@ class TransitionEditorViewModel @Inject constructor(
 
     // Derived beat indices for UI markers — keep this driven by waveform domain so UI matches what is drawn
     val beatMarkers: StateFlow<List<BeatGridMarker>> =
-        waveformBeatDomain1.map { samples ->
-            if (samples.isEmpty()) emptyList()
+        combine(waveformBeatDomain1, _track1) { samples, song -> // Combine with song data
+            if (samples.isEmpty() || song == null) emptyList()
             else {
                 val maxBeat = samples.last().beatIndex
+                val timeSig = song.song.timeSignature
+                val offset = song.song.downbeatOffset
+
                 (0..maxBeat.toInt()).map { index ->
+                    // Calculate if this specific beat index is a downbeat
+                    // Logic: If the index matches the offset in the modulo cycle
+                    val isOne = (index % timeSig) == offset
+
                     BeatGridMarker(
                         beatIndex = index.toFloat(),
-                        isDownbeat = index % 4 == 0,
+                        isDownbeat = isOne,
                         isGhost = false
                     )
                 }

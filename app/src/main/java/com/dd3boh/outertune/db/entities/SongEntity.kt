@@ -52,6 +52,8 @@ data class SongEntity(
     @ColumnInfo(name = "first_beat_ms") val firstBeatMs: Long? = null,
     @ColumnInfo(name = "waveform_path") val waveformPath: String? = null,
     @ColumnInfo(name = "beat_grid_path") val beatGridPath: String? = null,
+    @ColumnInfo(name = "time_signature") val timeSignature: Int = 4, // Default to 4/4
+    @ColumnInfo(name = "downbeat_offset") val downbeatOffset: Int = 0, // 0 to (timeSignature - 1)
 
     // val albumArtist // if anyone wants to implement album artists in a sane way, pull requests are welcome.
     val year: Int? = null,

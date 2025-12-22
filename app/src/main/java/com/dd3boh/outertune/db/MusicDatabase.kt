@@ -76,7 +76,7 @@ class MusicDatabase(
     fun close() = delegate.close()
 
     companion object {
-        const val MUSIC_DATABASE_VERSION = 24
+        const val MUSIC_DATABASE_VERSION = 25
     }
 }
 
@@ -150,6 +150,7 @@ abstract class InternalDatabase : RoomDatabase() {
                     .addMigrations(MIGRATION_16_17)
                     .addMigrations(MIGRATION_20_21)
                     .addMigrations(MIGRATION_21_22)
+                    .addMigrations(MIGRATION_24_25) // New Bar Detection Migration
                     .build()
             )
 
@@ -162,8 +163,22 @@ abstract class InternalDatabase : RoomDatabase() {
                     .addMigrations(MIGRATION_15_16)
                     .addMigrations(MIGRATION_16_17)
                     .addMigrations(MIGRATION_21_22)
+                    .addMigrations(MIGRATION_24_25) // New Bar Detection Migration
                     .build()
             )
+    }
+}
+
+/**
+ * Migration for Bar Detection feature.
+ * Adds time_signature (Default 4) and downbeat_offset (Default 0).
+ */
+val MIGRATION_24_25 = object : Migration(24, 25) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        // We set default time_signature to 4 for existing songs
+        db.execSQL("ALTER TABLE song ADD COLUMN time_signature INTEGER NOT NULL DEFAULT 4")
+        // We set default downbeat_offset to 0 (the first detected beat)
+        db.execSQL("ALTER TABLE song ADD COLUMN downbeat_offset INTEGER NOT NULL DEFAULT 0")
     }
 }
 

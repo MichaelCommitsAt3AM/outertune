@@ -78,28 +78,24 @@ class AnalysisWorker @AssistedInject constructor(
             // B. Define Candidates - Smart Octave Detection
             val candidates = mutableMapOf<String, Float>()
 
-            // Standard Octave Checks (expanded logic)
-            // Test halving if BPM is high
+            // Standard Octave Checks
             if (rawBpm > 150) {
                 candidates["Half"] = rawBpm / 2
             }
 
-            // Test doubling if BPM is low
             if (rawBpm < 100) {
                 candidates["Double"] = rawBpm * 2
             }
 
-            // NEW: Test both directions in the "ambiguous zone" (80-120 BPM)
-            // This is where BTrack often locks onto snares instead of kicks
+            // Test both directions in the "ambiguous zone" (80-120 BPM)
             if (rawBpm in 80f..120f) {
                 candidates["Double_AmbiguousZone"] = rawBpm * 2
-                // Only test half if we're on the higher end
                 if (rawBpm > 100) {
                     candidates["Half_AmbiguousZone"] = rawBpm / 2
                 }
             }
 
-            // NEW: Quarter/quadruple for extreme misdetections
+            // Extreme misdetections
             if (rawBpm < 60) {
                 candidates["Quadruple"] = rawBpm * 4
             }
@@ -110,7 +106,7 @@ class AnalysisWorker @AssistedInject constructor(
             var bestBpm = rawBpm
             var currentBestScore = originalScore
 
-            // C. Test Candidates (keep your existing logic)
+            // C. Test Candidates
             for ((type, candidateBpm) in candidates) {
                 val testGrid = generateSteadyGrid(firstBeatMs, candidateBpm, exactDurationSeconds)
                 val candidateScore = calculateGridScore(testGrid, pcmData, sampleRate, candidateBpm)
@@ -153,7 +149,30 @@ class AnalysisWorker @AssistedInject constructor(
             val finalGrid = backfillStartBeats(snappedGrid, correctedBpm)
 
             // =========================================================================
-            // 7. SAVE DATA
+            // 7. BAR DETECTION (Updated)
+            // =========================================================================
+
+            // Convert grid (milliseconds) to seconds for the BarDetector
+            val beatGridSeconds = finalGrid.map { it / 1000f }
+
+            // NEW: Call .detect() and handle the result object
+            val barResult = BarDetector.detect(
+                pcmData = pcmData,
+                sampleRate = sampleRate,
+                beatGrid = beatGridSeconds,
+                timeSignature = 4
+            )
+
+            // You can use barResult.confidence here to decide if you want to trust it,
+            // or just log it for debugging.
+            Log.i(TAG, "Bar Detection: Offset=${barResult.downbeatOffset} Confidence=${barResult.confidence}")
+
+            // Optional: If confidence is very low (e.g. < 0.1), you might want to default to 0
+            // val finalOffset = if (barResult.confidence > 0.1f) barResult.downbeatOffset else 0
+            val finalOffset = barResult.downbeatOffset
+
+            // =========================================================================
+            // 8. SAVE DATA
             // =========================================================================
 
             val waveformResult = amplituda.processAudio(absolutePath, Compress.withParams(Compress.AVERAGE, 100)).get()
@@ -168,14 +187,17 @@ class AnalysisWorker @AssistedInject constructor(
             File(cacheDir, "${songId}_waveform.dat").writeText(normalizedWaveform.joinToString(","))
             File(cacheDir, "${songId}_beats_sync.dat").writeText(finalGrid.joinToString(","))
 
-            // 8. Update DB
+            // 9. Update DB (With Bar Info)
             val updated = song.copy(
                 waveformPath = File(cacheDir, "${songId}_waveform.dat").absolutePath,
                 beatGridPath = File(cacheDir, "${songId}_beats_sync.dat").absolutePath,
                 bpm = correctedBpm,
                 displayBpm = correctedBpm,
                 firstBeatMs = if (finalGrid.isNotEmpty()) finalGrid[0] else 0L,
-                duration = exactDurationSeconds.toInt()
+                duration = exactDurationSeconds.toInt(),
+                // New fields for bar detection
+                timeSignature = 4,
+                downbeatOffset = finalOffset
             )
             database.update(updated)
 
