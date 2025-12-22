@@ -26,6 +26,11 @@ class AnalysisWorker @AssistedInject constructor(
 
     companion object {
         private const val TAG = "AnalysisWorker"
+        /**
+         * Threshold for transient detection during snapping.
+         * Prevents the grid from jumping to quiet noise or atmospheric pads.
+         */
+        private const val SNAPPING_FLUX_THRESHOLD = 0.015f
     }
 
     override suspend fun doWork(): Result {
@@ -53,11 +58,14 @@ class AnalysisWorker @AssistedInject constructor(
         return try {
             // 2. Decode Raw Audio
             val (pcmData, sampleRate) = AudioDecoder.decodeToMono(absolutePath) ?: return Result.failure()
-
-            // 3. Calculate EXACT Duration
             val exactDurationSeconds = pcmData.size.toFloat() / sampleRate.toFloat()
 
-            // 4. Raw Analysis (Native BTrack)
+            // 150Hz cutoff keeps the kick, removes snare/vocals/hats
+            // We use this for Anchoring and Bar Detection
+            val bassData = lowPassFilter(pcmData, sampleRate, 150f)
+
+            // 3. Raw Analysis (Native BTrack)
+            // Note: We still pass FULL pcmData here because BTrack needs high-freq transients for timing accuracy
             val analysisResult = AudioAnalyzer.analyzeBpm(pcmData, sampleRate) ?: return Result.failure()
             val rawBpm = analysisResult.bpm
             val rawGrid = analysisResult.beatGrid
@@ -65,13 +73,12 @@ class AnalysisWorker @AssistedInject constructor(
             // =========================================================================
             // 5. ANCHORING & REGENERATION (Fix for Intro/Drift Bugs)
             // =========================================================================
-            // We strip out the candidate logic and trust the Raw BPM for now.
-            // However, we MUST fix the grid alignment by finding a reliable "Anchor" (the Drop).
 
             val correctedBpm = rawBpm
 
-            // Find the "Drop" (Loudest part) to anchor our grid
-            val anchorBeatMs = findAnchorBeat(rawGrid, pcmData, sampleRate)
+            // Find the "Drop" (Loudest part) to anchor our grid.
+            // CRITICAL CHANGE: Pass 'bassData' here to ignore clicky/synth intros.
+            val anchorBeatMs = findAnchorBeat(rawGrid, bassData, sampleRate)
             Log.i(TAG, "Anchor Beat found at: $anchorBeatMs ms")
 
             val beatIntervalMs = 60000f / correctedBpm
@@ -89,13 +96,22 @@ class AnalysisWorker @AssistedInject constructor(
                 (calculatedFirstBeatMs + i * beatIntervalMs).toLong()
             }
 
+            // SNAP TO TRANSIENTS:
+            // This aligns the mathematically perfect grid to actual local transients (kicks).
+            // This fixes drift caused by "human" timing, swing, or groove in the performance.
+            // We use bassData for best alignment with the rhythmic foundation.
+            val snappedGrid = snapGridToTransients(finalGrid, bassData, sampleRate, correctedBpm)
+
             // =========================================================================
             // 6. BAR DETECTION
             // =========================================================================
 
-            val beatGridSeconds = finalGrid.map { it / 1000f }
+            val beatGridSeconds = snappedGrid.map { it / 1000f }
+
+            // CRITICAL CHANGE: Pass 'bassData' here.
+            // Bar detection works significantly better when isolating the bass line.
             val barResult = BarDetector.detect(
-                pcmData = pcmData,
+                pcmData = bassData,
                 sampleRate = sampleRate,
                 beatGrid = beatGridSeconds,
                 timeSignature = 4
@@ -117,7 +133,7 @@ class AnalysisWorker @AssistedInject constructor(
 
             File(cacheDir, "${songId}_metadata.dat").writeText(exactDurationSeconds.toString())
             File(cacheDir, "${songId}_waveform.dat").writeText(normalizedWaveform.joinToString(","))
-            File(cacheDir, "${songId}_beats_sync.dat").writeText(finalGrid.joinToString(","))
+            File(cacheDir, "${songId}_beats_sync.dat").writeText(snappedGrid.joinToString(","))
 
             // 8. Update DB
             val updated = song.copy(
@@ -125,7 +141,7 @@ class AnalysisWorker @AssistedInject constructor(
                 beatGridPath = File(cacheDir, "${songId}_beats_sync.dat").absolutePath,
                 bpm = correctedBpm,
                 displayBpm = correctedBpm,
-                firstBeatMs = if (finalGrid.isNotEmpty()) finalGrid[0] else 0L,
+                firstBeatMs = if (snappedGrid.isNotEmpty()) snappedGrid[0] else 0L,
                 duration = exactDurationSeconds.toInt(),
                 // New Bar Detection Fields
                 timeSignature = 4,
@@ -187,14 +203,14 @@ class AnalysisWorker @AssistedInject constructor(
      */
     private fun lowPassFilter(input: FloatArray, sampleRate: Int, cutoffFreq: Float): FloatArray {
         val output = FloatArray(input.size)
+        val rc = 1.0f / (cutoffFreq * 2 * Math.PI).toFloat()
         val dt = 1.0f / sampleRate
-        val rc = 1.0f / (2.0f * Math.PI.toFloat() * cutoffFreq)
         val alpha = dt / (rc + dt)
 
         var previous = input[0]
         for (i in input.indices) {
             val current = input[i]
-            val filtered = previous + alpha * (current - previous)
+            val filtered = previous + (alpha * (current - previous))
             output[i] = filtered
             previous = filtered
         }
@@ -281,7 +297,13 @@ class AnalysisWorker @AssistedInject constructor(
 
         return grid.map { beatTimeMs ->
             val centerIndex = (beatTimeMs * sampleRate / 1000).toInt()
-            val start = (centerIndex - windowSamples).coerceAtLeast(1)
+
+            // Skip beats outside PCM range
+            if (centerIndex <= 0 || centerIndex >= pcm.size - 1) {
+                return@map beatTimeMs
+            }
+
+            val start = (centerIndex - windowSamples).coerceIn(1, pcm.size - 2)
             val end = (centerIndex + windowSamples).coerceAtMost(pcm.size - 1)
 
             var maxFluxIndex = centerIndex
@@ -290,8 +312,10 @@ class AnalysisWorker @AssistedInject constructor(
 
             for (i in start..end) {
                 val currentAbs = abs(pcm[i])
-                val currentEnvelope = if (currentAbs > previousEnvelope) currentAbs
-                else previousEnvelope * alpha + currentAbs * (1 - alpha)
+                val currentEnvelope =
+                    if (currentAbs > previousEnvelope) currentAbs
+                    else previousEnvelope * alpha + currentAbs * (1 - alpha)
+
                 val flux = (currentEnvelope - previousEnvelope).coerceAtLeast(0f)
 
                 if (flux > maxFlux) {
@@ -300,7 +324,12 @@ class AnalysisWorker @AssistedInject constructor(
                 }
                 previousEnvelope = currentEnvelope
             }
-            (maxFluxIndex.toLong() * 1000) / sampleRate
+
+            if (maxFlux >= SNAPPING_FLUX_THRESHOLD) {
+                (maxFluxIndex.toLong() * 1000) / sampleRate
+            } else {
+                beatTimeMs
+            }
         }.toLongArray()
     }
 
@@ -332,4 +361,3 @@ class AnalysisWorker @AssistedInject constructor(
 
 // Add helper in companion object or as extension
 private fun List<Float>.toMillisLongArray() = map { (it * 1000).toLong() }.toLongArray()
-
