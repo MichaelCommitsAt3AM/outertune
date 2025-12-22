@@ -63,99 +63,37 @@ class AnalysisWorker @AssistedInject constructor(
             val rawGrid = analysisResult.beatGrid
 
             // =========================================================================
-            // 5. FLUX-BASED CANDIDATE SELECTION (Pure Meritocracy)
+            // 5. ANCHORING & REGENERATION (Fix for Intro/Drift Bugs)
             // =========================================================================
+            // We strip out the candidate logic and trust the Raw BPM for now.
+            // However, we MUST fix the grid alignment by finding a reliable "Anchor" (the Drop).
 
-            val firstBeatMs = if (rawGrid.isNotEmpty()) rawGrid[0] else 0L
+            val correctedBpm = rawBpm
 
-            // A. Calculate Baseline Score
-            // We evaluate how well the Raw BPM aligns with the Flux (Kick attacks)
-            val originalGrid = generateSteadyGrid(firstBeatMs, rawBpm, exactDurationSeconds)
-            val originalScore = calculateGridScore(originalGrid, pcmData, sampleRate, rawBpm)
+            // Find the "Drop" (Loudest part) to anchor our grid
+            val anchorBeatMs = findAnchorBeat(rawGrid, pcmData, sampleRate)
+            Log.i(TAG, "Anchor Beat found at: $anchorBeatMs ms")
 
-            Log.d(TAG, "Baseline (Original) BPM: $rawBpm | Flux Score: $originalScore")
+            val beatIntervalMs = 60000f / correctedBpm
 
-            // B. Define Candidates - Smart Octave Detection
-            val candidates = mutableMapOf<String, Float>()
+            // Project backwards from Anchor to find the theoretical start (0 timestamp or negative)
+            // This ensures precise alignment at the drop, even if the intro has loose timing.
+            val beatsBeforeAnchor = (anchorBeatMs / beatIntervalMs).toInt()
 
-            // Standard Octave Checks
-            if (rawBpm > 150) {
-                candidates["Half"] = rawBpm / 2
+            // This calculation finds the offset relative to 0 that makes the grid hit the anchor perfectly.
+            val calculatedFirstBeatMs = (anchorBeatMs - (beatsBeforeAnchor * beatIntervalMs)).coerceAtLeast(0f)
+
+            // Generate the full steady grid purely from math
+            val totalBeats = ((exactDurationSeconds * 1000) / beatIntervalMs).toInt() + 2
+            val finalGrid = LongArray(totalBeats) { i ->
+                (calculatedFirstBeatMs + i * beatIntervalMs).toLong()
             }
-
-            if (rawBpm < 100) {
-                candidates["Double"] = rawBpm * 2
-            }
-
-            // Test both directions in the "ambiguous zone" (80-120 BPM)
-            if (rawBpm in 80f..120f) {
-                candidates["Double_AmbiguousZone"] = rawBpm * 2
-                if (rawBpm > 100) {
-                    candidates["Half_AmbiguousZone"] = rawBpm / 2
-                }
-            }
-
-            // Extreme misdetections
-            if (rawBpm < 60) {
-                candidates["Quadruple"] = rawBpm * 4
-            }
-            if (rawBpm > 180) {
-                candidates["Quarter"] = rawBpm / 4
-            }
-
-            var bestBpm = rawBpm
-            var currentBestScore = originalScore
-
-            // C. Test Candidates
-            for ((type, candidateBpm) in candidates) {
-                val testGrid = generateSteadyGrid(firstBeatMs, candidateBpm, exactDurationSeconds)
-                val candidateScore = calculateGridScore(testGrid, pcmData, sampleRate, candidateBpm)
-
-                // Require 2% improvement to override native detection
-                val threshold = originalScore * 1.02f
-
-                if (candidateScore > threshold) {
-                    if (bestBpm == rawBpm || candidateScore > currentBestScore) {
-                        bestBpm = candidateBpm
-                        currentBestScore = candidateScore
-                        Log.i(TAG, "Candidate $type ($candidateBpm) took the lead! Score: $candidateScore")
-                    }
-                } else {
-                    Log.d(TAG, "Candidate $type ($candidateBpm) rejected. Score $candidateScore vs Thresh $threshold")
-                }
-            }
-
-            Log.i(TAG, "Final Decision: $bestBpm (Raw was: $rawBpm)")
-
-            val correctedBpm = bestBpm
-            val bpmChanged = abs(correctedBpm - rawBpm) > 1.0f
 
             // =========================================================================
-            // 6. REGENERATE & SNAP
+            // 6. BAR DETECTION
             // =========================================================================
 
-            val processingGrid: LongArray = if (bpmChanged) {
-                // BPM changed -> Regenerate steady grid from math
-                generateSteadyGrid(firstBeatMs, correctedBpm, exactDurationSeconds)
-            } else {
-                // BPM same -> Keep raw grid
-                rawGrid
-            }
-
-            // Snap to exact transients (using Raw PCM for precision)
-            val snappedGrid = snapGridToTransients(processingGrid, pcmData, sampleRate, correctedBpm)
-
-            // Backfill start
-            val finalGrid = backfillStartBeats(snappedGrid, correctedBpm)
-
-            // =========================================================================
-            // 7. BAR DETECTION (Updated)
-            // =========================================================================
-
-            // Convert grid (milliseconds) to seconds for the BarDetector
             val beatGridSeconds = finalGrid.map { it / 1000f }
-
-            // NEW: Call .detect() and handle the result object
             val barResult = BarDetector.detect(
                 pcmData = pcmData,
                 sampleRate = sampleRate,
@@ -163,16 +101,10 @@ class AnalysisWorker @AssistedInject constructor(
                 timeSignature = 4
             )
 
-            // You can use barResult.confidence here to decide if you want to trust it,
-            // or just log it for debugging.
             Log.i(TAG, "Bar Detection: Offset=${barResult.downbeatOffset} Confidence=${barResult.confidence}")
 
-            // Optional: If confidence is very low (e.g. < 0.1), you might want to default to 0
-            // val finalOffset = if (barResult.confidence > 0.1f) barResult.downbeatOffset else 0
-            val finalOffset = barResult.downbeatOffset
-
             // =========================================================================
-            // 8. SAVE DATA
+            // 7. SAVE DATA
             // =========================================================================
 
             val waveformResult = amplituda.processAudio(absolutePath, Compress.withParams(Compress.AVERAGE, 100)).get()
@@ -187,7 +119,7 @@ class AnalysisWorker @AssistedInject constructor(
             File(cacheDir, "${songId}_waveform.dat").writeText(normalizedWaveform.joinToString(","))
             File(cacheDir, "${songId}_beats_sync.dat").writeText(finalGrid.joinToString(","))
 
-            // 9. Update DB (With Bar Info)
+            // 8. Update DB
             val updated = song.copy(
                 waveformPath = File(cacheDir, "${songId}_waveform.dat").absolutePath,
                 beatGridPath = File(cacheDir, "${songId}_beats_sync.dat").absolutePath,
@@ -195,9 +127,9 @@ class AnalysisWorker @AssistedInject constructor(
                 displayBpm = correctedBpm,
                 firstBeatMs = if (finalGrid.isNotEmpty()) finalGrid[0] else 0L,
                 duration = exactDurationSeconds.toInt(),
-                // New fields for bar detection
+                // New Bar Detection Fields
                 timeSignature = 4,
-                downbeatOffset = finalOffset
+                downbeatOffset = barResult.downbeatOffset
             )
             database.update(updated)
 
@@ -267,6 +199,49 @@ class AnalysisWorker @AssistedInject constructor(
             previous = filtered
         }
         return output
+    }
+
+    /**
+     * Finds the timestamp of the "Anchor Beat" - the first beat in the loudest section of the song.
+     * This prevents quiet intros from skewing the grid alignment.
+     */
+    private fun findAnchorBeat(
+        rawGrid: LongArray,
+        pcmData: FloatArray,
+        sampleRate: Int
+    ): Long {
+        if (rawGrid.isEmpty()) return 0L
+        if (pcmData.isEmpty()) return rawGrid[0]
+
+        val windowSamples = (sampleRate * 0.05).toInt() // 50ms window
+        var maxEnergy = 0f
+        val beatEnergies = FloatArray(rawGrid.size)
+
+        // 1. Calculate energy for every detected beat
+        for (i in rawGrid.indices) {
+            val beatTimeMs = rawGrid[i]
+            val centerIndex = ((beatTimeMs / 1000.0) * sampleRate).toInt()
+            val start = (centerIndex - windowSamples / 2).coerceAtLeast(0)
+            val end = (centerIndex + windowSamples / 2).coerceAtMost(pcmData.size)
+
+            if (start >= end) continue
+
+            var sumSquares = 0.0
+            for (j in start until end) {
+                val s = pcmData[j]
+                sumSquares += s * s
+            }
+            val rms = kotlin.math.sqrt(sumSquares / (end - start)).toFloat()
+            beatEnergies[i] = rms
+            if (rms > maxEnergy) maxEnergy = rms
+        }
+
+        // 2. Find the first beat that is "Loud Enough" (e.g., > 50% of peak energy)
+        // This skips the quiet intro clicks but catches the first kick of the drop.
+        val threshold = maxEnergy * 0.5f
+        val anchorIndex = beatEnergies.indexOfFirst { it > threshold }
+
+        return if (anchorIndex != -1) rawGrid[anchorIndex] else rawGrid[0]
     }
 
     /**
