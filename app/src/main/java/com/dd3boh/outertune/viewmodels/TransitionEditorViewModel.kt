@@ -221,9 +221,10 @@ class TransitionEditorViewModel @Inject constructor(
             rawGrid1 = dualA.sync.map { it.toDouble() }
             rawGrid2 = dualB.sync.map { it.toDouble() }
 
-            // Use visual grids for waveform drawing (Float)
-            val gridForWaveformA = dualA.visual
-            val gridForWaveformB = dualB.visual
+            // Use SYNC grids for waveform drawing to ensure markers exist for every beat,
+            // even if raw detection missed some.
+            val gridForWaveformA = dualA.sync
+            val gridForWaveformB = dualB.sync
 
             // Compute scalar between tracks for visual display matching (unchanged)
             val bpmA = displayBpmA
@@ -337,7 +338,9 @@ class TransitionEditorViewModel @Inject constructor(
             val entryBeatA = anchorBeatA
             val transitionDurationBeats = beatsInZone
 
-            val unmuteBeatA = getBeatForTimestamp(gridA, seekA + (STABILIZATION_MS/1000.0))
+            // FIXED: If starting at 0.0s, unmute immediately to play the first beat
+            val unmuteTimeA = if (seekA <= 0.05) 0.0 else seekA + (STABILIZATION_MS / 1000.0)
+            val unmuteBeatA = getBeatForTimestamp(gridA, unmuteTimeA)
 
             val bandsA = eqA?.numberOfBands ?: 0.toShort()
             val bandsB = eqB?.numberOfBands ?: 0.toShort()
@@ -484,6 +487,10 @@ class TransitionEditorViewModel @Inject constructor(
         }
     }
 
+    /**
+     * Correctly converts the waveform to the beat domain, handling grid intervals that
+     * extend into negative time (silence) correctly without stretching the audio.
+     */
     private fun convertWaveformToBeatDomain(
         waveform: FloatArray,
         grid: List<Float>,
@@ -495,25 +502,49 @@ class TransitionEditorViewModel @Inject constructor(
         val out = ArrayList<BeatSample>()
         val size = waveform.size
 
-        for (beatIndex in 0 until grid.size - 1) {
-            val tStart = grid[beatIndex].coerceAtLeast(0f)
-            val tEnd = grid[beatIndex + 1].coerceAtMost(durationSec)
+        // Pre-calculate sample rate proxy (indices per second)
+        val indicesPerSecond = size / durationSec
 
-            val startIdx = ((tStart / durationSec) * size).toInt().coerceIn(0, size - 1)
-            val endIdx = ((tEnd / durationSec) * size).toInt().coerceIn(0, size)
-            val chunkLen = (endIdx - startIdx).coerceAtLeast(1)
+        for (beatIndex in 0 until grid.size - 1) {
+            val tGridStart = grid[beatIndex]
+            val tGridEnd = grid[beatIndex + 1]
+            val intervalDuration = tGridEnd - tGridStart
+
+            // Safety check for invalid grid
+            if (intervalDuration <= 0f) {
+                for (i in 0 until samplesPerBeat) {
+                    val originalBeatPos = beatIndex.toFloat() + (i.toFloat() / samplesPerBeat)
+                    out.add(BeatSample(originalBeatPos * scalar, 0f))
+                }
+                continue
+            }
 
             for (i in 0 until samplesPerBeat) {
-                val beatFraction = i.toFloat() / samplesPerBeat
+                val beatFractionStart = i.toFloat() / samplesPerBeat
+                val beatFractionEnd = (i + 1).toFloat() / samplesPerBeat
 
-                val audioStart = startIdx + (beatFraction * chunkLen).toInt()
-                val audioEnd = startIdx + ((beatFraction + (1f/samplesPerBeat)) * chunkLen).toInt().coerceAtMost(size)
+                val timeStart = tGridStart + (beatFractionStart * intervalDuration)
+                val timeEnd = tGridStart + (beatFractionEnd * intervalDuration)
+
                 var maxAmp = 0f
-                for (k in audioStart until audioEnd) {
-                    if (k < size) maxAmp = maxOf(maxAmp, abs(waveform[k]))
+
+                // Only process if the time slice intersects with actual audio (time >= 0 and time <= duration)
+                if (timeEnd > 0f && timeStart < durationSec) {
+                    val validTimeStart = timeStart.coerceAtLeast(0f)
+                    val validTimeEnd = timeEnd.coerceAtMost(durationSec)
+
+                    val idxStart = (validTimeStart * indicesPerSecond).toInt().coerceIn(0, size - 1)
+                    val idxEnd = (validTimeEnd * indicesPerSecond).toInt().coerceIn(0, size)
+
+                    for (k in idxStart until idxEnd) {
+                        if (k < size) {
+                            val amp = abs(waveform[k])
+                            if (amp > maxAmp) maxAmp = amp
+                        }
+                    }
                 }
 
-                val originalBeatPos = beatIndex.toFloat() + beatFraction
+                val originalBeatPos = beatIndex.toFloat() + beatFractionStart
                 val finalBeatIndex = originalBeatPos * scalar
 
                 out.add(BeatSample(finalBeatIndex, maxAmp))
@@ -538,7 +569,7 @@ class TransitionEditorViewModel @Inject constructor(
         val lastIdx = grid.size - 1
         if (beatIndex < 0) {
             val avgStep = if (grid.size > 1) (grid[1] - grid[0]) else 0.5
-            return (grid[0] + beatIndex * avgStep).coerceAtLeast(0.0)
+            return (grid[0] + beatIndex * avgStep).coerceAtLeast(0.0) // Keep standard behavior for seeking
         }
         if (beatIndex > lastIdx) {
             val avgStep = if (grid.size > 1) (grid[lastIdx] - grid[lastIdx - 1]) else 0.5
