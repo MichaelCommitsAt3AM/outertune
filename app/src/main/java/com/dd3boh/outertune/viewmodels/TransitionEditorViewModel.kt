@@ -6,6 +6,7 @@ import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.media3.common.MediaItem
+import androidx.media3.common.util.Log
 import androidx.media3.exoplayer.ExoPlayer
 import com.dd3boh.outertune.db.MusicDatabase
 import com.dd3boh.outertune.db.entities.Song
@@ -21,6 +22,7 @@ import java.io.File
 import javax.inject.Inject
 import kotlin.math.abs
 
+// Data class for the visual waveform
 data class BeatSample(val beatIndex: Float, val amplitude: Float)
 
 @HiltViewModel
@@ -46,18 +48,19 @@ class TransitionEditorViewModel @Inject constructor(
     private var eqA: Equalizer? = null
     private var eqB: Equalizer? = null
 
-    // Derived beat indices for UI markers — keep this driven by waveform domain so UI matches what is drawn
+    // Derived beat indices for UI markers
+    // We derive this directly from the waveform samples to ensure 1:1 visual alignment
     val beatMarkers: StateFlow<List<BeatGridMarker>> =
-        combine(waveformBeatDomain1, _track1) { samples, song -> // Combine with song data
+        combine(waveformBeatDomain1, _track1) { samples, song ->
             if (samples.isEmpty() || song == null) emptyList()
             else {
-                val maxBeat = samples.last().beatIndex
+                val maxBeat = samples.lastOrNull()?.beatIndex ?: 0f
                 val timeSig = song.song.timeSignature
                 val offset = song.song.downbeatOffset
 
+                // Generate markers for every integer beat index covered by the waveform
                 (0..maxBeat.toInt()).map { index ->
-                    // Calculate if this specific beat index is a downbeat
-                    // Logic: If the index matches the offset in the modulo cycle
+                    // Determine if this is a Downbeat (Beat 1)
                     val isOne = (index % timeSig) == offset
 
                     BeatGridMarker(
@@ -111,14 +114,12 @@ class TransitionEditorViewModel @Inject constructor(
     private var playerA: ExoPlayer? = null
     private var playerB: ExoPlayer? = null
 
-    // Internal State for Playback Sync
-    private var initialSpeedB = 1.0 // Changed to Double
+    // Internal State for Playback Sync (Double Precision)
+    private var initialSpeedB = 1.0
     private var currentScreenWidthPx: Float = 0f
+    private var trackBGridScalar = 1.0
 
-    private var trackBGridScalar = 1.0 // Changed to Double
-
-    // Cache raw refined grids to perform time lookups during playback
-    // Using Double for high precision timing
+    // Cache raw grids (Double Precision) for time lookups
     private var rawGrid1: List<Double> = emptyList()
     private var rawGrid2: List<Double> = emptyList()
 
@@ -177,8 +178,12 @@ class TransitionEditorViewModel @Inject constructor(
 
             var pcmA = FloatArray(0)
             var pcmB = FloatArray(0)
+
+            // Temporary Float grids for Normalizer (compatibility)
             var visualGridA = emptyList<Float>()
             var visualGridB = emptyList<Float>()
+
+            // Source of truth Double grids
             var syncGridA = emptyList<Double>()
             var syncGridB = emptyList<Double>()
 
@@ -193,47 +198,46 @@ class TransitionEditorViewModel @Inject constructor(
                 syncGridB = loadBeatGridDouble(it.song.beatGridPath, it.id)
             }
 
-            // Determine analysis and display BPM (displayBpm field if present, else fallback)
+            // BPM info
             val analysisBpmA = songA?.song?.bpm ?: 120f
             val analysisBpmB = songB?.song?.bpm ?: 120f
             val displayBpmA = songA?.song?.displayBpm ?: analysisBpmA
             val displayBpmB = songB?.song?.displayBpm ?: analysisBpmB
 
-            // durations (use exact if available)
-            val durA = songA?.let { loadExactDuration(it.id) } ?: songA?.song?.duration?.toFloat() ?: 1f
-            val durB = songB?.let { loadExactDuration(it.id) } ?: songB?.song?.duration?.toFloat() ?: 1f
+            // Exact Durations (Double)
+            val durA = songA?.let { loadExactDuration(it.id) } ?: songA?.song?.duration?.toDouble() ?: 1.0
+            val durB = songB?.let { loadExactDuration(it.id) } ?: songB?.song?.duration?.toDouble() ?: 1.0
 
-            // Build detected visual grid fallback (prefer visual file, else fall back to sync file)
+            // Fallback for normalizer
             val detectedVisualA = if (visualGridA.isNotEmpty()) visualGridA else syncGridA.map { it.toFloat() }
             val detectedVisualB = if (visualGridB.isNotEmpty()) visualGridB else syncGridB.map { it.toFloat() }
 
-            // Resolve Dual Grids using BeatGridNormalizer (phase-preserving)
+            // Normalize Grids
             val dualA = BeatGridNormalizer.resolveDjGrids(
                 detectedGrid = detectedVisualA,
                 analysisBpm = analysisBpmA,
                 displayBpm = displayBpmA,
-                durationSec = durA,
-                promoteVisual = false // keep waveform transients visually intact by default
+                durationSec = durA.toFloat(),
+                promoteVisual = false
             )
 
             val dualB = BeatGridNormalizer.resolveDjGrids(
                 detectedGrid = detectedVisualB,
                 analysisBpm = analysisBpmB,
                 displayBpm = displayBpmB,
-                durationSec = durB,
+                durationSec = durB.toFloat(),
                 promoteVisual = false
             )
 
-            // Use sync grids for playback (high precision)
+            // CRITICAL: We now use the SYNC grid (Double) for BOTH playback and waveform.
+            // This ensures they never drift apart.
             rawGrid1 = dualA.sync.map { it.toDouble() }
             rawGrid2 = dualB.sync.map { it.toDouble() }
 
-            // Use SYNC grids for waveform drawing to ensure markers exist for every beat,
-            // even if raw detection missed some.
-            val gridForWaveformA = dualA.sync
-            val gridForWaveformB = dualB.sync
+            val gridForWaveformA = rawGrid1
+            val gridForWaveformB = rawGrid2
 
-            // Compute scalar between tracks for visual display matching (unchanged)
+            // Calculate playback ratios (scalar)
             val bpmA = displayBpmA
             val bpmB = displayBpmB
             val rawRatio = if (bpmB > 0f) bpmA / bpmB else 1f
@@ -246,7 +250,7 @@ class TransitionEditorViewModel @Inject constructor(
             trackBGridScalar = bestMultiplier.toDouble()
             initialSpeedB = (rawRatio / bestMultiplier).toDouble()
 
-            // --- Waveform Generation (Keep UI on Floats for performance) ---
+            // --- Waveform Generation (Double Precision) ---
             val samplesPerBeat = 64
 
             _waveformBeatDomain1.value = convertWaveformToBeatDomain(
@@ -254,21 +258,33 @@ class TransitionEditorViewModel @Inject constructor(
                 gridForWaveformA,
                 durA,
                 samplesPerBeat,
-                1.0f
+                1.0
             )
+
+            _waveformBeatDomain1.value.forEachIndexed { index, sample ->
+                if (index % 64 == 0) { // every beat-slice
+                    Log.d("WaveformCheck", "Track1 BeatIndex=${sample.beatIndex}, Amplitude=${sample.amplitude}")
+                }
+            }
 
             _waveformBeatDomain2.value = convertWaveformToBeatDomain(
                 pcmB,
                 gridForWaveformB,
                 durB,
                 samplesPerBeat,
-                trackBGridScalar.toFloat()
+                trackBGridScalar
             )
+
+            _waveformBeatDomain2.value.forEachIndexed { index, sample ->
+                if (index % 64 == 0) {
+                    Log.d("WaveformCheck", "Track2 BeatIndex=${sample.beatIndex}, Amplitude=${sample.amplitude}")
+                }
+            }
 
             updateTransitionDuration()
 
             withContext(Dispatchers.Main) {
-                // Prepare players with local files
+                // Initialize ExoPlayers
                 songA?.song?.localPath?.let { filePath ->
                     File(filePath).takeIf { it.exists() }?.let {
                         playerA?.setMediaItem(MediaItem.fromUri(Uri.fromFile(it)))
@@ -297,6 +313,7 @@ class TransitionEditorViewModel @Inject constructor(
         val gridB = rawGrid2
         if (gridA.isEmpty() || gridB.isEmpty()) return
 
+        // Initialize EQ if needed
         if (eqA == null && pA.audioSessionId != 0) {
             try { eqA = Equalizer(0, pA.audioSessionId).apply { enabled = true } } catch (e: Exception) { e.printStackTrace() }
         }
@@ -345,7 +362,7 @@ class TransitionEditorViewModel @Inject constructor(
             val entryBeatA = anchorBeatA
             val transitionDurationBeats = beatsInZone
 
-            // FIXED: If starting at 0.0s, unmute immediately to play the first beat
+            // Determine when to unmute
             val unmuteTimeA = if (seekA <= 0.05) 0.0 else seekA + (STABILIZATION_MS / 1000.0)
             val unmuteBeatA = getBeatForTimestamp(gridA, unmuteTimeA)
 
@@ -354,15 +371,35 @@ class TransitionEditorViewModel @Inject constructor(
             val minEQ = eqA?.bandLevelRange?.get(0) ?: -1500
 
             var bUnmuted = false
-
-            var nextCorrectionBeat = unmuteBeatA + 16.0 // First correction 16 beats after start
+            var nextCorrectionBeat = unmuteBeatA + 16.0
 
             while (isActive && _isPlaying.value) {
                 val posA = pA.currentPosition / 1000.0
                 val currentBeatA = getBeatForTimestamp(gridA, posA)
 
+                // --- ADD THIS LOG BLOCK ---
+                // 1. Calculate the exact timestamp where the grid says the previous integer beat SHOULD be
+                val previousIntBeat = kotlin.math.floor(currentBeatA)
+                val expectedTimeOfBeat = getTimestampForBeat(gridA, previousIntBeat)
+
+                // 2. Calculate how far past that beat we really are
+                val timeSinceBeat = posA - expectedTimeOfBeat
+
+                // 3. Compare to the calculated fraction
+                val beatFraction = currentBeatA - previousIntBeat
+                // (This helps visualize if the fraction logic aligns with time logic)
+
+                if (previousIntBeat % 4 == 0.0) { // Log on downbeats
+                    Log.d("SyncDrift", "Beat $previousIntBeat :: GridTime=${String.format("%.3f", expectedTimeOfBeat)}s :: PlayerTime=${String.format("%.3f", posA)}s :: TimeSinceBeat=${String.format("%.3f", timeSinceBeat)}s")
+                }
+
                 _playbackBeatMarker.value = currentBeatA.toFloat()
 
+                val posB = pB.currentPosition / 1000.0
+                val currentBeatB = getBeatForTimestamp(gridB, posB)
+                Log.d("PlaybackSync", "PlaybackA beat=$currentBeatA, time=${posA}s; PlaybackB beat=$currentBeatB, time=${posB}s")
+
+                // Sync correction check
                 if (currentBeatA > nextCorrectionBeat) {
                     val posB = pB.currentPosition / 1000.0
 
@@ -385,19 +422,16 @@ class TransitionEditorViewModel @Inject constructor(
                             }
                         }
                     }
-
                     nextCorrectionBeat += 16.0
                 }
+
+                // Volume and EQ Automation
                 val progress = if (transitionDurationBeats > 0)
                     ((currentBeatA - entryBeatA) / transitionDurationBeats).toFloat()
                 else 0f
 
                 if (progress < 0f) {
-                    if (currentBeatA >= unmuteBeatA) {
-                        pA.volume = 1f
-                    } else {
-                        pA.volume = 0f
-                    }
+                    if (currentBeatA >= unmuteBeatA) pA.volume = 1f else pA.volume = 0f
                     pB.volume = 0f
                     resetEQ(eqA)
                     resetEQ(eqB)
@@ -411,9 +445,7 @@ class TransitionEditorViewModel @Inject constructor(
                     applyDeckStateToEQ(eqA, stateA, minEQ, bandsA, _effectMode.value)
                     applyDeckStateToEQ(eqB, stateB, minEQ, bandsB, _effectMode.value)
 
-                    if (!bUnmuted) {
-                        bUnmuted = true
-                    }
+                    if (!bUnmuted) bUnmuted = true
                 } else {
                     pA.volume = 0f
                     pB.volume = 1f
@@ -442,9 +474,7 @@ class TransitionEditorViewModel @Inject constructor(
         if (eq == null) return
         try {
             for (i in 0 until eq.numberOfBands) eq.setBandLevel(i.toShort(), 0)
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
+        } catch (e: Exception) { e.printStackTrace() }
     }
 
     private fun applyDeckStateToEQ(
@@ -455,7 +485,6 @@ class TransitionEditorViewModel @Inject constructor(
         effectMode: String
     ) {
         if (eq == null || bands < 1) return
-
         try {
             val bassLevel = state.bass
             val bassCut = (minEQ * (1f - bassLevel)).toInt().toShort()
@@ -489,72 +518,89 @@ class TransitionEditorViewModel @Inject constructor(
                     eq.setBandLevel(2.toShort(), (cut * 0.5).toInt().toShort())
                 }
             }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
+        } catch (e: Exception) { e.printStackTrace() }
     }
 
     /**
-     * Correctly converts the waveform to the beat domain, handling grid intervals that
-     * extend into negative time (silence) correctly without stretching the audio.
+     * CONVERT WAVEFORM TO BEAT DOMAIN
+     * FIXED: Uses Double precision for all time calculations to prevent drift.
      */
     private fun convertWaveformToBeatDomain(
         waveform: FloatArray,
-        grid: List<Float>,
-        durationSec: Float,
+        grid: List<Double>,     // Input grid must be Double
+        durationSec: Double,    // Duration must be Double
         samplesPerBeat: Int,
-        scalar: Float
+        scalar: Double
     ): List<BeatSample> {
-        if (waveform.isEmpty() || grid.size < 2 || durationSec <= 0f) return emptyList()
+        if (waveform.isEmpty() || grid.size < 2 || durationSec <= 0.0) return emptyList()
         val out = ArrayList<BeatSample>()
         val size = waveform.size
 
-        // Pre-calculate sample rate proxy (indices per second)
-        val indicesPerSecond = size / durationSec
+        // Calculate sample rate (indices per second) using high precision
+        val indicesPerSecond = size.toDouble() / durationSec
 
         for (beatIndex in 0 until grid.size - 1) {
             val tGridStart = grid[beatIndex]
             val tGridEnd = grid[beatIndex + 1]
             val intervalDuration = tGridEnd - tGridStart
+            var peakSampleIndex = -1
+            var maxAmpInBeat = 0f
 
-            // Safety check for invalid grid
-            if (intervalDuration <= 0f) {
+            // Safety check for empty/invalid intervals
+            if (intervalDuration <= 0.000001) {
+                // Just emit zeroes to keep index alignment
                 for (i in 0 until samplesPerBeat) {
-                    val originalBeatPos = beatIndex.toFloat() + (i.toFloat() / samplesPerBeat)
-                    out.add(BeatSample(originalBeatPos * scalar, 0f))
+                    val originalBeatPos = beatIndex.toDouble() + (i.toDouble() / samplesPerBeat)
+                    out.add(BeatSample((originalBeatPos * scalar).toFloat(), 0f))
                 }
                 continue
             }
 
             for (i in 0 until samplesPerBeat) {
-                val beatFractionStart = i.toFloat() / samplesPerBeat
-                val beatFractionEnd = (i + 1).toFloat() / samplesPerBeat
+                // Calculate exact time range for this sub-beat slice
+                val beatFractionStart = i.toDouble() / samplesPerBeat
+                val beatFractionEnd = (i + 1).toDouble() / samplesPerBeat
 
                 val timeStart = tGridStart + (beatFractionStart * intervalDuration)
                 val timeEnd = tGridStart + (beatFractionEnd * intervalDuration)
 
                 var maxAmp = 0f
 
-                // Only process if the time slice intersects with actual audio (time >= 0 and time <= duration)
-                if (timeEnd > 0f && timeStart < durationSec) {
-                    val validTimeStart = timeStart.coerceAtLeast(0f)
+                // Map time range to array indices
+                if (timeEnd > 0.0 && timeStart < durationSec) {
+                    val validTimeStart = timeStart.coerceAtLeast(0.0)
                     val validTimeEnd = timeEnd.coerceAtMost(durationSec)
 
                     val idxStart = (validTimeStart * indicesPerSecond).toInt().coerceIn(0, size - 1)
                     val idxEnd = (validTimeEnd * indicesPerSecond).toInt().coerceIn(0, size)
 
+                    // Find max amplitude in this slice
                     for (k in idxStart until idxEnd) {
                         if (k < size) {
                             val amp = abs(waveform[k])
                             if (amp > maxAmp) maxAmp = amp
+
+                            // Capture global max for the whole beat to log specifically on the downbeat
+                            if (amp > maxAmpInBeat) {
+                                maxAmpInBeat = amp
+                                peakSampleIndex = i // Record which "slice" (0-63) holds the peak
+                            }
                         }
                     }
                 }
 
-                val originalBeatPos = beatIndex.toFloat() + beatFractionStart
+                // Final output position
+                val originalBeatPos = beatIndex.toDouble() + beatFractionStart
                 val finalBeatIndex = originalBeatPos * scalar
 
-                out.add(BeatSample(finalBeatIndex, maxAmp))
+                out.add(BeatSample(finalBeatIndex.toFloat(), maxAmp))
+            }
+
+            // Log only on likely kicks (high amplitude) to avoid noise
+            if (maxAmpInBeat > 0.5f) {
+                // We expect the kick to be at index 0 (start of beat).
+                // If it's at 32, it's in the middle of the beat (off-beat).
+                Log.d("WaveformAlign", "Beat $beatIndex: Peak Amp at slice $peakSampleIndex/$samplesPerBeat (Amp: $maxAmpInBeat)")
             }
         }
         return out
@@ -563,25 +609,29 @@ class TransitionEditorViewModel @Inject constructor(
     private fun updateTransitionDuration() {
         val grid = rawGrid1
         if (grid.size < 2) return
-
         val beats = _barsCount.value * 4
         val interval = grid[1] - grid[0]
         _transitionDurationSeconds.value = (beats * interval).toFloat()
     }
 
-    // --- Double Precision Helpers ---
+    // --- Double Precision Math Helpers ---
 
     private fun getTimestampForBeat(grid: List<Double>, beatIndex: Double): Double {
         if (grid.isEmpty()) return 0.0
         val lastIdx = grid.size - 1
+
+        // Extrapolate before start
         if (beatIndex < 0) {
             val avgStep = if (grid.size > 1) (grid[1] - grid[0]) else 0.5
-            return (grid[0] + beatIndex * avgStep).coerceAtLeast(0.0) // Keep standard behavior for seeking
+            return (grid[0] + beatIndex * avgStep).coerceAtLeast(0.0)
         }
+        // Extrapolate after end
         if (beatIndex > lastIdx) {
             val avgStep = if (grid.size > 1) (grid[lastIdx] - grid[lastIdx - 1]) else 0.5
             return grid[lastIdx] + (beatIndex - lastIdx) * avgStep
         }
+
+        // Interpolate inside grid
         val idx = beatIndex.toInt()
         val t1 = grid[idx]
         val t2 = if (idx + 1 < grid.size) grid[idx + 1] else t1 + 0.5
@@ -610,9 +660,11 @@ class TransitionEditorViewModel @Inject constructor(
         return idx + fraction
     }
 
-    private fun loadExactDuration(id: String): Float? {
+    // --- Disk IO (Double Precision) ---
+
+    private fun loadExactDuration(id: String): Double? {
         val file = File(context.cacheDir, "analysis_data/${id}_metadata.dat")
-        return if (file.exists()) file.readText().toFloatOrNull() else null
+        return if (file.exists()) file.readText().toDoubleOrNull() else null
     }
 
     private fun loadWaveform(path: String?, id: String) = File(path ?: "${context.cacheDir}/analysis_data/${id}_waveform.dat")
