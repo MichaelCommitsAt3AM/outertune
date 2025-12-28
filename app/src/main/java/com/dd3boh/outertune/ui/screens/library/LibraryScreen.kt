@@ -4,43 +4,25 @@ import android.content.pm.PackageManager
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.asPaddingValues
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
-import androidx.compose.foundation.lazy.grid.items
-import androidx.compose.foundation.lazy.grid.rememberLazyGridState
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.grid.itemsIndexed
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.List
 import androidx.compose.material.icons.rounded.CloudDownload
 import androidx.compose.material.icons.rounded.Favorite
 import androidx.compose.material.icons.rounded.GridView
-import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.Icon
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
-import androidx.compose.material3.TopAppBarScrollBehavior
+import androidx.compose.material3.*
 import androidx.compose.material3.pulltorefresh.PullToRefreshDefaults.Indicator
 import androidx.compose.material3.pulltorefresh.pullToRefresh
 import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
-import androidx.compose.runtime.setValue
+import androidx.compose.runtime.*
 import androidx.compose.runtime.snapshots.SnapshotStateList
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -56,39 +38,15 @@ import com.dd3boh.outertune.LocalPlayerAwareWindowInsets
 import com.dd3boh.outertune.LocalPlayerConnection
 import com.dd3boh.outertune.MainActivity
 import com.dd3boh.outertune.R
-import com.dd3boh.outertune.constants.CONTENT_TYPE_HEADER
-import com.dd3boh.outertune.constants.CONTENT_TYPE_LIST
-import com.dd3boh.outertune.constants.CONTENT_TYPE_PLAYLIST
-import com.dd3boh.outertune.constants.DEFAULT_ENABLED_FILTERS
-import com.dd3boh.outertune.constants.EnabledFiltersKey
-import com.dd3boh.outertune.constants.GridThumbnailHeight
-import com.dd3boh.outertune.constants.LibraryFilterKey
-import com.dd3boh.outertune.constants.LibrarySortDescendingKey
-import com.dd3boh.outertune.constants.LibrarySortType
-import com.dd3boh.outertune.constants.LibrarySortTypeKey
-import com.dd3boh.outertune.constants.LibraryViewType
-import com.dd3boh.outertune.constants.LibraryViewTypeKey
-import com.dd3boh.outertune.constants.LocalLibraryEnableKey
-import com.dd3boh.outertune.constants.ShowLikedAndDownloadedPlaylist
+import com.dd3boh.outertune.constants.*
 import com.dd3boh.outertune.db.entities.Album
 import com.dd3boh.outertune.db.entities.Artist
 import com.dd3boh.outertune.db.entities.Playlist
 import com.dd3boh.outertune.db.entities.PlaylistEntity
-import com.dd3boh.outertune.ui.component.ChipsLazyRow
-import com.dd3boh.outertune.ui.component.EmptyPlaceholder
-import com.dd3boh.outertune.ui.component.LazyColumnScrollbar
-import com.dd3boh.outertune.ui.component.LazyVerticalGridScrollbar
-import com.dd3boh.outertune.ui.component.LibraryAlbumGridItem
-import com.dd3boh.outertune.ui.component.LibraryAlbumListItem
-import com.dd3boh.outertune.ui.component.LibraryArtistGridItem
-import com.dd3boh.outertune.ui.component.LibraryArtistListItem
-import com.dd3boh.outertune.ui.component.LibraryPlaylistGridItem
-import com.dd3boh.outertune.ui.component.LibraryPlaylistListItem
-import com.dd3boh.outertune.ui.component.ScrollToTopManager
-import com.dd3boh.outertune.ui.component.SortHeader
+import com.dd3boh.outertune.db.entities.Song
+import com.dd3boh.outertune.ui.component.*
 import com.dd3boh.outertune.ui.component.button.IconButton
-import com.dd3boh.outertune.ui.component.items.AutoPlaylistGridItem
-import com.dd3boh.outertune.ui.component.items.AutoPlaylistListItem
+import com.dd3boh.outertune.ui.component.items.*
 import com.dd3boh.outertune.ui.screens.Screens
 import com.dd3boh.outertune.ui.screens.Screens.LibraryFilter
 import com.dd3boh.outertune.ui.utils.MEDIA_PERMISSION_LEVEL
@@ -154,21 +112,15 @@ fun LibraryScreen(
             LibraryFilter.PLAYLISTS -> LibraryFilter.PLAYLISTS to stringResource(R.string.playlists)
             LibraryFilter.SONGS -> LibraryFilter.SONGS to stringResource(R.string.songs)
             LibraryFilter.FOLDERS -> LibraryFilter.FOLDERS to stringResource(R.string.folders)
-            else -> LibraryFilter.ALL to stringResource(R.string.home) // there is no all filter, use as null value
+            else -> LibraryFilter.ALL to stringResource(R.string.home)
         }
     }.filterNot { it.first == LibraryFilter.ALL }
 
     val chips = remember { SnapshotStateList<Pair<LibraryFilter, String>>() }
-
-    var filterSelected by remember {
-        mutableStateOf(filter)
-    }
+    var filterSelected by remember { mutableStateOf(filter) }
 
     LaunchedEffect(Unit) {
-        if (filter == LibraryFilter.ALL)
-            chips.addAll(defaultFilter)
-        else
-            chips.add(filter to filterString)
+        if (filter == LibraryFilter.ALL) chips.addAll(defaultFilter) else chips.add(filter to filterString)
     }
 
     LaunchedEffect(filter) {
@@ -179,10 +131,7 @@ fun LibraryScreen(
             filterSelected = LibraryFilter.ALL
         } else {
             filterSelected = filter
-            chips.filter { it.first != filter }
-                .onEach {
-                    if (chips.contains(it)) chips.remove(it)
-                }
+            chips.filter { it.first != filter }.onEach { if (chips.contains(it)) chips.remove(it) }
         }
     }
 
@@ -192,17 +141,13 @@ fun LibraryScreen(
         }
 
         Column {
-            if (localLibEnable && showStoragePerm
-            ) {
+            if (localLibEnable && showStoragePerm) {
                 TextButton(
                     onClick = {
-                        showStoragePerm =
-                            false // allow user to hide error when clicked. This also makes the code a lot nicer too...
+                        showStoragePerm = false
                         (context as MainActivity).permissionLauncher.launch(MEDIA_PERMISSION_LEVEL)
                     },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .background(MaterialTheme.colorScheme.error)
+                    modifier = Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.error)
                 ) {
                     Text(
                         text = stringResource(R.string.missing_media_permission_warning),
@@ -216,10 +161,7 @@ fun LibraryScreen(
                     chips = chips,
                     currentValue = filter,
                     onValueUpdate = {
-                        filter = if (filter == LibraryFilter.ALL)
-                            it
-                        else
-                            LibraryFilter.ALL
+                        filter = if (filter == LibraryFilter.ALL) it else LibraryFilter.ALL
                     },
                     modifier = Modifier.weight(1f),
                     selected = { it == filterSelected },
@@ -233,17 +175,14 @@ fun LibraryScreen(
 
                 if (filter != LibraryFilter.SONGS && filter != LibraryFilter.FOLDERS) {
                     IconButton(
-                        onClick = {
-                            viewType = viewType.toggle()
-                        },
+                        onClick = { viewType = viewType.toggle() },
                         modifier = Modifier.padding(end = 6.dp)
                     ) {
                         Icon(
-                            imageVector =
-                                when (viewType) {
-                                    LibraryViewType.LIST -> Icons.AutoMirrored.Rounded.List
-                                    LibraryViewType.GRID -> Icons.Rounded.GridView
-                                },
+                            imageVector = when (viewType) {
+                                LibraryViewType.LIST -> Icons.AutoMirrored.Rounded.List
+                                LibraryViewType.GRID -> Icons.Rounded.GridView
+                            },
                             contentDescription = null
                         )
                     }
@@ -269,12 +208,9 @@ fun LibraryScreen(
     }
 
     if (filter != LibraryFilter.ALL) {
-        BackHandler {
-            filter = LibraryFilter.ALL
-        }
+        BackHandler { filter = LibraryFilter.ALL }
     }
 
-    // scroll to top
     LaunchedEffect(scrollToTop?.value) {
         if (scrollToTop?.value == true) {
             when (viewType) {
@@ -292,43 +228,15 @@ fun LibraryScreen(
                 state = pullRefreshState,
                 isRefreshing = isSyncingRemotePlaylists || isSyncingRemoteAlbums || isSyncingRemoteArtists
                         || isSyncingRemoteSongs || isSyncingRemoteLikedSongs,
-                onRefresh = {
-                    viewModel.syncAll(true)
-                }
+                onRefresh = { viewModel.syncAll(true) }
             ),
     ) {
         when (filter) {
-            LibraryFilter.ALBUMS ->
-                LibraryAlbumsScreen(
-                    navController,
-                    libraryFilterContent = filterContent
-                )
-
-            LibraryFilter.ARTISTS ->
-                LibraryArtistsScreen(
-                    navController,
-                    libraryFilterContent = filterContent
-                )
-
-            LibraryFilter.PLAYLISTS ->
-                LibraryPlaylistsScreen(
-                    navController,
-                    libraryFilterContent = filterContent
-                )
-
-            LibraryFilter.SONGS ->
-                LibrarySongsScreen(
-                    navController,
-                    libraryFilterContent = filterContent
-                )
-
-            LibraryFilter.FOLDERS ->
-                LibraryFoldersScreen(
-                    navController,
-                    scrollBehavior,
-                    filterContent = filterContent
-                )
-
+            LibraryFilter.ALBUMS -> LibraryAlbumsScreen(navController, libraryFilterContent = filterContent)
+            LibraryFilter.ARTISTS -> LibraryArtistsScreen(navController, libraryFilterContent = filterContent)
+            LibraryFilter.PLAYLISTS -> LibraryPlaylistsScreen(navController, libraryFilterContent = filterContent)
+            LibraryFilter.SONGS -> LibrarySongsScreen(navController, libraryFilterContent = filterContent)
+            LibraryFilter.FOLDERS -> LibraryFoldersScreen(navController, scrollBehavior, filterContent = filterContent)
             LibraryFilter.ALL -> {
                 ScrollToTopManager(navController, lazyListState)
                 when (viewType) {
@@ -337,110 +245,73 @@ fun LibraryScreen(
                             state = lazyListState,
                             contentPadding = LocalPlayerAwareWindowInsets.current.asPaddingValues()
                         ) {
-                            item(
-                                key = "filter",
-                                contentType = CONTENT_TYPE_HEADER
-                            ) {
-                                filterContent()
-                            }
-
-                            item(
-                                key = "header",
-                                contentType = CONTENT_TYPE_HEADER
-                            ) {
-                                headerContent()
-                            }
+                            item(key = "filter", contentType = CONTENT_TYPE_HEADER) { filterContent() }
+                            item(key = "header", contentType = CONTENT_TYPE_HEADER) { headerContent() }
 
                             if (showLikedAndDownloadedPlaylist) {
-                                item(
-                                    key = likedPlaylist.id,
-                                    contentType = { CONTENT_TYPE_PLAYLIST }
-                                ) {
+                                item(key = likedPlaylist.id) {
                                     AutoPlaylistListItem(
                                         playlist = likedPlaylist,
                                         thumbnail = Icons.Rounded.Favorite,
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .clickable {
-                                                navController.navigate("auto_playlist/${likedPlaylist.id}")
-                                            }
-                                            .animateItem()
+                                        modifier = Modifier.fillMaxWidth().clickable { navController.navigate("auto_playlist/${likedPlaylist.id}") }.animateItem()
                                     )
                                 }
-
-                                item(
-                                    key = downloadedPlaylist.id,
-                                    contentType = { CONTENT_TYPE_PLAYLIST }
-                                ) {
+                                item(key = downloadedPlaylist.id) {
                                     AutoPlaylistListItem(
                                         playlist = downloadedPlaylist,
                                         thumbnail = Icons.Rounded.CloudDownload,
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .clickable {
-                                                navController.navigate("auto_playlist/${downloadedPlaylist.id}")
-                                            }
-                                            .animateItem()
+                                        modifier = Modifier.fillMaxWidth().clickable { navController.navigate("auto_playlist/${downloadedPlaylist.id}") }.animateItem()
                                     )
                                 }
                             }
 
-                            allItems.let { allItems ->
-                                if (allItems.isEmpty() && !showLikedAndDownloadedPlaylist) {
-                                    item {
-                                        EmptyPlaceholder(
-                                            icon = Icons.AutoMirrored.Rounded.List,
-                                            text = stringResource(R.string.library_empty),
-                                            modifier = Modifier.animateItem()
-                                        )
+                            itemsIndexed(
+                                items = allItems,
+                                key = { _, item -> item.hashCode() }
+                            ) { index, item ->
+                                if (index >= allItems.size - 1) {
+                                    LaunchedEffect(allItems.size) {
+                                        viewModel.loadMoreItems()
                                     }
                                 }
 
-                                items(
-                                    items = allItems.distinctBy { it.hashCode() },
-                                    key = { it.hashCode() },
-                                    contentType = { CONTENT_TYPE_LIST }
-                                ) { item ->
-                                    when (item) {
-                                        is Album -> {
-                                            LibraryAlbumListItem(
-                                                navController = navController,
-                                                menuState = menuState,
-                                                album = item,
-                                                isActive = item.id == mediaMetadata?.album?.id,
-                                                isPlaying = isPlaying,
-                                                modifier = Modifier.animateItem()
-                                            )
-                                        }
+                                when (item) {
+                                    is Playlist -> LibraryPlaylistListItem(
+                                        navController = navController,
+                                        menuState = menuState,
+                                        coroutineScope = coroutineScope,
+                                        playlist = item,
+                                        modifier = Modifier.animateItem()
+                                    )
+                                    is Album -> LibraryAlbumListItem(
+                                        navController = navController,
+                                        menuState = menuState,
+                                        album = item,
+                                        isActive = item.id == mediaMetadata?.album?.id,
+                                        isPlaying = isPlaying,
+                                        modifier = Modifier.animateItem()
+                                    )
+                                    is Artist -> LibraryArtistListItem(
+                                        navController = navController,
+                                        menuState = menuState,
+                                        coroutineScope = coroutineScope,
+                                        artist = item,
+                                        modifier = Modifier.animateItem()
+                                    )
+                                    else -> {} // Handle Song or other types if necessary
+                                }
+                            }
 
-                                        is Artist -> {
-                                            LibraryArtistListItem(
-                                                navController = navController,
-                                                menuState = menuState,
-                                                coroutineScope = coroutineScope,
-                                                modifier = Modifier.animateItem(),
-                                                artist = item
-                                            )
-                                        }
-
-                                        is Playlist -> {
-                                            LibraryPlaylistListItem(
-                                                navController = navController,
-                                                menuState = menuState,
-                                                coroutineScope = coroutineScope,
-                                                playlist = item,
-                                                modifier = Modifier.animateItem()
-                                            )
-                                        }
-
-                                        else -> {}
-                                    }
+                            item(key = "loading_indicator") {
+                                Box(
+                                    modifier = Modifier.fillMaxWidth().padding(16.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    CircularProgressIndicator(modifier = Modifier.size(32.dp), strokeWidth = 2.dp)
                                 }
                             }
                         }
-                        LazyColumnScrollbar(
-                            state = lazyListState,
-                        )
+                        LazyColumnScrollbar(state = lazyListState)
                     }
 
                     LibraryViewType.GRID -> {
@@ -449,115 +320,73 @@ fun LibraryScreen(
                             columns = GridCells.Adaptive(minSize = GridThumbnailHeight + 24.dp),
                             contentPadding = LocalPlayerAwareWindowInsets.current.asPaddingValues()
                         ) {
-                            item(
-                                key = "filter",
-                                span = { GridItemSpan(maxLineSpan) },
-                                contentType = CONTENT_TYPE_HEADER
-                            ) {
-                                filterContent()
-                            }
-
-                            item(
-                                key = "header",
-                                span = { GridItemSpan(maxLineSpan) },
-                                contentType = CONTENT_TYPE_HEADER
-                            ) {
-                                headerContent()
-                            }
+                            item(key = "filter", span = { GridItemSpan(maxLineSpan) }) { filterContent() }
+                            item(key = "header", span = { GridItemSpan(maxLineSpan) }) { headerContent() }
 
                             if (showLikedAndDownloadedPlaylist) {
-                                item(
-                                    key = likedPlaylist.id,
-                                    contentType = { CONTENT_TYPE_PLAYLIST }
-                                ) {
+                                item(key = likedPlaylist.id) {
                                     AutoPlaylistGridItem(
                                         playlist = likedPlaylist,
                                         thumbnail = Icons.Rounded.Favorite,
                                         fillMaxWidth = true,
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .clickable {
-                                                navController.navigate("auto_playlist/${likedPlaylist.id}")
-                                            }
-                                            .animateItem()
+                                        modifier = Modifier.clickable { navController.navigate("auto_playlist/${likedPlaylist.id}") }.animateItem()
                                     )
                                 }
-
-                                item(
-                                    key = downloadedPlaylist.id,
-                                    contentType = { CONTENT_TYPE_PLAYLIST }
-                                ) {
+                                item(key = downloadedPlaylist.id) {
                                     AutoPlaylistGridItem(
                                         playlist = downloadedPlaylist,
                                         thumbnail = Icons.Rounded.CloudDownload,
                                         fillMaxWidth = true,
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .clickable {
-                                                navController.navigate("auto_playlist/${downloadedPlaylist.id}")
-                                            }
-                                            .animateItem()
+                                        modifier = Modifier.clickable { navController.navigate("auto_playlist/${downloadedPlaylist.id}") }.animateItem()
                                     )
                                 }
                             }
 
-                            allItems.let { allItems ->
-                                if (allItems.isEmpty() && !showLikedAndDownloadedPlaylist) {
-                                    item {
-                                        EmptyPlaceholder(
-                                            icon = Icons.AutoMirrored.Rounded.List,
-                                            text = stringResource(R.string.library_empty),
-                                            modifier = Modifier.animateItem()
-                                        )
+                            itemsIndexed(
+                                items = allItems,
+                                key = { _, item -> item.hashCode() }
+                            ) { index, item ->
+                                if (index >= allItems.size - 1) {
+                                    LaunchedEffect(allItems.size) {
+                                        viewModel.loadMoreItems()
                                     }
                                 }
 
-                                items(
-                                    items = allItems.distinctBy { it.hashCode() },
-                                    key = { it.hashCode() },
-                                    contentType = { CONTENT_TYPE_LIST }
-                                ) { item ->
-                                    when (item) {
-                                        is Album -> {
-                                            LibraryAlbumGridItem(
-                                                navController = navController,
-                                                menuState = menuState,
-                                                coroutineScope = coroutineScope,
-                                                album = item,
-                                                isActive = item.id == mediaMetadata?.album?.id,
-                                                isPlaying = isPlaying,
-                                                modifier = Modifier.animateItem()
-                                            )
-                                        }
+                                when (item) {
+                                    is Playlist -> LibraryPlaylistGridItem(
+                                        navController = navController,
+                                        menuState = menuState,
+                                        coroutineScope = coroutineScope,
+                                        playlist = item,
+                                        modifier = Modifier.animateItem()
+                                    )
+                                    is Album -> LibraryAlbumGridItem(
+                                        navController = navController,
+                                        menuState = menuState,
+                                        coroutineScope = coroutineScope,
+                                        album = item,
+                                        isActive = item.id == mediaMetadata?.album?.id,
+                                        isPlaying = isPlaying,
+                                        modifier = Modifier.animateItem()
+                                    )
+                                    is Artist -> LibraryArtistGridItem(
+                                        navController = navController,
+                                        menuState = menuState,
+                                        coroutineScope = coroutineScope,
+                                        artist = item,
+                                        modifier = Modifier.animateItem()
+                                    )
+                                    else -> {} // Handle other types
+                                }
+                            }
 
-                                        is Artist -> {
-                                            LibraryArtistGridItem(
-                                                navController = navController,
-                                                menuState = menuState,
-                                                coroutineScope = coroutineScope,
-                                                modifier = Modifier.animateItem(),
-                                                artist = item
-                                            )
-                                        }
-
-                                        is Playlist -> {
-                                            LibraryPlaylistGridItem(
-                                                navController = navController,
-                                                menuState = menuState,
-                                                coroutineScope = coroutineScope,
-                                                playlist = item,
-                                                modifier = Modifier.animateItem()
-                                            )
-                                        }
-
-                                        else -> {}
-                                    }
+                            item(key = "loading_indicator", span = { GridItemSpan(maxLineSpan) }) {
+                                Box(modifier = Modifier.fillMaxWidth().padding(16.dp), contentAlignment = Alignment.Center) {
+                                    CircularProgressIndicator(modifier = Modifier.size(32.dp), strokeWidth = 2.dp)
                                 }
                             }
                         }
-                        LazyVerticalGridScrollbar(
-                            state = lazyGridState,
-                        )
+                        LazyVerticalGridScrollbar(state = lazyGridState)
                     }
                 }
             }

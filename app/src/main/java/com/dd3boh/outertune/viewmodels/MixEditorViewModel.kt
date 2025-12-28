@@ -94,9 +94,6 @@ class MixEditorViewModel @Inject constructor(
         val sA = songA ?: return
         val sB = songB ?: return
 
-        // Calculate milliseconds duration from beats
-        // We use Song B's BPM as the master for the transition length usually,
-        // or an average. Let's use Song A's BPM for the fade-out duration.
         val bpm = sA.bpm ?: 120f
         val durationMs = (60000f / bpm * durationBeats).toLong()
 

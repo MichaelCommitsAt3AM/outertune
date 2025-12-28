@@ -123,9 +123,6 @@ object BeatGridNormalizer {
         return alignedBeat
     }
 
-    // Keep existing methods, but update them if they rely on simple normalization
-    // ... (normalizeWithSections, normalizeWithMedianInterval, promoteGrid, etc.)
-
     // NOTE: For normalizeWithMedianInterval, you should also apply the consensus logic
     // if you want to fix the drift there, but 'normalize' is the primary one used by loadData.
 

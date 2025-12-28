@@ -65,6 +65,7 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
@@ -309,34 +310,86 @@ class LibraryViewModel @Inject constructor(
     var albums = database.albumsLikedAsc().stateIn(viewModelScope, SharingStarted.Lazily, emptyList())
     var playlists = database.playlistInLibraryAsc().stateIn(viewModelScope, SharingStarted.Lazily, emptyList())
 
+    private val _visibleItemCount = MutableStateFlow(21)
+    val visibleItemCount = _visibleItemCount.asStateFlow()
+
+    // Function to call when the user reaches the end
+    fun loadMoreItems() {
+        _visibleItemCount.value += 21
+    }
+
+    // Update the allItems flow to use this limit
     val allItems = context.dataStore.data
         .map {
             it[LibrarySortTypeKey].toEnum(LibrarySortType.CREATE_DATE) to (it[LibrarySortDescendingKey] != false)
         }
         .distinctUntilChanged()
         .flatMapLatest { (sortType, descending) ->
-            combine(artists, albums, playlists) { artists, albums, playlists ->
-                val items = artists + albums + playlists
-                items.sortedBy { item ->
-                    when (sortType) {
-                        LibrarySortType.CREATE_DATE -> when (item) {
-                            is Album -> item.album.bookmarkedAt
-                            is Artist -> item.artist.bookmarkedAt
-                            is Playlist -> item.playlist.bookmarkedAt
-                            else -> LocalDateTime.now()
-                        }
-
-                        else -> when (item) {
-                            is Album -> item.album.title.lowercase()
-                            is Artist -> item.artist.name.lowercase()
-                            is Playlist -> item.playlist.name.lowercase()
-                            else -> ""
-                        }
-                    }.toString()
+            combine(artists, albums, playlists, _visibleItemCount) { artists, albums, playlists, limit ->
+                // 1. Sort Playlists, Albums, Artists individually first to maintain the "Playlists First" order
+                val sortedPlaylists = playlists.sortedBy { item ->
+                    if (sortType == LibrarySortType.CREATE_DATE) item.playlist.bookmarkedAt.toString()
+                    else item.playlist.name.lowercase()
                 }.let { if (descending) it.reversed() else it }
+
+                val sortedAlbums = albums.sortedBy { item ->
+                    if (sortType == LibrarySortType.CREATE_DATE) item.album.bookmarkedAt.toString()
+                    else item.album.title.lowercase()
+                }.let { if (descending) it.reversed() else it }
+
+                val sortedArtists = artists.sortedBy { item ->
+                    if (sortType == LibrarySortType.CREATE_DATE) item.artist.bookmarkedAt.toString()
+                    else item.artist.name.lowercase()
+                }.let { if (descending) it.reversed() else it }
+
+                // 2. Combine them in the specific order requested
+                val combinedList = sortedPlaylists + sortedAlbums + sortedArtists
+
+                // 3. Take only the current limit
+                combinedList.take(limit)
             }
         }
         .stateIn(viewModelScope, SharingStarted.Lazily, emptyList())
+
+
+    val sortedPlaylists = context.dataStore.data
+        .map { it[LibrarySortTypeKey].toEnum(LibrarySortType.CREATE_DATE) to (it[LibrarySortDescendingKey] != false) }
+        .distinctUntilChanged()
+        .flatMapLatest { (sortType, descending) ->
+            playlists.map { list ->
+                val sorted = list.sortedBy { item ->
+                    if (sortType == LibrarySortType.CREATE_DATE) item.playlist.bookmarkedAt.toString()
+                    else item.playlist.name.lowercase()
+                }
+                if (descending) sorted.reversed() else sorted
+            }
+        }.stateIn(viewModelScope, SharingStarted.Lazily, emptyList())
+
+    val sortedAlbums = context.dataStore.data
+        .map { it[LibrarySortTypeKey].toEnum(LibrarySortType.CREATE_DATE) to (it[LibrarySortDescendingKey] != false) }
+        .distinctUntilChanged()
+        .flatMapLatest { (sortType, descending) ->
+            albums.map { list ->
+                val sorted = list.sortedBy { item ->
+                    if (sortType == LibrarySortType.CREATE_DATE) item.album.bookmarkedAt.toString()
+                    else item.album.title.lowercase()
+                }
+                if (descending) sorted.reversed() else sorted
+            }
+        }.stateIn(viewModelScope, SharingStarted.Lazily, emptyList())
+
+    val sortedArtists = context.dataStore.data
+        .map { it[LibrarySortTypeKey].toEnum(LibrarySortType.CREATE_DATE) to (it[LibrarySortDescendingKey] != false) }
+        .distinctUntilChanged()
+        .flatMapLatest { (sortType, descending) ->
+            artists.map { list ->
+                val sorted = list.sortedBy { item ->
+                    if (sortType == LibrarySortType.CREATE_DATE) item.artist.bookmarkedAt.toString()
+                    else item.artist.name.lowercase()
+                }
+                if (descending) sorted.reversed() else sorted
+            }
+        }.stateIn(viewModelScope, SharingStarted.Lazily, emptyList())
 
     fun syncAll(bypassCd: Boolean = false) {
         viewModelScope.launch(Dispatchers.IO) { syncUtils.tryAutoSync(bypassCd) }
@@ -364,3 +417,5 @@ class ArtistSongsViewModel @Inject constructor(
         }
         .stateIn(viewModelScope, SharingStarted.Lazily, emptyList())
 }
+
+

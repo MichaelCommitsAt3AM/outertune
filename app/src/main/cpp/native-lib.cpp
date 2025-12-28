@@ -1,4 +1,5 @@
 #include <jni.h>
+#include <map>
 #include <vector>
 #include <algorithm>
 #include <cmath>
@@ -15,6 +16,9 @@ const int HOP_SIZE = 512;
 const int FRAME_SIZE = 1024;
 const double MIN_BPM = 40.0;
 const double MAX_BPM = 200.0;
+const double TARGET_MIN_BPM = 75.0;
+const double TARGET_MAX_BPM = 160.0;
+const double LATENCY_COMPENSATION_MS = 40.0;
 
 /**
  * Helper: Post-process the raw beat grid to improve reliability (Recommendation #3).
@@ -62,31 +66,80 @@ std::vector<double> cleanBeatGrid(std::vector<double>& rawBeats, double averageB
 double calculateBpmFromBeats(const std::vector<double>& beatTimesMs) {
     if (beatTimesMs.size() < 2) return 0.0;
 
+    // 1. Calculate all Inter-Beat Intervals (IBIs)
     std::vector<double> intervals;
     intervals.reserve(beatTimesMs.size() - 1);
     for (size_t i = 1; i < beatTimesMs.size(); ++i) {
         double diff = beatTimesMs[i] - beatTimesMs[i - 1];
+        // Ignore impossible glitches (< 10ms)
         if (diff > 10.0) intervals.push_back(diff);
     }
 
     if (intervals.empty()) return 0.0;
 
-    std::sort(intervals.begin(), intervals.end());
-    double medianIBI = intervals[intervals.size() / 2];
+    // 2. Build a Histogram of BPMs (Resolution: 1 BPM)
+    // We map integer BPM -> Count (score)
+    std::map<int, int> bpmHistogram;
 
-    if (medianIBI <= 0.0) return 0.0;
-    double bpm = 60000.0 / medianIBI;
+    for (double intervalMs : intervals) {
+        if (intervalMs <= 0) continue;
 
-    while (bpm < MIN_BPM && bpm > 0) bpm *= 2.0;
-    while (bpm > MAX_BPM) bpm /= 2.0;
+        double rawBpm = 60000.0 / intervalMs;
 
-    return bpm;
+        // 3. Octave Normalization (The "Double/Half" Fix)
+        // We force the BPM into our target range (75-160) to see where the energy clusters.
+        // e.g., if the raw is 70, we treat it as 140 for voting purposes.
+        double normalizedBpm = rawBpm;
+        while (normalizedBpm < TARGET_MIN_BPM && normalizedBpm > 0) normalizedBpm *= 2.0;
+        while (normalizedBpm > TARGET_MAX_BPM) normalizedBpm /= 2.0;
+
+        int bin = std::round(normalizedBpm);
+        bpmHistogram[bin]++;
+
+        // Smear vote to neighbors to handle jitter (120.1 vs 119.9)
+        bpmHistogram[bin - 1]++;
+        bpmHistogram[bin + 1]++;
+    }
+
+    // 4. Find the Mode (The bin with the highest score)
+    int bestBin = 0;
+    int maxCount = -1;
+
+    for (auto const& [bpm, count] : bpmHistogram) {
+        if (count > maxCount) {
+            maxCount = count;
+            bestBin = bpm;
+        }
+    }
+
+    // 5. Refinement (Weighted Average)
+    // Now that we know the "Rough BPM" (e.g., 120), calculate the precise average
+    // using ONLY the intervals that contributed to this peak.
+    double totalBpm = 0.0;
+    int validCount = 0;
+
+    for (double intervalMs : intervals) {
+        double rawBpm = 60000.0 / intervalMs;
+
+        // Apply the same normalization logic to match the raw beat against our Winner
+        double normalizedBpm = rawBpm;
+        while (normalizedBpm < TARGET_MIN_BPM && normalizedBpm > 0) normalizedBpm *= 2.0;
+        while (normalizedBpm > TARGET_MAX_BPM) normalizedBpm /= 2.0;
+
+        // If this interval is close to our best bin (within +/- 3 BPM), include it in the average
+        if (std::abs(normalizedBpm - bestBin) <= 3.0) {
+            totalBpm += normalizedBpm;
+            validCount++;
+        }
+    }
+
+    return (validCount > 0) ? (totalBpm / validCount) : (double)bestBin;
 }
 
 extern "C" JNIEXPORT jobject JNICALL
 Java_com_dd3boh_outertune_utils_analysis_AudioAnalyzer_analyzeBpm(
         JNIEnv* env,
-        jobject /* this */,
+        jobject,
         jfloatArray pcmData,
         jint sampleRate) {
 
