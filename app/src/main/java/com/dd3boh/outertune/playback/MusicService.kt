@@ -864,14 +864,12 @@ class MusicService : MediaLibraryService(),
     private fun startMixPoller() {
         offloadScope.launch {
             while (isActive) {
-                // Access player on main thread to check if playing
-                val isPlaying = withContext(Dispatchers.Main) {
-                    player.isPlaying
-                }
-
-                if (isPlaying) {
-                    // Check triggers
-                    checkMixStatus()
+                // FIX: Switch to Main thread for both the check AND the function call
+                withContext(Dispatchers.Main) {
+                    if (player.isPlaying) {
+                        // This function accesses player.currentPosition, so it must run on Main
+                        checkMixStatus()
+                    }
                 }
 
                 delay(50) // Poll every 50ms for precise triggers
