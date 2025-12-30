@@ -137,6 +137,7 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
@@ -151,6 +152,7 @@ import java.net.SocketTimeoutException
 import java.net.UnknownHostException
 import java.time.LocalDateTime
 import javax.inject.Inject
+import kotlin.math.abs
 import kotlin.math.min
 import kotlin.math.pow
 
@@ -862,16 +864,17 @@ class MusicService : MediaLibraryService(),
     private fun startMixPoller() {
         offloadScope.launch {
             while (isActive) {
-                // Access player on main thread
-                val playing = withContext(Dispatchers.Main) {
+                // Access player on main thread to check if playing
+                val isPlaying = withContext(Dispatchers.Main) {
                     player.isPlaying
                 }
 
-                if (playing) {
-                    // Your mix polling logic here
+                if (isPlaying) {
+                    // Check triggers
+                    checkMixStatus()
                 }
 
-                delay(50) // or whatever interval you need
+                delay(50) // Poll every 50ms for precise triggers
             }
         }
     }
@@ -879,73 +882,98 @@ class MusicService : MediaLibraryService(),
     private var nextSongPreparedId: String? = null // Track what we prepared
 
     private suspend fun checkMixStatus() {
+        // 1. Get Current Player State
         val currentPosition = player.currentPosition
         val duration = player.duration
-        if (duration < 0) return
+        if (duration < 0 || !player.isPlaying) return
+
+        // 1. Check if Mix Mode is Active for this Playlist
+        // We look up the playlist currently playing
+        val currentQueue = queueBoard.getCurrentQueue() ?: return
+        val playlistId = currentQueue.playlistId
+
+        // If it's a radio or undefined playlist, we might default to OFF or allow it.
+        // If it's a DB playlist, check the flag.
+        if (playlistId != null) {
+            val playlist = database.playlist(playlistId).firstOrNull()
+            // If Mix Mode is OFF, stop here. Normal playback will occur.
+            if (playlist?.playlist?.isMixModeActive != true) return
+        }
 
         val currentMetadata = player.currentMetadata ?: return
         val currentId = currentMetadata.id
 
-        // Retrieve current song object to get BPM
-        val currentSongObj = database.song(currentId).first()?.song
-        val currentBpm = currentSongObj?.bpm?.toFloat()
+        // 2. Identify Next Song
+        val nextSong = queueBoard.peekNext() ?: return
 
-        // 1. LOOKAHEAD: Prepare next song if 20s left
-        // Check if we are in "Mix Mode" for this playlist
-        // Note: You need to read 'isMixModeActive' from DB or Cache here.
-        // For PoC, let's assume TRUE or check a simple flag.
+        // 3. Check for a Saved Transition in DB
+        // We use the DAO to see if user has edited a transition for A -> B
+        val transition = transitionDao.getTransition(currentId, nextSong.id) ?: return
 
+        // === PREPARATION PHASE (Lookahead) ===
+        // If we are within 20 seconds of the end, prepare the next deck
         if (duration - currentPosition < 20_000 && nextSongPreparedId != currentId) {
-            val nextSong = queueBoard.peekNext()
-            if (nextSong != null) {
-                // Check for Manual Transition in DB
-                val transition = transitionDao.getTransition(currentId, nextSong.id)
 
-                if (transition != null) {
-                    Log.d(TAG, "Mixer: Found transition to ${nextSong.title}")
+            Log.d(TAG, "Mixer: Found transition settings A[${currentId}] -> B[${nextSong.id}]")
 
-                    // --- BPM MATCHING LOGIC ---
-                    var speedMultiplier: Float? = null
+            // --- BPM SYNC LOGIC ---
+            var speedMultiplier: Float? = null
 
-                    // Fetch next song details for BPM
-                    val nextSongObj = database.song(nextSong.id).first()?.song
-                    val nextBpm = nextSongObj?.bpm?.toFloat()
+            if (transition.syncTempo) {
+                // Fetch song objects to get BPMs
+                val currentSongObj = database.song(currentId).first()?.song
+                val nextSongObj = database.song(nextSong.id).first()?.song
 
-                    if (currentBpm != null && nextBpm != null && currentBpm > 0 && nextBpm > 0) {
-                        val diff = kotlin.math.abs(currentBpm - nextBpm)
-                        if (diff <= 15f) {
-                            // Calculate multiplier to make Next Song match Current Song's speed
-                            // Target Speed = Current BPM
-                            // Multiplier = Target / Original
-                            speedMultiplier = currentBpm / nextBpm
-                            Log.i(TAG, "Beatmatch: Adjusting ${nextSong.title} (BPM $nextBpm) to match $currentBpm. Speed: $speedMultiplier")
-                        }
+                val currentBpm = currentSongObj?.bpm?.toFloat() ?: 0f
+                val nextBpm = nextSongObj?.bpm?.toFloat() ?: 0f
+
+                // If both have valid BPMs, calculate the pitch shift needed for Song B
+                if (currentBpm > 0 && nextBpm > 0) {
+                    // If BPMs are within a "sanity" range (e.g., +/- 30 BPM), sync them.
+                    // Otherwise, it might sound too weird, so we skip sync.
+                    if (abs(currentBpm - nextBpm) < 40f) {
+                        // Formula: Target / Source
+                        // e.g. Target 128, Source 125 -> 1.024x speed
+                        speedMultiplier = currentBpm / nextBpm
+                        Log.i(TAG, "Mixer: Syncing Tempo. Deck B ${nextBpm} -> ${currentBpm} (x${speedMultiplier})")
                     }
-                    withContext(Dispatchers.Main) {
-                        deckManager.prepareNext(
-                            nextSong.toMediaItem(),
-                            transition.entryPointMs,
-                            speedMultiplier
-                        )
-                    }
-                    nextSongPreparedId = currentId // Mark as handled for this song
                 }
             }
+
+            // Prepare Deck B
+            withContext(Dispatchers.Main) {
+                deckManager.prepareNext(
+                    mediaItem = nextSong.toMediaItem(),
+                    startPositionMs = transition.entryPointMs, // Start exactly where user set the cue
+                    bpmConfig = speedMultiplier
+                )
+            }
+
+            // Mark this transition as prepared so we don't spam the preparation
+            nextSongPreparedId = currentId
         }
 
-        // 2. TRIGGER: Start Mix if we hit the Exit Point
-        // We need to fetch the transition again (or cache it in the step above)
-        val nextSong = queueBoard.peekNext()
-        if (nextSong != null) {
-            val transition = transitionDao.getTransition(currentId, nextSong.id)
-            if (transition != null) {
-                if (currentPosition >= transition.exitPointMs) {
-                    withContext(Dispatchers.Main) {
-                        deckManager.startCrossfade(transition.durationMs)
-                        // Advance QueueBoard index so UI updates
-                        queueBoard.setCurrQueuePosIndex(player.currentMediaItemIndex + 1)
-                    }
-                }
+        // === EXECUTION PHASE (Trigger) ===
+        // Check if we have crossed the Exit Point (Cue Out)
+        if (currentPosition >= transition.exitPointMs) {
+
+            // Ensure we haven't already switched (simple check against current media index)
+            // Note: DeckManager handles the actual switching logic, we just pull the trigger.
+
+            // We need to verify we aren't already transitioning.
+            // Usually DeckManager handles this, but we can check if player.currentMediaItem is still Song A.
+
+            withContext(Dispatchers.Main) {
+                // Pass all the specific FX params to the DeckManager
+                deckManager.startCrossfade(
+                    durationMs = transition.durationMs,
+                    overlapMode = transition.overlapMode, // "Crossfade", "Cut", "Overlap"
+                    eqMode = transition.eqMode,           // "Centre Bass swap", etc
+                    effectMode = transition.effectMode    // "Low pass in", etc
+                )
+
+                // Advance QueueBoard index so the UI shows the correct song is "Next"
+                queueBoard.setCurrQueuePosIndex(player.currentMediaItemIndex + 1)
             }
         }
     }

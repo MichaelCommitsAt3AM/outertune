@@ -15,20 +15,20 @@ data class TransitionEntity(
     // The point in Song A (outgoing) where the crossfade starts
     val exitPointMs: Long,
 
-    // The point in Song B (incoming) where playback begins
+    // The point in Song B (incoming) where playback begins (aligns with start of crossfade)
     val entryPointMs: Long,
 
-    // How long the transition lasts (default 8s)
+    // How long the transition lasts
     val durationMs: Long = 8000,
-
-    // The musical length (for the UI: 2, 4, 8, 16)
     val durationBeats: Int? = null,
 
-    // Whether to force Deck B to match Deck A's BPM
     val syncTempo: Boolean = true,
+    val type: Int = TYPE_MANUAL,
 
-    // Future-proofing: Manual vs Auto generated
-    val type: Int = TYPE_MANUAL
+    // --- NEW FIELDS FOR EFFECT STORAGE ---
+    val overlapMode: String = "Overlap", // Overlap, Crossfade, Cut
+    val eqMode: String = "None",         // Bass Swaps etc
+    val effectMode: String = "None"      // Filters etc
 ) {
     companion object {
         const val TYPE_MANUAL = 0

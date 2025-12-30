@@ -76,7 +76,7 @@ class MusicDatabase(
     fun close() = delegate.close()
 
     companion object {
-        const val MUSIC_DATABASE_VERSION = 25
+        const val MUSIC_DATABASE_VERSION = 26
     }
 }
 
@@ -151,6 +151,7 @@ abstract class InternalDatabase : RoomDatabase() {
                     .addMigrations(MIGRATION_20_21)
                     .addMigrations(MIGRATION_21_22)
                     .addMigrations(MIGRATION_24_25) // New Bar Detection Migration
+                    .addMigrations(MIGRATION_25_26)
                     .build()
             )
 
@@ -164,6 +165,7 @@ abstract class InternalDatabase : RoomDatabase() {
                     .addMigrations(MIGRATION_16_17)
                     .addMigrations(MIGRATION_21_22)
                     .addMigrations(MIGRATION_24_25) // New Bar Detection Migration
+                    .addMigrations(MIGRATION_25_26)
                     .build()
             )
     }
@@ -179,6 +181,14 @@ val MIGRATION_24_25 = object : Migration(24, 25) {
         db.execSQL("ALTER TABLE song ADD COLUMN time_signature INTEGER NOT NULL DEFAULT 4")
         // We set default downbeat_offset to 0 (the first detected beat)
         db.execSQL("ALTER TABLE song ADD COLUMN downbeat_offset INTEGER NOT NULL DEFAULT 0")
+    }
+}
+
+val MIGRATION_25_26 = object : Migration(25, 26) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE transitions ADD COLUMN overlapMode TEXT NOT NULL DEFAULT 'Overlap'")
+        db.execSQL("ALTER TABLE transitions ADD COLUMN eqMode TEXT NOT NULL DEFAULT 'None'")
+        db.execSQL("ALTER TABLE transitions ADD COLUMN effectMode TEXT NOT NULL DEFAULT 'None'")
     }
 }
 

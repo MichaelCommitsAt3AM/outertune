@@ -10,6 +10,7 @@ import androidx.media3.common.util.Log
 import androidx.media3.exoplayer.ExoPlayer
 import com.dd3boh.outertune.db.MusicDatabase
 import com.dd3boh.outertune.db.entities.Song
+import com.dd3boh.outertune.db.entities.TransitionEntity
 import com.dd3boh.outertune.ui.component.BeatGridMarker
 import com.dd3boh.outertune.utils.DJHelper
 import com.dd3boh.outertune.utils.TransitionMixer
@@ -692,6 +693,71 @@ class TransitionEditorViewModel @Inject constructor(
         val t2 = grid[idx + 1]
         val fraction = (time - t1) / (t2 - t1)
         return idx + fraction
+    }
+
+    fun saveTransition(onComplete: () -> Unit) {
+        val songA = track1.value
+        val songB = track2.value
+        val gridA = rawGrid1
+        val gridB = rawGrid2
+
+        if (songA == null || songB == null || gridA.isEmpty() || gridB.isEmpty()) return
+
+        viewModelScope.launch(Dispatchers.IO) {
+            // 1. Calculate the timestamps exactly as they are calculated in startPreview()
+            //    to ensure What You Hear Is What You Save.
+
+            val beatOffsetA = _track1OffsetBeats.value.toDouble()
+            val beatOffsetB = _track2OffsetBeats.value.toDouble()
+            val zoneFraction = _transitionWidthFraction.value
+            val beatsInZone = (_barsCount.value * 4).toDouble()
+
+            // Calculate how many beats act as the left-side margin before the green box
+            val marginFraction = (1f - zoneFraction) / 2f
+            val visualMarginBeats = if (zoneFraction > 0f) (marginFraction / zoneFraction) * beatsInZone else 0.0
+
+            // The 'Anchor Beat' is the exact beat index where the Transition Zone (Green Box) starts
+            val anchorBeatA = beatOffsetA + visualMarginBeats
+            val rawAnchorBeatB = beatOffsetB + visualMarginBeats
+
+            // Adjust Beat B for grid scaling (if tempo sync was needed)
+            val internalBeatB = if (trackBGridScalar == 1.0) rawAnchorBeatB
+            else rawAnchorBeatB / trackBGridScalar
+
+            // Convert Beats to Milliseconds using the Double Precision grids
+            val exitPointMs = (getTimestampForBeat(gridA, anchorBeatA) * 1000).toLong()
+            val entryPointMs = (getTimestampForBeat(gridB, internalBeatB) * 1000).toLong()
+
+            // Calculate actual duration in MS based on current grid A speed
+            val durationMs = (_transitionDurationSeconds.value * 1000).toLong()
+
+            // 2. Create the Entity
+            val transition = TransitionEntity(
+                fromSongId = songA.id,
+                toSongId = songB.id,
+                exitPointMs = exitPointMs.coerceAtLeast(0),
+                entryPointMs = entryPointMs.coerceAtLeast(0),
+                durationMs = durationMs,
+                durationBeats = _barsCount.value * 4,
+                syncTempo = true, // We generally force sync in this editor
+                type = TransitionEntity.TYPE_MANUAL,
+
+                // Save specific FX settings
+                overlapMode = _overlapMode.value,
+                eqMode = _eqMode.value,
+                effectMode = _effectMode.value
+            )
+
+            // 3. Save to DB
+            database.transitionDao().insert(transition)
+
+            Log.d("TransitionEditor", "Saved Transition: A[${exitPointMs}ms] -> B[${entryPointMs}ms] (${_eqMode.value})")
+
+            // 4. Close Screen
+            withContext(Dispatchers.Main) {
+                onComplete()
+            }
+        }
     }
 
     // --- Disk IO (Double Precision) ---

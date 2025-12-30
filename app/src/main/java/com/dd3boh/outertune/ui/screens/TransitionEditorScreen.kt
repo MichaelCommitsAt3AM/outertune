@@ -126,7 +126,11 @@ fun TransitionEditorScreen(
         }
 
         Column(modifier = Modifier.fillMaxSize()) {
-            TopBar(onCancel, onSave)
+            TopBar(
+                onCancel = onCancel,
+                onSave = {
+                    viewModel.saveTransition (onComplete = onSave)
+                })
 
             Spacer(modifier = Modifier.height(24.dp))
 
