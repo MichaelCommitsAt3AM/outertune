@@ -58,6 +58,11 @@ class PlayerConnection(
         playWhenReady && playbackState != STATE_ENDED
     }.stateIn(scope, SharingStarted.Lazily, player.playWhenReady && player.playbackState != STATE_ENDED)
     val waitingForNetworkConnection: StateFlow<Boolean> = service.waitingForNetworkConnection.asStateFlow()
+
+    // --- NEW: Expose Logical State ---
+    val logicalState = service.logicalState
+    // ---------------------------------
+
     val mediaMetadata = MutableStateFlow(player.currentMetadata)
     val currentSong = mediaMetadata.flatMapLatest {
         database.song(it?.id)
@@ -116,6 +121,10 @@ class PlayerConnection(
             title = title,
             isRadio = isRadio
         )
+    }
+
+    fun seekToLogical(positionMs: Long) {
+        service.seekToLogical(positionMs)
     }
 
     /**

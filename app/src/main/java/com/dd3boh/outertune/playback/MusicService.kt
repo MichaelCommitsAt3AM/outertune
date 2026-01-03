@@ -93,6 +93,7 @@ import com.dd3boh.outertune.db.daos.TransitionDao
 import com.dd3boh.outertune.db.entities.Event
 import com.dd3boh.outertune.db.entities.FormatEntity
 import com.dd3boh.outertune.db.entities.RelatedSongMap
+import com.dd3boh.outertune.db.entities.TransitionEntity
 import com.dd3boh.outertune.di.AppModule.PlayerCache
 import com.dd3boh.outertune.di.DownloadCache
 import com.dd3boh.outertune.extensions.SilentHandler
@@ -104,6 +105,7 @@ import com.dd3boh.outertune.extensions.metadata
 import com.dd3boh.outertune.extensions.setOffloadEnabled
 import com.dd3boh.outertune.extensions.toMediaItem
 import com.dd3boh.outertune.lyrics.LyricsHelper
+import com.dd3boh.outertune.models.LogicalPlayerState
 import com.dd3boh.outertune.models.HybridCacheDataSinkFactory
 import com.dd3boh.outertune.models.MediaMetadata
 import com.dd3boh.outertune.models.MultiQueueObject
@@ -133,6 +135,7 @@ import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -215,6 +218,13 @@ class MusicService : MediaLibraryService(),
 
     // Player vars
     val currentMediaMetadata = MutableStateFlow<MediaMetadata?>(null)
+
+    // --- NEW: Logical State for Gapless UI ---
+    private val _logicalState = MutableStateFlow(LogicalPlayerState())
+    val logicalState = _logicalState.asStateFlow()
+
+    // Cache the transition for the CURRENT song to avoid DB hits every tick
+    private var currentTransitionCache: TransitionEntity? = null
 
     private val currentSong = currentMediaMetadata.flatMapLatest { mediaMetadata ->
         database.song(mediaMetadata?.id)
@@ -864,15 +874,16 @@ class MusicService : MediaLibraryService(),
     private fun startMixPoller() {
         offloadScope.launch {
             while (isActive) {
-                // FIX: Switch to Main thread for both the check AND the function call
                 withContext(Dispatchers.Main) {
                     if (player.isPlaying) {
-                        // This function accesses player.currentPosition, so it must run on Main
+                        // 1. Update the UI Clock (NEW)
+                        updateLogicalState()
+
+                        // 2. Check for Transition Triggers (EXISTING)
                         checkMixStatus()
                     }
                 }
-
-                delay(50) // Poll every 50ms for precise triggers
+                delay(50) // 50ms = ~20 updates per second
             }
         }
     }
@@ -880,99 +891,106 @@ class MusicService : MediaLibraryService(),
     private var nextSongPreparedId: String? = null // Track what we prepared
 
     private suspend fun checkMixStatus() {
-        // 1. Get Current Player State
-        val currentPosition = player.currentPosition
-        val duration = player.duration
-        if (duration < 0 || !player.isPlaying) return
+        // 1. Basic Checks
+        if (!player.isPlaying) return
+        val transition = currentTransitionCache ?: return
 
-        // 1. Check if Mix Mode is Active for this Playlist
-        // We look up the playlist currently playing
-        val currentQueue = queueBoard.getCurrentQueue() ?: return
-        val playlistId = currentQueue.playlistId
-
-        // If it's a radio or undefined playlist, we might default to OFF or allow it.
-        // If it's a DB playlist, check the flag.
-        if (playlistId != null) {
-            val playlist = database.playlist(playlistId).firstOrNull()
-            // If Mix Mode is OFF, stop here. Normal playback will occur.
-            if (playlist?.playlist?.isMixModeActive != true) return
+        // 2. Validate Data Integrity
+        // If the exit point is beyond the file duration (bad data), ignore the transition.
+        // We use a small buffer (500ms) to ensure we don't skip valid end-of-song transitions.
+        val realDuration = player.duration
+        if (realDuration > 0 && transition.exitPointMs > (realDuration - 500)) {
+            // Bad transition data: Point is too close to end or past it.
+            return
         }
 
-        val currentMetadata = player.currentMetadata ?: return
-        val currentId = currentMetadata.id
+        // 3. Validate Queue Integrity
+        // If the user shuffled or moved songs, the "Next Song" might have changed
+        // since we cached the transition.
+        val nextSong = queueBoard.peekNext()
+        if (nextSong == null || nextSong.id != transition.toSongId) {
+            // The queue no longer matches the transition plan. Invalidate cache.
+            currentTransitionCache = null
+            return
+        }
 
-        // 2. Identify Next Song
-        val nextSong = queueBoard.peekNext() ?: return
+        // 4. Handle Repeat Mode
+        // If "Repeat One" is on, we generally should NOT transition to the next song.
+        if (player.repeatMode == Player.REPEAT_MODE_ONE) {
+            return
+        }
 
-        // 3. Check for a Saved Transition in DB
-        // We use the DAO to see if user has edited a transition for A -> B
-        val transition = transitionDao.getTransition(currentId, nextSong.id) ?: return
+        val currentPosition = player.currentPosition
 
-        // === PREPARATION PHASE (Lookahead) ===
-        // If we are within 20 seconds of the end, prepare the next deck
-        if (duration - currentPosition < 20_000 && nextSongPreparedId != currentId) {
+        // === EXECUTION PHASE (Trigger) ===
+        if (currentPosition >= transition.exitPointMs) {
+            withContext(Dispatchers.Main) {
+                // Double check we haven't already switched (race condition protection)
+                if (_logicalState.value.activeMetadata?.id == nextSong.id) return@withContext
 
-            Log.d(TAG, "Mixer: Found transition settings A[${currentId}] -> B[${nextSong.id}]")
+                // 1. Trigger Physical Crossfade
+                deckManager.startCrossfade(
+                    durationMs = transition.durationMs,
+                    overlapMode = transition.overlapMode,
+                    eqMode = transition.eqMode,
+                    effectMode = transition.effectMode
+                )
 
-            // --- BPM SYNC LOGIC ---
-            var speedMultiplier: Float? = null
+                // 2. Advance Queue
+                queueBoard.setCurrQueuePosIndex(player.currentMediaItemIndex + 1)
 
-            if (transition.syncTempo) {
-                // Fetch song objects to get BPMs
-                val currentSongObj = database.song(currentId).first()?.song
-                val nextSongObj = database.song(nextSong.id).first()?.song
+                // 3. Trigger LOGICAL Switch
+                offloadScope.launch {
+                    val songAfterNext = queueBoard.getSongAtIndex(player.currentMediaItemIndex + 2)
 
-                val currentBpm = currentSongObj?.bpm?.toFloat() ?: 0f
-                val nextBpm = nextSongObj?.bpm?.toFloat() ?: 0f
+                    currentTransitionCache = if (songAfterNext != null) {
+                        transitionDao.getTransition(nextSong.id, songAfterNext.id)
+                    } else null
 
-                // If both have valid BPMs, calculate the pitch shift needed for Song B
-                if (currentBpm > 0 && nextBpm > 0) {
-                    // If BPMs are within a "sanity" range (e.g., +/- 30 BPM), sync them.
-                    // Otherwise, it might sound too weird, so we skip sync.
-                    if (abs(currentBpm - nextBpm) < 40f) {
-                        // Formula: Target / Source
-                        // e.g. Target 128, Source 125 -> 1.024x speed
-                        speedMultiplier = currentBpm / nextBpm
-                        Log.i(TAG, "Mixer: Syncing Tempo. Deck B ${nextBpm} -> ${currentBpm} (x${speedMultiplier})")
+                    withContext(Dispatchers.Main) {
+                        _logicalState.value = LogicalPlayerState(
+                            activeMetadata = nextSong,
+                            currentPositionMs = 0L,
+                            durationMs = currentTransitionCache?.exitPointMs ?: (nextSong.duration * 1000L),
+                            isTransitionActive = true
+                        )
                     }
                 }
             }
-
-            // Prepare Deck B
-            withContext(Dispatchers.Main) {
-                deckManager.prepareNext(
-                    mediaItem = nextSong.toMediaItem(),
-                    startPositionMs = transition.entryPointMs, // Start exactly where user set the cue
-                    bpmConfig = speedMultiplier
-                )
-            }
-
-            // Mark this transition as prepared so we don't spam the preparation
-            nextSongPreparedId = currentId
         }
+    }
 
-        // === EXECUTION PHASE (Trigger) ===
-        // Check if we have crossed the Exit Point (Cue Out)
-        if (currentPosition >= transition.exitPointMs) {
+    private fun updateLogicalState() {
+        val currentMeta = player.currentMetadata ?: return
+        val realPos = player.currentPosition
+        val realDur = player.duration
 
-            // Ensure we haven't already switched (simple check against current media index)
-            // Note: DeckManager handles the actual switching logic, we just pull the trigger.
+        // 1. Determine Logical Duration
+        // If there is a transition, the track "ends" for the UI at the Exit Point.
+        val logicalDuration = currentTransitionCache?.exitPointMs ?: realDur
 
-            // We need to verify we aren't already transitioning.
-            // Usually DeckManager handles this, but we can check if player.currentMediaItem is still Song A.
+        // 2. Determine Logical Position
+        // Clamp position to logical duration. This prevents the UI slider from
+        // jumping past the end during the audio crossfade overlap.
+        val logicalPos = min(realPos, logicalDuration)
 
-            withContext(Dispatchers.Main) {
-                // Pass all the specific FX params to the DeckManager
-                deckManager.startCrossfade(
-                    durationMs = transition.durationMs,
-                    overlapMode = transition.overlapMode, // "Crossfade", "Cut", "Overlap"
-                    eqMode = transition.eqMode,           // "Centre Bass swap", etc
-                    effectMode = transition.effectMode    // "Low pass in", etc
-                )
-
-                // Advance QueueBoard index so the UI shows the correct song is "Next"
-                queueBoard.setCurrQueuePosIndex(player.currentMediaItemIndex + 1)
-            }
+        // 3. Update State
+        // We only update if the IDs match. This prevents "glitching" if the logical state
+        // was switched ahead of the physical player during a transition trigger.
+        if (_logicalState.value.activeMetadata?.id == currentMeta.id) {
+            _logicalState.value = _logicalState.value.copy(
+                currentPositionMs = logicalPos,
+                durationMs = logicalDuration,
+                // If we are just playing normally, ensure this is false
+                isTransitionActive = false
+            )
+        } else if (_logicalState.value.activeMetadata == null) {
+            // Initial/Reset State
+            _logicalState.value = LogicalPlayerState(
+                activeMetadata = currentMeta,
+                currentPositionMs = logicalPos,
+                durationMs = logicalDuration
+            )
         }
     }
 
@@ -1143,6 +1161,31 @@ class MusicService : MediaLibraryService(),
             }
         }
 
+        // --- NEW: Refresh Transition Cache ---
+        mediaItem?.mediaId?.let { currentId ->
+            offloadScope.launch {
+                val nextSong = queueBoard.peekNext() // This works now
+                currentTransitionCache = if (nextSong != null) {
+                    transitionDao.getTransition(currentId, nextSong.id)
+                } else null
+
+                // Force an immediate update so UI has correct duration
+                withContext(Dispatchers.Main) {
+                    val meta = player.currentMetadata
+                    if (meta != null) {
+                        // SAFETY: Ensure duration is at least 1ms to prevent UI division errors
+                        val safeDuration = if (player.duration > 0) player.duration else 1L
+
+                        _logicalState.value = LogicalPlayerState(
+                            activeMetadata = meta,
+                            currentPositionMs = 0L,
+                            durationMs = currentTransitionCache?.exitPointMs ?: safeDuration
+                        )
+                    }
+                }
+            }
+        }
+
         updateNotification() // also updates when queue changes
     }
 
@@ -1215,6 +1258,37 @@ class MusicService : MediaLibraryService(),
                 }
             }
         }
+    }
+
+    fun seekToLogical(newPositionMs: Long) {
+        val state = _logicalState.value
+        val logicalDuration = state.durationMs
+
+        // 1. Clamp to Logical Duration
+        // Ensure we don't seek past the exit point (transition start)
+        val clampedPosition = if (logicalDuration > 0) {
+            newPositionMs.coerceIn(0L, logicalDuration)
+        } else {
+            newPositionMs
+        }
+
+        // 2. Handle "Scrubbing backwards across boundary"
+        // If the user was visually on "Song B" (transition active) but scrubs back to 0:00,
+        // we are still effectively playing Song B (or about to).
+        // Since we physically switch tracks at the transition point,
+        // standard seeking usually works, BUT we must cancel any active crossfade.
+
+        if (deckManager.activeDeck.isPlaying && state.isTransitionActive) {
+            // Cancel any active crossfade if the user interrupts
+            deckManager.cancelCrossfade()
+            // Reset logical state to match physical reality
+            // (The update loop will fix it next tick, but good to be explicit)
+        }
+
+        player.seekTo(clampedPosition)
+
+        // Update state immediately for UI responsiveness (optimistic update)
+        _logicalState.value = state.copy(currentPositionMs = clampedPosition)
     }
 
     override fun onRepeatModeChanged(repeatMode: Int) {

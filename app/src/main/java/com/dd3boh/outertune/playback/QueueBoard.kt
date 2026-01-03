@@ -953,6 +953,17 @@ class QueueBoard(
         }
     }
 
+    fun getSongAtIndex(index: Int): MediaMetadata? {
+        val q = getCurrentQueue() ?: return null
+        val items = q.getCurrentQueueShuffled()
+
+        return if (index >= 0 && index < items.size) {
+            items[index]
+        } else {
+            null
+        }
+    }
+
     companion object {
 
         fun shuffleInPlace(list: List<MediaMetadata>) {

@@ -5,9 +5,15 @@ import android.media.audiofx.Equalizer
 import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import androidx.media3.common.AudioAttributes
+import androidx.media3.common.C
 import androidx.media3.common.MediaItem
+import androidx.media3.common.audio.SonicAudioProcessor
 import androidx.media3.common.util.Log
+import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.audio.DefaultAudioSink
+import androidx.media3.exoplayer.audio.SilenceSkippingAudioProcessor
 import com.dd3boh.outertune.db.MusicDatabase
 import com.dd3boh.outertune.db.entities.Song
 import com.dd3boh.outertune.db.entities.TransitionEntity
@@ -126,22 +132,87 @@ class TransitionEditorViewModel @Inject constructor(
 
     private val PRE_ROLL_MS = 3000L
 
+    private val _errorMessage = MutableSharedFlow<String>()
+    val errorMessage = _errorMessage.asSharedFlow()
+
     init { viewModelScope.launch(Dispatchers.Main) { setupPlayers() } }
 
     private fun setupPlayers() {
-        if (playerA == null) {
-            playerA = ExoPlayer.Builder(context).build().apply {
-                volume = 1f
-                // ADD THIS
-                setSeekParameters(androidx.media3.exoplayer.SeekParameters.EXACT)
+        // 1. Define Audio Attributes
+        val audioAttributes = AudioAttributes.Builder()
+            .setUsage(C.USAGE_MEDIA)
+            .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
+            .build()
+
+        // 2. Define Renderers Factory (Same as before)
+        val renderersFactory = object : DefaultRenderersFactory(context) {
+            override fun buildAudioSink(
+                context: Context,
+                pcmEncodingRestrictionLifted: Boolean,
+                enableFloatOutput: Boolean,
+                enableAudioTrackPlaybackParams: Boolean
+            ): androidx.media3.exoplayer.audio.AudioSink? {
+                return DefaultAudioSink.Builder(context)
+                    .setPcmEncodingRestrictionLifted(pcmEncodingRestrictionLifted)
+                    .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
+                    .setAudioProcessorChain(
+                        DefaultAudioSink.DefaultAudioProcessorChain(
+                            emptyArray(),
+                            SilenceSkippingAudioProcessor(),
+                            SonicAudioProcessor()
+                        )
+                    )
+                    .build()
             }
+        }.apply {
+            setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON)
         }
+
+        if (playerA == null) {
+            playerA = ExoPlayer.Builder(context)
+                .setRenderersFactory(renderersFactory)
+                // CRITICAL FIX: set handleAudioFocus = false
+                .setAudioAttributes(audioAttributes, false)
+                .setHandleAudioBecomingNoisy(true)
+                .build().apply {
+                    volume = 1f
+                    setSeekParameters(androidx.media3.exoplayer.SeekParameters.EXACT)
+                }
+        }
+
         if (playerB == null) {
-            playerB = ExoPlayer.Builder(context).build().apply {
-                volume = 1f
-                // ADD THIS
-                setSeekParameters(androidx.media3.exoplayer.SeekParameters.EXACT)
+            // Re-create factory for B (Factory instances cannot be shared safely)
+            val renderersFactoryB = object : DefaultRenderersFactory(context) {
+                override fun buildAudioSink(
+                    context: Context,
+                    pcmEncodingRestrictionLifted: Boolean,
+                    enableFloatOutput: Boolean,
+                    enableAudioTrackPlaybackParams: Boolean
+                ): androidx.media3.exoplayer.audio.AudioSink? {
+                    return DefaultAudioSink.Builder(context)
+                        .setPcmEncodingRestrictionLifted(pcmEncodingRestrictionLifted)
+                        .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
+                        .setAudioProcessorChain(
+                            DefaultAudioSink.DefaultAudioProcessorChain(
+                                emptyArray(),
+                                SilenceSkippingAudioProcessor(),
+                                SonicAudioProcessor()
+                            )
+                        )
+                        .build()
+                }
+            }.apply {
+                setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON)
             }
+
+            playerB = ExoPlayer.Builder(context)
+                .setRenderersFactory(renderersFactoryB)
+                .setAudioAttributes(audioAttributes, false)
+                .setHandleAudioBecomingNoisy(true)
+                .build().apply {
+                    volume = 1f
+                    setSeekParameters(androidx.media3.exoplayer.SeekParameters.EXACT)
+                }
         }
     }
 
@@ -179,163 +250,193 @@ class TransitionEditorViewModel @Inject constructor(
 
     // --- Data Loading ---
     fun loadData(songAId: String, songBId: String) {
+        Log.d("TRANSITION_DEBUG", "1. loadData called for A=$songAId, B=$songBId")
+
         viewModelScope.launch(Dispatchers.IO) {
+            Log.d("TRANSITION_DEBUG", "2. Coroutine started")
+
             val songA = database.song(songAId).firstOrNull()
             val songB = database.song(songBId).firstOrNull()
+
+            Log.d("TRANSITION_DEBUG", "3. DB Fetch Complete. SongA found: ${songA != null}, SongB found: ${songB != null}")
+
+            if (songA == null || songB == null) {
+                Log.e("TRANSITION_DEBUG", "CRITICAL: One or both songs are null. Aborting.")
+                return@launch
+            }
+
             _track1.value = songA
             _track2.value = songB
+            Log.d("TRANSITION_DEBUG", "4. StateFlows _track1 and _track2 updated")
 
+            // Durations
             val durA = songA?.let { loadExactDuration(it.id) } ?: songA?.song?.duration?.toDouble() ?: 1.0
             val durB = songB?.let { loadExactDuration(it.id) } ?: songB?.song?.duration?.toDouble() ?: 1.0
+            Log.d("TRANSITION_DEBUG", "5. Durations loaded. A=$durA, B=$durB")
+
+            // Grid Loading
+            val gridPathA = songA?.song?.beatGridPath
+            val gridPathB = songB?.song?.beatGridPath
+            val loadedGridA = loadBeatGridDouble(gridPathA, songAId)
+            val loadedGridB = loadBeatGridDouble(gridPathB, songBId)
+
+            Log.d("TRANSITION_DEBUG", "6. Raw Grids Loaded from disk. A size=${loadedGridA.size}, B size=${loadedGridB.size}")
+            Log.d("TRANSITION_DEBUG", "   Path A: $gridPathA exists? ${File(gridPathA ?: "").exists()}")
+
+            // BPMs
+            val analysisBpmA = songA?.song?.bpm ?: 120f
+            val displayBpmA = songA?.song?.displayBpm ?: 120f
+            val analysisBpmB = songB?.song?.bpm ?: 120f
+            val displayBpmB = songB?.song?.displayBpm ?: 120f
+            Log.d("TRANSITION_DEBUG", "7. BPMs A: $analysisBpmA/$displayBpmA, B: $analysisBpmB/$displayBpmB")
 
             // 1. Resolve Grids
-            val dualA = BeatGridNormalizer.resolveDjGrids(
-                detectedGrid = loadBeatGridDouble(songA?.song?.beatGridPath, songAId).map { it.toFloat() },
-                analysisBpm = songA?.song?.bpm ?: 120f,
-                displayBpm = songA?.song?.displayBpm ?: 120f,
-                durationSec = durA.toFloat()
-            )
-            val dualB = BeatGridNormalizer.resolveDjGrids(
-                detectedGrid = loadBeatGridDouble(songB?.song?.beatGridPath, songBId).map { it.toFloat() },
-                analysisBpm = songB?.song?.bpm ?: 120f,
-                displayBpm = songB?.song?.displayBpm ?: 120f,
-                durationSec = durB.toFloat()
-            )
+            Log.d("TRANSITION_DEBUG", "8. Calling BeatGridNormalizer...")
+            try {
+                val dualA = BeatGridNormalizer.resolveDjGrids(
+                    detectedGrid = loadedGridA.map { it.toFloat() },
+                    analysisBpm = analysisBpmA,
+                    displayBpm = displayBpmA,
+                    durationSec = durA.toFloat()
+                )
+                val dualB = BeatGridNormalizer.resolveDjGrids(
+                    detectedGrid = loadedGridB.map { it.toFloat() },
+                    analysisBpm = analysisBpmB,
+                    displayBpm = displayBpmB,
+                    durationSec = durB.toFloat()
+                )
 
-            rawGrid1 = dualA.sync.map { it.toDouble() }
-            rawGrid2 = dualB.sync.map { it.toDouble() }
+                rawGrid1 = dualA.sync.map { it.toDouble() }
+                rawGrid2 = dualB.sync.map { it.toDouble() }
+                Log.d("TRANSITION_DEBUG", "9. BeatGridNormalizer success. Final Grid Sizes -> A: ${rawGrid1.size}, B: ${rawGrid2.size}")
+
+            } catch (e: Exception) {
+                Log.e("TRANSITION_DEBUG", "CRITICAL: BeatGridNormalizer crashed", e)
+                return@launch
+            }
 
             // === GRID DIAGNOSTICS ===
-            Log.d("GRID_DEBUG", """
-            === Raw Grid Data ===
-            Track A: ${rawGrid1.size} beats
-            First 5 beats: ${rawGrid1.take(5).map { String.format("%.3f", it) }}
-            Last 5 beats: ${rawGrid1.takeLast(5).map { String.format("%.3f", it) }}
-            
-            Track B: ${rawGrid2.size} beats  
-            First 5 beats: ${rawGrid2.take(5).map { String.format("%.3f", it) }}
-            Last 5 beats: ${rawGrid2.takeLast(5).map { String.format("%.3f", it) }}
-        """.trimIndent())
+            // (Keeping your original debug log here, but adding prefix)
+            Log.d("TRANSITION_DEBUG", "GRID_DEBUG: Track A first 5: ${rawGrid1.take(5)}")
 
-            // Check if intervals are consistent
-            val intervalsA = rawGrid1.zipWithNext { a, b -> b - a }
-            val intervalsB = rawGrid2.zipWithNext { a, b -> b - a }
-
-            val avgIntervalA = intervalsA.average()
-            val avgIntervalB = intervalsB.average()
-            val stdDevA = kotlin.math.sqrt(intervalsA.map { (it - avgIntervalA).let { d -> d * d } }.average())
-            val stdDevB = kotlin.math.sqrt(intervalsB.map { (it - avgIntervalB).let { d -> d * d } }.average())
-
-            Log.d("GRID_DEBUG", """
-            === Grid Interval Statistics ===
-            Track A: avg=${String.format("%.4f", avgIntervalA)}s, stdDev=${String.format("%.4f", stdDevA)}s
-            Track B: avg=${String.format("%.4f", avgIntervalB)}s, stdDev=${String.format("%.4f", stdDevB)}s
-            
-            First 10 intervals A: ${intervalsA.take(10).map { String.format("%.4f", it) }}
-            Last 10 intervals A: ${intervalsA.takeLast(10).map { String.format("%.4f", it) }}
-            
-            First 10 intervals B: ${intervalsB.take(10).map { String.format("%.4f", it) }}
-            Last 10 intervals B: ${intervalsB.takeLast(10).map { String.format("%.4f", it) }}
-        """.trimIndent())
-
-            // 2. Get BPMs for comparison
-            val bpmA = songA?.song?.displayBpm ?: songA?.song?.bpm ?: 120f
-            val bpmB = songB?.song?.displayBpm ?: songB?.song?.bpm ?: 120f
-
-            Log.d("DJ_DEBUG", "Track A BPM: $bpmA, Track B BPM: $bpmB")
-
-            // 3. FIXED: Check if BPMs are close enough to tempo-match
+            // 2. BPM Matching Logic
+            val bpmA = displayBpmA
+            val bpmB = displayBpmB
             val bpmDifference = kotlin.math.abs(bpmA - bpmB)
 
+            Log.d("TRANSITION_DEBUG", "10. Calculating Tempo Match. Diff: $bpmDifference")
+
             if (bpmDifference <= 15f) {
-                // BPMs are close - force Track B to play at Track A's tempo
-                Log.d("DJ_DEBUG", "BPM difference ${bpmDifference} <= 15, tempo-matching to Track A")
-
-                // Speed ratio is simply BPM ratio (no interval calculation needed)
-                initialSpeedB = (bpmB / bpmA).toDouble()
-                trackBGridScalar = 1.0 // No grid scaling needed
-
+                Log.d("TRANSITION_DEBUG", "    Mode: Tempo Sync")
+                initialSpeedB = (bpmA / bpmB).toDouble()
+                trackBGridScalar = 1.0
             } else {
-                // BPMs are too different - use physical interval matching (original logic)
-                Log.d("DJ_DEBUG", "BPM difference ${bpmDifference} > 15, using interval matching")
+                Log.d("TRANSITION_DEBUG", "    Mode: Interval Matching")
+                val avgIntervalA = if (rawGrid1.size > 1) (rawGrid1.last() - rawGrid1.first()) / (rawGrid1.size - 1) else 0.5
+                val avgIntervalB = if (rawGrid2.size > 1) (rawGrid2.last() - rawGrid2.first()) / (rawGrid2.size - 1) else 0.5
+                val rawRatio = if (avgIntervalA > 0 && avgIntervalB > 0) avgIntervalB / avgIntervalA else 1.0
 
-                val avgIntervalA = if (rawGrid1.size > 1)
-                    (rawGrid1.last() - rawGrid1.first()) / (rawGrid1.size - 1) else 0.5
-                val avgIntervalB = if (rawGrid2.size > 1)
-                    (rawGrid2.last() - rawGrid2.first()) / (rawGrid2.size - 1) else 0.5
-
-                val rawRatio = if (avgIntervalA > 0 && avgIntervalB > 0)
-                    avgIntervalB / avgIntervalA else 1.0
-
-                // Handle double/half time
                 val candidates = listOf(0.5, 1.0, 1.5, 2.0, 4.0)
-                val bestMultiplier = candidates.minByOrNull { k ->
-                    kotlin.math.abs(1.0 - (rawRatio / k))
-                } ?: 1.0
+                val bestMultiplier = candidates.minByOrNull { k -> kotlin.math.abs(1.0 - (rawRatio / k)) } ?: 1.0
 
                 trackBGridScalar = bestMultiplier
                 initialSpeedB = rawRatio / bestMultiplier
             }
+            Log.d("TRANSITION_DEBUG", "11. Speed calc done. SpeedB=$initialSpeedB, Scalar=$trackBGridScalar")
 
-            Log.d("DJ_DEBUG", "Final: initialSpeedB=$initialSpeedB, gridScalar=$trackBGridScalar")
-
-            // 4. Waveform Generation (use the grid scalar for visual alignment)
+            // 4. Waveform Generation
             val samplesPerBeat = 64
+            Log.d("TRANSITION_DEBUG", "12. Generating Waveforms...")
+
+            val wfA = loadWaveform(songA?.song?.waveformPath, songAId)
+            val wfB = loadWaveform(songB?.song?.waveformPath, songBId)
+            Log.d("TRANSITION_DEBUG", "    Raw Waveform sizes: A=${wfA.size}, B=${wfB.size}")
+
             _waveformBeatDomain1.value = convertWaveformToBeatDomain(
-                loadWaveform(songA?.song?.waveformPath, songAId),
-                rawGrid1, durA, samplesPerBeat, 1.0
+                wfA, rawGrid1, durA, samplesPerBeat, 1.0
             )
             _waveformBeatDomain2.value = convertWaveformToBeatDomain(
-                loadWaveform(songB?.song?.waveformPath, songBId),
-                rawGrid2, durB, samplesPerBeat, trackBGridScalar
+                wfB, rawGrid2, durB, samplesPerBeat, trackBGridScalar
             )
+            Log.d("TRANSITION_DEBUG", "13. Waveforms converted to Beat Domain. Sizes: ${_waveformBeatDomain1.value.size}, ${_waveformBeatDomain2.value.size}")
 
             updateTransitionDuration()
 
             withContext(Dispatchers.Main) {
+                Log.d("TRANSITION_DEBUG", "14. Switching to Main Thread to setup players")
                 setupPlayers()
+
+                if (songA?.song?.localPath == null) Log.e("TRANSITION_DEBUG", "CRITICAL: Song A Local Path is NULL")
+                if (songB?.song?.localPath == null) Log.e("TRANSITION_DEBUG", "CRITICAL: Song B Local Path is NULL")
+
                 songA?.song?.localPath?.let {
+                    Log.d("TRANSITION_DEBUG", "    Setting MediaItem A: $it")
                     playerA?.setMediaItem(MediaItem.fromUri(Uri.fromFile(File(it))))
                     playerA?.prepare()
                 }
                 songB?.song?.localPath?.let {
+                    Log.d("TRANSITION_DEBUG", "    Setting MediaItem B: $it")
                     playerB?.setMediaItem(MediaItem.fromUri(Uri.fromFile(File(it))))
                     playerB?.prepare()
                 }
+                Log.d("TRANSITION_DEBUG", "15. Players Prepared. loadData COMPLETE.")
             }
         }
     }
 
     // --- Playback Logic ---
     fun togglePlayback() {
-        if (_isPlaying.value) stopPreview() else startPreview()
+        val currentState = _isPlaying.value
+        Log.d("PLAYBACK_DEBUG", "togglePlayback() called. Current state: $currentState")
+        if (currentState) {
+            stopPreview()
+        } else {
+            startPreview()
+        }
     }
 
     private fun startPreview() {
-        val pA = playerA ?: return
-        val pB = playerB ?: return
+        Log.d("PLAYBACK_DEBUG", "startPreview() initiated (Clock-Gated PLL)")
+
+        val pA = playerA
+        val pB = playerB
+        if (pA == null || pB == null) {
+            _isPlaying.value = false
+            return
+        }
+
+        // --- DEBUG LISTENER ---
+        val debugListener = object : androidx.media3.common.Player.Listener {
+            override fun onPlaybackStateChanged(state: Int) {
+                val stateName = when(state) { 1->"IDLE"; 2->"BUFFERING"; 3->"READY"; 4->"ENDED"; else->"UNKNOWN" }
+                Log.d("PLAYBACK_DEBUG", "EVENT: State -> $stateName")
+            }
+            override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
+                Log.e("PLAYBACK_DEBUG", "EVENT: Player Error -> ${error.message}")
+            }
+        }
+        pA.removeListener(debugListener)
+        pA.addListener(debugListener)
+
         val gridA = rawGrid1
         val gridB = rawGrid2
-        if (gridA.isEmpty() || gridB.isEmpty()) return
+        if (gridA.isEmpty() || gridB.isEmpty()) {
+            _isPlaying.value = false
+            return
+        }
 
-        // 1. Initialize EQs
-        if (eqA == null && pA.audioSessionId != 0) {
-            try { eqA = Equalizer(0, pA.audioSessionId).apply { enabled = true } }
-            catch (e: Exception) { Log.e("FX", "EQ A Init Failed", e) }
-        }
-        if (eqB == null && pB.audioSessionId != 0) {
-            try { eqB = Equalizer(0, pB.audioSessionId).apply { enabled = true } }
-            catch (e: Exception) { Log.e("FX", "EQ B Init Failed", e) }
-        }
+        if (eqA == null && pA.audioSessionId != 0) try { eqA = Equalizer(0, pA.audioSessionId).apply { enabled = true } } catch (e: Exception) {}
+        if (eqB == null && pB.audioSessionId != 0) try { eqB = Equalizer(0, pB.audioSessionId).apply { enabled = true } } catch (e: Exception) {}
 
         _isPlaying.value = true
+        playbackJob?.cancel()
 
-        // 2. Setup Anchors
+        // --- Calc Logic ---
         val beatOffsetA = _track1OffsetBeats.value.toDouble()
         val beatOffsetB = _track2OffsetBeats.value.toDouble()
         val zoneFraction = _transitionWidthFraction.value
-        val marginFraction = (1f - zoneFraction) / 2f
         val beatsInZone = (_barsCount.value * 4).toDouble()
+        val marginFraction = (1f - zoneFraction) / 2f
         val visualMarginBeats = if (zoneFraction > 0f) (marginFraction / zoneFraction) * beatsInZone else 0.0
 
         val anchorBeatA = beatOffsetA + visualMarginBeats
@@ -345,153 +446,190 @@ class TransitionEditorViewModel @Inject constructor(
         val timeAnchorA = getTimestampForBeat(gridA, anchorBeatA)
         val timeAnchorB = getTimestampForBeat(gridB, internalBeatB)
 
-        // 3. Set Initial Speeds & Seek
         pA.setPlaybackSpeed(1.0f)
-        pB.setPlaybackSpeed(initialSpeedB.toFloat())
+        val safeSpeedB = if (initialSpeedB.isFinite() && initialSpeedB > 0) initialSpeedB.toFloat() else 1.0f
+        pB.setPlaybackSpeed(safeSpeedB)
 
-        val STABILIZATION_MS = 500L
-        val prerollSeconds = (PRE_ROLL_MS + STABILIZATION_MS) / 1000.0
+        val prerollSeconds = 3.0
         val seekA = (timeAnchorA - prerollSeconds).coerceAtLeast(0.0)
-
         val prerollB = if (trackBGridScalar == 1.0) prerollSeconds else prerollSeconds * initialSpeedB
-        val effectivePrerollB = if (timeAnchorB < prerollB) timeAnchorB * 0.9 else prerollB
-        val seekB = (timeAnchorB - effectivePrerollB).coerceAtLeast(0.0)
+        val seekB_Theoretical = timeAnchorB - prerollB
+        val seekB_Actual = seekB_Theoretical.coerceAtLeast(0.0)
 
-        val actualSeekA = if (effectivePrerollB < prerollB) {
-            val prerollRatio = effectivePrerollB / prerollB
-            (timeAnchorA - (prerollSeconds * prerollRatio)).coerceAtLeast(0.0)
-        } else {
-            seekA
-        }
-
-        pA.seekTo((actualSeekA * 1000).toLong())
-        pB.seekTo((seekB * 1000).toLong())
-
+        // --- START PLAYERS ---
         pA.volume = 0f
         pB.volume = 0f
+
+        pA.setMediaItem(pA.currentMediaItem ?: return)
+        pB.setMediaItem(pB.currentMediaItem ?: return)
+        pA.prepare()
+        pB.prepare()
+
+        pA.seekTo((seekA * 1000).toLong())
+        pB.seekTo((seekB_Actual * 1000).toLong())
 
         pA.play()
         pB.play()
 
-        playbackJob?.cancel()
-
-        // CRITICAL FIX: Run on Main thread to prevent crash.
-        // The arithmetic is fast enough that it won't block the UI.
         playbackJob = viewModelScope.launch(Dispatchers.Main) {
-            val entryBeatA = anchorBeatA
-            val transitionDurationBeats = beatsInZone
-            val unmuteBeatA = getBeatForTimestamp(gridA, actualSeekA + (STABILIZATION_MS / 1000.0))
+            try {
+                val entryBeatA = anchorBeatA
+                val transitionDurationBeats = beatsInZone
+                val unmuteBeatA = getBeatForTimestamp(gridA, seekA + 0.5)
 
-            val bandsA = eqA?.numberOfBands ?: 0.toShort()
-            val bandsB = eqB?.numberOfBands ?: 0.toShort()
-            val minEQ = eqA?.bandLevelRange?.get(0) ?: -1500
+                val bandsA = eqA?.numberOfBands ?: 0.toShort()
+                val bandsB = eqB?.numberOfBands ?: 0.toShort()
+                val minEQ = eqA?.bandLevelRange?.get(0) ?: -1500
 
-            var isLeaderActive = false
-            var lastPosA = -1.0
+                // --- CLOCK LATCH STATE ---
+                // We track the activation of both clocks independently
+                var isClockAActive = false
+                var isClockBActive = false
 
-            var smoothedDrift = 0.0
-            var currentAppliedSpeed = initialSpeedB.toFloat()
+                // Track last position to detect movement
+                var lastPosA = -1.0
+                var lastPosB = -1.0
 
-            while (isActive && _isPlaying.value) {
-                // Safety check inside loop
-                if (playerA == null || playerB == null) break
+                // Time when B actually woke up (for soft start)
+                var clockBStartTime = 0L
 
-                val posA = pA.currentPosition / 1000.0
-                val posB = pB.currentPosition / 1000.0
+                val loopStartTime = System.currentTimeMillis()
 
-                // 1. STARTUP LATCH (Fixes end-of-song sync issue)
-                if (!isLeaderActive) {
-                    if (posA > actualSeekA + 0.05 && posA != lastPosA) {
-                        isLeaderActive = true
+                // PLL State
+                var currentAppliedSpeed = safeSpeedB
 
-                        // Startup Snap
-                        val currentBeatA = getBeatForTimestamp(gridA, posA)
-                        val elapsedBeatsA = currentBeatA - anchorBeatA
+                while (isActive && _isPlaying.value) {
+                    if (playerA == null || playerB == null) break
 
-                        val expectedBeatB = if (trackBGridScalar == 1.0) internalBeatB + elapsedBeatsA
-                        else (beatOffsetB + visualMarginBeats + elapsedBeatsA) / trackBGridScalar
+                    val posA = pA.currentPosition / 1000.0
+                    val posB = pB.currentPosition / 1000.0
 
-                        val expectedTimeB = getTimestampForBeat(gridB, expectedBeatB)
+                    // --- 1. WATCHDOG (Stall Detection) ---
+                    // If either player is stuck "Ready" but not "Playing" for too long, kick it.
+                    if (pA.playbackState == androidx.media3.common.Player.STATE_READY && !pA.isPlaying) pA.play()
+                    if (pB.playbackState == androidx.media3.common.Player.STATE_READY && !pB.isPlaying) pB.play()
 
-                        if (kotlin.math.abs(posB - expectedTimeB) > 0.03) {
-                            pB.seekTo((expectedTimeB * 1000).toLong())
+                    // Safety Timeout: If B hasn't started moving after 1.5s, force a restart
+                    if (!isClockBActive && System.currentTimeMillis() - loopStartTime > 1500) {
+                        Log.w("PLAYBACK_DEBUG", "B clock stalled > 1.5s. Forcing soft restart.")
+                        pB.pause()
+                        pB.play()
+                        // Reset timeout to avoid spamming
+                        // (In a real app, you might want to break or show error after 2-3 tries)
+                    }
+
+                    // --- 2. CLOCK ACTIVATION LATCH ---
+
+                    // Check A
+                    if (!isClockAActive) {
+                        if (posA > lastPosA + 0.001) { // It moved!
+                            isClockAActive = true
+                            Log.d("PLAYBACK_DEBUG", "Clock A Activated at $posA")
                         }
-                    } else {
                         lastPosA = posA
-                        delay(20)
+                    }
+
+                    // Check B
+                    if (!isClockBActive) {
+                        if (posB > lastPosB + 0.001) { // It moved!
+                            isClockBActive = true
+                            clockBStartTime = System.currentTimeMillis()
+                            Log.d("PLAYBACK_DEBUG", "Clock B Activated at $posB")
+                        }
+                        lastPosB = posB
+                    }
+
+                    // --- 3. GATE: Wait for BOTH clocks ---
+                    // Until both engines are physically running, we do NOT touch speed.
+                    if (!isClockAActive || !isClockBActive) {
+                        delay(16) // Wait for next frame
                         continue
                     }
-                }
-                lastPosA = posA
 
-                // 2. DRIFT CALCULATION
-                val currentBeatA = getBeatForTimestamp(gridA, posA)
-                _playbackBeatMarker.value = currentBeatA.toFloat()
+                    // --- 4. MIXER LOGIC (Calculations) ---
+                    val currentBeatA = getBeatForTimestamp(gridA, posA)
+                    _playbackBeatMarker.value = currentBeatA.toFloat()
 
-                val elapsedBeatsA = currentBeatA - anchorBeatA
-                val targetBeatB_internal = if (trackBGridScalar == 1.0) internalBeatB + elapsedBeatsA
-                else (beatOffsetB + visualMarginBeats + elapsedBeatsA) / trackBGridScalar
+                    val progress = if (transitionDurationBeats > 0)
+                        ((currentBeatA - entryBeatA) / transitionDurationBeats).toFloat()
+                    else 0f
 
-                val targetTimeB = getTimestampForBeat(gridB, targetBeatB_internal)
-                val rawDrift = posB - targetTimeB
+                    var volA = 0f
+                    var volB = 0f
 
-                // Low-pass filter to ignore single-frame jitter
-                smoothedDrift = (smoothedDrift * 0.7) + (rawDrift * 0.3)
-
-                // 3. SPEED THROTTLING (Fixes choppy audio)
-                val newSpeed = when {
-                    kotlin.math.abs(smoothedDrift) > 0.100 -> {
-                        // Drift > 100ms: Hard Sync
-                        pB.seekTo((targetTimeB * 1000).toLong())
-                        smoothedDrift = 0.0
-                        initialSpeedB.toFloat()
+                    if (progress < 0f) {
+                        volA = if (currentBeatA >= unmuteBeatA) 1f else 0f
+                        volB = 0f
+                        resetEQ(eqA); resetEQ(eqB)
+                    } else if (progress <= 1f) {
+                        val stateA = TransitionMixer.getMixState("A", progress, _overlapMode.value, _eqMode.value, _effectMode.value)
+                        val stateB = TransitionMixer.getMixState("B", progress, _overlapMode.value, _eqMode.value, _effectMode.value)
+                        volA = stateA.volume
+                        volB = stateB.volume
+                        applyDeckStateToEQ(eqA, stateA, minEQ, bandsA, _effectMode.value)
+                        applyDeckStateToEQ(eqB, stateB, minEQ, bandsB, _effectMode.value)
+                    } else {
+                        volA = 0f
+                        volB = 1f
+                        resetEQ(eqB)
                     }
-                    kotlin.math.abs(smoothedDrift) > 0.010 -> {
-                        // Drift > 10ms: Soft Correction
-                        val correction = (-smoothedDrift * 0.08).coerceIn(-0.05, 0.05)
-                        (initialSpeedB + correction).toFloat()
+
+                    pA.volume = volA
+                    pB.volume = volB
+
+                    // =========================================================
+                    // PLL SYNC LOGIC (Gated & Soft-Started)
+                    // =========================================================
+
+                    val elapsedBeatsA = currentBeatA - anchorBeatA
+                    val targetBeatB = if (trackBGridScalar == 1.0) internalBeatB + elapsedBeatsA
+                    else (beatOffsetB + visualMarginBeats + elapsedBeatsA) / trackBGridScalar
+                    val currentBeatB = getBeatForTimestamp(gridB, posB)
+
+                    // Wrap Phase Error (-0.5 to +0.5)
+                    var phaseError = (targetBeatB - currentBeatB).toFloat()
+                    while (phaseError > 0.5f) phaseError -= 1f
+                    while (phaseError < -0.5f) phaseError += 1f
+
+                    // Gain Scheduling
+                    val mix = volB.coerceIn(0f, 1f)
+                    val baseKp = 0.03f + (0.60f - 0.03f) * (1f - mix)
+                    val maxAdjust = 0.015f + (0.12f - 0.015f) * (1f - mix)
+
+                    // Warmup Boost (Still useful for first 250ms of *active* clock)
+                    val warmupFactor = if (System.currentTimeMillis() - clockBStartTime < 250) 1.4f else 1f
+
+                    // SOFT START: Ramp up correction power over first 150ms of audio
+                    // This prevents "Jerk" if the first clock tick was erratic
+                    val clockStabilizationTime = System.currentTimeMillis() - clockBStartTime
+                    val clockGain = (clockStabilizationTime / 150f).coerceIn(0f, 1f)
+
+                    val effectiveKp = baseKp * warmupFactor * clockGain
+
+                    // Soft Saturation Shaping
+                    val shapedError = phaseError / (1f + kotlin.math.abs(phaseError) * 4f)
+
+                    val correction = (shapedError * effectiveKp).coerceIn(-maxAdjust, maxAdjust)
+                    val newSpeed = (safeSpeedB + correction).coerceIn(0.5f, 2.0f)
+
+                    if (kotlin.math.abs(newSpeed - currentAppliedSpeed) > 0.001f) {
+                        pB.setPlaybackSpeed(newSpeed)
+                        currentAppliedSpeed = newSpeed
                     }
-                    else -> initialSpeedB.toFloat()
+
+                    delay(33)
                 }
-
-                // DEAD BAND: Only update ExoPlayer if speed changed by > 0.2%
-                // This prevents the audio engine from stuttering due to constant updates
-                if (kotlin.math.abs(newSpeed - currentAppliedSpeed) > 0.002f) {
-                    pB.setPlaybackSpeed(newSpeed)
-                    currentAppliedSpeed = newSpeed
+            } catch (e: Exception) {
+                if (e !is CancellationException) {
+                    Log.e("PLAYBACK_DEBUG", "Error", e)
+                    _isPlaying.value = false
                 }
-
-                // 4. MIXER AUTOMATION
-                val progress = if (transitionDurationBeats > 0)
-                    ((currentBeatA - entryBeatA) / transitionDurationBeats).toFloat()
-                else 0f
-
-                if (progress < 0f) {
-                    pA.volume = if (currentBeatA >= unmuteBeatA) 1f else 0f
-                    pB.volume = 0f
-                    resetEQ(eqA); resetEQ(eqB)
-                } else if (progress <= 1f) {
-                    val stateA = TransitionMixer.getMixState("A", progress, _overlapMode.value, _eqMode.value, _effectMode.value)
-                    val stateB = TransitionMixer.getMixState("B", progress, _overlapMode.value, _eqMode.value, _effectMode.value)
-
-                    pA.volume = stateA.volume
-                    pB.volume = stateB.volume
-
-                    applyDeckStateToEQ(eqA, stateA, minEQ, bandsA, _effectMode.value)
-                    applyDeckStateToEQ(eqB, stateB, minEQ, bandsB, _effectMode.value)
-                } else {
-                    pA.volume = 0f
-                    pB.volume = 1f
-                    resetEQ(eqB)
-                }
-
-                // Update roughly 30 times a second
-                delay(33)
             }
         }
     }
 
     private fun stopPreview() {
+        Log.d("PLAYBACK_DEBUG", "stopPreview() called")
         _isPlaying.value = false
         playerA?.pause()
         playerB?.pause()
@@ -503,6 +641,7 @@ class TransitionEditorViewModel @Inject constructor(
         resetEQ(eqB)
         playbackJob?.cancel()
         _playbackBeatMarker.value = null
+        Log.d("PLAYBACK_DEBUG", "Players paused and reset")
     }
 
     private fun resetEQ(eq: Equalizer?) {

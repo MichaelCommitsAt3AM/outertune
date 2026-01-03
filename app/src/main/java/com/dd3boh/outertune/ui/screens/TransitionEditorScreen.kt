@@ -50,9 +50,20 @@ fun TransitionEditorScreen(
     onSave: () -> Unit = {},
     viewModel: TransitionEditorViewModel = hiltViewModel()
 ) {
-    // Load tracks when IDs change
+    val context = androidx.compose.ui.platform.LocalContext.current
+
+    // --- Load Data--
     LaunchedEffect(songAId, songBId) {
-        viewModel.loadData(songAId, songBId)
+        if (songAId.isNotEmpty() && songBId.isNotEmpty()) {
+            viewModel.loadData(songAId, songBId)
+        }
+    }
+
+    // Listen for errors
+    LaunchedEffect(Unit) {
+        viewModel.errorMessage.collect { message ->
+            android.widget.Toast.makeText(context, message, android.widget.Toast.LENGTH_LONG).show()
+        }
     }
 
     // Collect state from ViewModel

@@ -169,9 +169,10 @@ fun BottomSheetPlayer(
     val context = LocalContext.current
 
     val playbackState by playerConnection.playbackState.collectAsState()
+    val logicalState by playerConnection.logicalState.collectAsState()
+    val mediaMetadata = logicalState.activeMetadata ?: playerConnection.mediaMetadata.collectAsState().value
     val isPlaying by playerConnection.isPlaying.collectAsState()
     val repeatMode by playerConnection.repeatMode.collectAsState()
-    val mediaMetadata by playerConnection.mediaMetadata.collectAsState()
     val currentSong by playerConnection.currentSong.collectAsState(initial = null)
 
     val canSkipPrevious by playerConnection.canSkipPrevious.collectAsState()
@@ -222,12 +223,17 @@ fun BottomSheetPlayer(
 
     val showLyrics by rememberPreference(ShowLyricsKey, defaultValue = false)
 
-    var position by rememberSaveable(playbackState) {
-        mutableLongStateOf(playerConnection.player.currentPosition)
-    }
-    var duration by rememberSaveable(playbackState) {
-        mutableLongStateOf(playerConnection.player.duration)
-    }
+//    var position by rememberSaveable(playbackState) {
+//        mutableLongStateOf(playerConnection.player.currentPosition)
+//    }
+//    var duration by rememberSaveable(playbackState) {
+//        mutableLongStateOf(playerConnection.player.duration)
+//    }
+
+
+    val position = logicalState.currentPositionMs
+    val duration = logicalState.durationMs
+
     var sliderPosition by remember {
         mutableStateOf<Long?>(null)
     }
@@ -252,16 +258,6 @@ fun BottomSheetPlayer(
             val bitmap = result.image?.toBitmap()?.extractGradientColors()
             bitmap?.let {
                 gradientColors = it
-            }
-        }
-    }
-
-    LaunchedEffect(playbackState) {
-        if (playbackState == STATE_READY) {
-            while (isActive) {
-                delay(500)
-                position = playerConnection.player.currentPosition
-                duration = playerConnection.player.duration
             }
         }
     }
@@ -502,16 +498,16 @@ fun BottomSheetPlayer(
 
                 Slider(
                     value = (sliderPosition ?: position).toFloat(),
-                    valueRange = 0f..(if (duration == C.TIME_UNSET) 0f else duration.toFloat()),
+                    // Ensure duration is at least 1 to prevent crash
+                    valueRange = 0f..(if (duration <= 0) 1f else duration.toFloat()),
                     onValueChange = {
                         sliderPosition = it.toLong()
-                        // slider too granular for this haptic to feel right
-//                    haptic.performHapticFeedback(HapticFeedbackType.SegmentFrequentTick)
                     },
                     onValueChangeFinished = {
-                        sliderPosition?.let {
-                            playerConnection.player.seekTo(it)
-                            position = it
+                        sliderPosition?.let { targetMs ->
+                            // --- NEW: Use Logical Seek ---
+                            playerConnection.seekToLogical(targetMs)
+                            // -----------------------------
                         }
                         sliderPosition = null
                         haptic.performHapticFeedback(HapticFeedbackType.Confirm)
