@@ -183,6 +183,7 @@ class TransitionPlaybackEngine(
         var clockBStartTime = 0L
         var currentAppliedSpeed = plan.initialSpeedB.toFloat()
         var hasSeekOccurred = false
+        var isAligned = false
 
         val loopStartTime = System.currentTimeMillis()
 
@@ -229,24 +230,48 @@ class TransitionPlaybackEngine(
             val targetBeatB = plan.anchorBeatB + elapsedBeatsA
             val currentBeatB = TransitionMath.getBeatForTimestamp(plan.gridB, posB)
 
-            // 4. Phase Error
+// 4. Phase Error (with conditional wrapping)
             var phaseErrorBeats = targetBeatB - currentBeatB
-            while (phaseErrorBeats > 0.5) phaseErrorBeats -= 1.0
-            while (phaseErrorBeats < -0.5) phaseErrorBeats += 1.0
 
-            _playbackState.value = PlaybackState(true, currentBeatA.toFloat(), currentBeatB.toFloat(), phaseErrorBeats.toFloat())
-
-            // 5. Muted Preroll Seek Correction
+// CRITICAL FIX: Only wrap phase during active PLL, not during preroll
             val isInPreroll = currentBeatA < transitionStartBeatA
-            if (isInPreroll && !hasSeekOccurred) {
-                if (abs(phaseErrorBeats) > PHASE_ERROR_THRESHOLD) {
+            if (!isInPreroll && hasSeekOccurred) {
+                // Wrap phase error to [-0.5, 0.5] range for PLL stability
+                while (phaseErrorBeats > 0.5) phaseErrorBeats -= 1.0
+                while (phaseErrorBeats < -0.5) phaseErrorBeats += 1.0
+            }
+
+            _playbackState.value = PlaybackState(
+                true,
+                currentBeatA.toFloat(),
+                currentBeatB.toFloat(),
+                phaseErrorBeats.toFloat()
+            )
+
+// 5. Aggressive Preroll Correction - Multiple seeks allowed until aligned
+            if (isInPreroll) {
+                // More aggressive threshold during preroll
+                val prerollThreshold = 0.15 // Tighter than normal operation
+
+                if (abs(phaseErrorBeats) > prerollThreshold) {
                     val correctedTimeB = TransitionMath.getTimestampForBeat(plan.gridB, targetBeatB)
                     pB.seekTo((correctedTimeB * 1000).toLong())
-                    hasSeekOccurred = true
+
+                    // Reset speed after seek
                     currentAppliedSpeed = plan.initialSpeedB.toFloat()
                     pB.setPlaybackSpeed(currentAppliedSpeed)
-                    delay(50)
+                    isAligned = false // Reset alignment flag
+
+                    Log.d(TAG, "Preroll correction: error=$phaseErrorBeats beats, seekTo=${correctedTimeB}s")
+                    delay(50) // Allow seek to settle
                     continue
+                } else {
+                    // Mark as aligned when error is consistently small
+                    if (!isAligned && abs(phaseErrorBeats) < 0.08) {
+                        isAligned = true
+                        hasSeekOccurred = true
+                        Log.d(TAG, "Preroll lock achieved: error=$phaseErrorBeats beats")
+                    }
                 }
             }
 
