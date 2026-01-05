@@ -8,12 +8,10 @@ import com.dd3boh.outertune.db.entities.Song
 import com.dd3boh.outertune.db.entities.TransitionEntity
 import com.dd3boh.outertune.transition.editor.EditorArtifacts
 import com.dd3boh.outertune.transition.editor.TransitionEditorEngine
-import com.dd3boh.outertune.transition.editor.BeatSample
 import com.dd3boh.outertune.transition.math.TransitionMath
 import com.dd3boh.outertune.transition.model.TransitionConfig
 import com.dd3boh.outertune.transition.model.TransitionPlan
 import com.dd3boh.outertune.transition.playback.TransitionPlaybackEngine
-import com.dd3boh.outertune.ui.component.BeatGridMarker
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
@@ -28,15 +26,10 @@ class TransitionEditorViewModel @Inject constructor(
     @ApplicationContext private val context: Context
 ) : ViewModel() {
 
-    // --- Engines ---
-    // In a real app, these should be Singletons injected via Hilt.
-    // For this refactor, we instantiate them here to ensure they share the scope/context correctly.
     private val editorEngine = TransitionEditorEngine(context, database)
     private val playbackEngine = TransitionPlaybackEngine(context)
 
     // --- UI State ---
-
-    // 1. Editor Data (Waveforms, Markers, Songs)
     private val _editorArtifacts = MutableStateFlow<EditorArtifacts?>(null)
     val track1 = _editorArtifacts.map { it?.track1 }.stateIn(viewModelScope, SharingStarted.Lazily, null)
     val track2 = _editorArtifacts.map { it?.track2 }.stateIn(viewModelScope, SharingStarted.Lazily, null)
@@ -49,16 +42,16 @@ class TransitionEditorViewModel @Inject constructor(
     val beatMarkers = _editorArtifacts.map { it?.beatMarkers ?: emptyList() }
         .stateIn(viewModelScope, SharingStarted.Lazily, emptyList())
 
-    // 2. Playback State (Bridged from Engine)
     val isPlaying = playbackEngine.playbackState.map { it.isPlaying }
         .stateIn(viewModelScope, SharingStarted.Lazily, false)
 
-    // Scrubber position (0.0 = Anchor Point)
     val playbackBeatMarker = playbackEngine.playbackState.map { state ->
         if (state.isPlaying) state.currentBeatA else null
     }.stateIn(viewModelScope, SharingStarted.Lazily, null)
 
-    // 3. Configuration State (User Inputs)
+    // Expose Decks Ready state to UI (optional, can be used to disable Play button)
+    val areDecksReady = playbackEngine.decksReady.stateIn(viewModelScope, SharingStarted.Lazily, false)
+
     private val _config = MutableStateFlow(TransitionConfig())
     val barsCount = _config.map { it.barsCount }.stateIn(viewModelScope, SharingStarted.Lazily, 4)
     val transitionWidthFraction = _config.map { it.widthFraction }.stateIn(viewModelScope, SharingStarted.Lazily, 0.75f)
@@ -66,7 +59,6 @@ class TransitionEditorViewModel @Inject constructor(
     val eqMode = _config.map { it.eqMode }.stateIn(viewModelScope, SharingStarted.Lazily, "None")
     val effectMode = _config.map { it.effectMode }.stateIn(viewModelScope, SharingStarted.Lazily, "None")
 
-    // 4. Viewport State (Scroll Offsets)
     private val _track1OffsetBeats = MutableStateFlow(0.0)
     val track1OffsetBeats = _track1OffsetBeats.map { it.toFloat() }.stateIn(viewModelScope, SharingStarted.Lazily, 0f)
 
@@ -82,27 +74,23 @@ class TransitionEditorViewModel @Inject constructor(
 
     fun loadData(songAId: String, songBId: String) {
         viewModelScope.launch {
-            // 1. Heavy Lift (Offloaded to Engine)
             val artifacts = editorEngine.loadArtifacts(songAId, songBId)
             _editorArtifacts.value = artifacts
 
-            // 2. Prepare Audio (Offloaded to Engine)
             if (artifacts != null) {
-                // Ensure paths are valid before preparing
                 val pathA = artifacts.track1.song.localPath
                 val pathB = artifacts.track2.song.localPath
+
                 if (pathA != null && pathB != null) {
-                    playbackEngine.prepare(pathA, pathB)
+                    playbackEngine.prewarmDecks(pathA, pathB)
                 }
 
-                // Recalculate zoom based on loaded config
                 recalculateZoom()
             }
         }
     }
 
     // --- User Actions ---
-
     fun setOverlapMode(mode: String) { updateConfig { it.copy(overlapMode = mode) } }
     fun setEqMode(mode: String) { updateConfig { it.copy(eqMode = mode) } }
     fun setEffectMode(mode: String) { updateConfig { it.copy(effectMode = mode) } }
@@ -133,20 +121,20 @@ class TransitionEditorViewModel @Inject constructor(
         if (isPlaying.value) {
             playbackEngine.stop()
         } else {
+            // Guard: Ensure decks are hot (Recommendation 1)
+            if (!playbackEngine.decksReady.value) return
+
             val plan = calculateCurrentPlan() ?: return
             playbackEngine.play(plan, _config.value)
         }
     }
 
     // --- Save Logic ---
-
     fun saveTransition(onComplete: () -> Unit) {
         viewModelScope.launch(Dispatchers.IO) {
             val plan = calculateCurrentPlan() ?: return@launch
             val artifacts = _editorArtifacts.value ?: return@launch
 
-            // Create Entity from the deterministic Plan
-            // The Plan guarantees that plan.exitPointMs == what was heard in preview
             val transition = TransitionEntity(
                 fromSongId = artifacts.track1.id,
                 toSongId = artifacts.track2.id,
@@ -174,7 +162,6 @@ class TransitionEditorViewModel @Inject constructor(
     private fun updateConfig(update: (TransitionConfig) -> TransitionConfig) {
         val newConfig = update(_config.value)
         _config.value = newConfig
-        // If playing, live-update parameters (e.g. switching EQ mode while listening)
         if (isPlaying.value) {
             playbackEngine.updateConfig(newConfig)
         }
@@ -187,9 +174,6 @@ class TransitionEditorViewModel @Inject constructor(
         _pixelsPerBeatBase.value = (zoneWidth / totalBeats).coerceAtLeast(4f)
     }
 
-    /**
-     * Bridges the UI State + Editor Artifacts -> Pure Math Engine
-     */
     private fun calculateCurrentPlan(): TransitionPlan? {
         val artifacts = _editorArtifacts.value ?: return null
 
