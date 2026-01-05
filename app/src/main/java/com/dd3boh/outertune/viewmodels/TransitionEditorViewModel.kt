@@ -396,7 +396,7 @@ class TransitionEditorViewModel @Inject constructor(
     }
 
     private fun startPreview() {
-        Log.d("PLAYBACK_DEBUG", "startPreview() initiated (Clock-Gated PLL)")
+        Log.d("PLAYBACK_DEBUG", "startPreview() initiated (Muted Preroll + Perfect Sync)")
 
         val pA = playerA
         val pB = playerB
@@ -405,19 +405,6 @@ class TransitionEditorViewModel @Inject constructor(
             return
         }
 
-        // --- DEBUG LISTENER ---
-        val debugListener = object : androidx.media3.common.Player.Listener {
-            override fun onPlaybackStateChanged(state: Int) {
-                val stateName = when(state) { 1->"IDLE"; 2->"BUFFERING"; 3->"READY"; 4->"ENDED"; else->"UNKNOWN" }
-                Log.d("PLAYBACK_DEBUG", "EVENT: State -> $stateName")
-            }
-            override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
-                Log.e("PLAYBACK_DEBUG", "EVENT: Player Error -> ${error.message}")
-            }
-        }
-        pA.removeListener(debugListener)
-        pA.addListener(debugListener)
-
         val gridA = rawGrid1
         val gridB = rawGrid2
         if (gridA.isEmpty() || gridB.isEmpty()) {
@@ -425,13 +412,18 @@ class TransitionEditorViewModel @Inject constructor(
             return
         }
 
-        if (eqA == null && pA.audioSessionId != 0) try { eqA = Equalizer(0, pA.audioSessionId).apply { enabled = true } } catch (e: Exception) {}
-        if (eqB == null && pB.audioSessionId != 0) try { eqB = Equalizer(0, pB.audioSessionId).apply { enabled = true } } catch (e: Exception) {}
+        // Initialize EQ if not already done
+        if (eqA == null && pA.audioSessionId != 0) {
+            try { eqA = Equalizer(0, pA.audioSessionId).apply { enabled = true } } catch (e: Exception) {}
+        }
+        if (eqB == null && pB.audioSessionId != 0) {
+            try { eqB = Equalizer(0, pB.audioSessionId).apply { enabled = true } } catch (e: Exception) {}
+        }
 
         _isPlaying.value = true
         playbackJob?.cancel()
 
-        // --- Calc Logic ---
+        // --- Calculate Transition Zone Boundaries ---
         val beatOffsetA = _track1OffsetBeats.value.toDouble()
         val beatOffsetB = _track2OffsetBeats.value.toDouble()
         val zoneFraction = _transitionWidthFraction.value
@@ -439,6 +431,7 @@ class TransitionEditorViewModel @Inject constructor(
         val marginFraction = (1f - zoneFraction) / 2f
         val visualMarginBeats = if (zoneFraction > 0f) (marginFraction / zoneFraction) * beatsInZone else 0.0
 
+        // Anchor beat is where the transition zone (green box) starts
         val anchorBeatA = beatOffsetA + visualMarginBeats
         val internalBeatB = if (trackBGridScalar == 1.0) beatOffsetB + visualMarginBeats
         else (beatOffsetB + visualMarginBeats) / trackBGridScalar
@@ -446,19 +439,23 @@ class TransitionEditorViewModel @Inject constructor(
         val timeAnchorA = getTimestampForBeat(gridA, anchorBeatA)
         val timeAnchorB = getTimestampForBeat(gridB, internalBeatB)
 
+        // --- Preroll Configuration ---
+        val prerollSeconds = 3.0 // Track B starts muted 3 seconds early
+        val phaseErrorThreshold = 0.5 // Seek if error exceeds 0.5 beats (in beats)
+
+        // Set initial playback speeds
         pA.setPlaybackSpeed(1.0f)
         val safeSpeedB = if (initialSpeedB.isFinite() && initialSpeedB > 0) initialSpeedB.toFloat() else 1.0f
         pB.setPlaybackSpeed(safeSpeedB)
 
-        val prerollSeconds = 3.0
+        // Calculate seek positions
         val seekA = (timeAnchorA - prerollSeconds).coerceAtLeast(0.0)
         val prerollB = if (trackBGridScalar == 1.0) prerollSeconds else prerollSeconds * initialSpeedB
-        val seekB_Theoretical = timeAnchorB - prerollB
-        val seekB_Actual = seekB_Theoretical.coerceAtLeast(0.0)
+        val seekB = (timeAnchorB - prerollB).coerceAtLeast(0.0)
 
-        // --- START PLAYERS ---
+        // --- Prepare and Start Players ---
         pA.volume = 0f
-        pB.volume = 0f
+        pB.volume = 0f // Track B starts muted
 
         pA.setMediaItem(pA.currentMediaItem ?: return)
         pB.setMediaItem(pB.currentMediaItem ?: return)
@@ -466,37 +463,35 @@ class TransitionEditorViewModel @Inject constructor(
         pB.prepare()
 
         pA.seekTo((seekA * 1000).toLong())
-        pB.seekTo((seekB_Actual * 1000).toLong())
+        pB.seekTo((seekB * 1000).toLong())
 
         pA.play()
         pB.play()
 
         playbackJob = viewModelScope.launch(Dispatchers.Main) {
             try {
-                val entryBeatA = anchorBeatA
                 val transitionDurationBeats = beatsInZone
-                val unmuteBeatA = getBeatForTimestamp(gridA, seekA + 0.5)
+                val transitionStartBeatA = anchorBeatA // When to unmute track B
+                val unmuteBeatA = getBeatForTimestamp(gridA, seekA + 0.5) // When to unmute track A
 
                 val bandsA = eqA?.numberOfBands ?: 0.toShort()
                 val bandsB = eqB?.numberOfBands ?: 0.toShort()
                 val minEQ = eqA?.bandLevelRange?.get(0) ?: -1500
 
-                // --- CLOCK LATCH STATE ---
-                // We track the activation of both clocks independently
+                // --- Clock Activation State ---
                 var isClockAActive = false
                 var isClockBActive = false
-
-                // Track last position to detect movement
                 var lastPosA = -1.0
                 var lastPosB = -1.0
-
-                // Time when B actually woke up (for soft start)
                 var clockBStartTime = 0L
 
                 val loopStartTime = System.currentTimeMillis()
 
                 // PLL State
                 var currentAppliedSpeed = safeSpeedB
+                var hasSeekOccurred = false // Track if we've already sought during preroll
+
+                Log.d("PLAYBACK_DEBUG", "Preroll: B starts at ${seekB}s, transition zone at ${timeAnchorA}s")
 
                 while (isActive && _isPlaying.value) {
                     if (playerA == null || playerB == null) break
@@ -504,71 +499,110 @@ class TransitionEditorViewModel @Inject constructor(
                     val posA = pA.currentPosition / 1000.0
                     val posB = pB.currentPosition / 1000.0
 
-                    // --- 1. WATCHDOG (Stall Detection) ---
-                    // If either player is stuck "Ready" but not "Playing" for too long, kick it.
+                    // --- 1. Watchdog (Stall Detection) ---
                     if (pA.playbackState == androidx.media3.common.Player.STATE_READY && !pA.isPlaying) pA.play()
                     if (pB.playbackState == androidx.media3.common.Player.STATE_READY && !pB.isPlaying) pB.play()
 
-                    // Safety Timeout: If B hasn't started moving after 1.5s, force a restart
+                    // Safety timeout for B
                     if (!isClockBActive && System.currentTimeMillis() - loopStartTime > 1500) {
-                        Log.w("PLAYBACK_DEBUG", "B clock stalled > 1.5s. Forcing soft restart.")
+                        Log.w("PLAYBACK_DEBUG", "B clock stalled > 1.5s. Forcing restart.")
                         pB.pause()
                         pB.play()
-                        // Reset timeout to avoid spamming
-                        // (In a real app, you might want to break or show error after 2-3 tries)
                     }
 
-                    // --- 2. CLOCK ACTIVATION LATCH ---
-
-                    // Check A
+                    // --- 2. Clock Activation Detection ---
                     if (!isClockAActive) {
-                        if (posA > lastPosA + 0.001) { // It moved!
+                        if (posA > lastPosA + 0.001) {
                             isClockAActive = true
-                            Log.d("PLAYBACK_DEBUG", "Clock A Activated at $posA")
+                            Log.d("PLAYBACK_DEBUG", "Clock A Activated at ${posA}s")
                         }
                         lastPosA = posA
                     }
 
-                    // Check B
                     if (!isClockBActive) {
-                        if (posB > lastPosB + 0.001) { // It moved!
+                        if (posB > lastPosB + 0.001) {
                             isClockBActive = true
                             clockBStartTime = System.currentTimeMillis()
-                            Log.d("PLAYBACK_DEBUG", "Clock B Activated at $posB")
+                            Log.d("PLAYBACK_DEBUG", "Clock B Activated at ${posB}s")
                         }
                         lastPosB = posB
                     }
 
-                    // --- 3. GATE: Wait for BOTH clocks ---
-                    // Until both engines are physically running, we do NOT touch speed.
+                    // Gate: Wait for both clocks to start
                     if (!isClockAActive || !isClockBActive) {
-                        delay(16) // Wait for next frame
+                        delay(16)
                         continue
                     }
 
-                    // --- 4. MIXER LOGIC (Calculations) ---
+                    // --- 3. Phase Error Calculation ---
                     val currentBeatA = getBeatForTimestamp(gridA, posA)
                     _playbackBeatMarker.value = currentBeatA.toFloat()
 
+                    // Calculate where track B should be in its timeline
+                    val elapsedBeatsA = currentBeatA - anchorBeatA
+                    val targetBeatB = if (trackBGridScalar == 1.0) internalBeatB + elapsedBeatsA
+                    else (beatOffsetB + visualMarginBeats + elapsedBeatsA) / trackBGridScalar
+                    val currentBeatB = getBeatForTimestamp(gridB, posB)
+
+                    // Wrapped phase error in beats
+                    var phaseErrorBeats = targetBeatB - currentBeatB
+                    while (phaseErrorBeats > 0.5) phaseErrorBeats -= 1.0
+                    while (phaseErrorBeats < -0.5) phaseErrorBeats += 1.0
+
+                    // --- 4. Muted Preroll & Optional Seek ---
+                    val isInPreroll = currentBeatA < transitionStartBeatA
+
+                    if (isInPreroll && !hasSeekOccurred) {
+                        // During muted preroll, check if we need an instant seek
+                        if (abs(phaseErrorBeats) > phaseErrorThreshold) {
+                            Log.d("PLAYBACK_DEBUG", "Muted preroll: Large phase error ${phaseErrorBeats} beats detected. Seeking B.")
+
+                            // Calculate correct timestamp for track B
+                            val correctedTimeB = getTimestampForBeat(gridB, targetBeatB)
+                            val seekTargetMs = (correctedTimeB * 1000).toLong().coerceAtLeast(0)
+
+                            // Perform instant seek while muted
+                            pB.seekTo(seekTargetMs)
+                            hasSeekOccurred = true // Only seek once during preroll
+
+                            Log.d("PLAYBACK_DEBUG", "Seeked B to ${correctedTimeB}s (${targetBeatB} beats)")
+
+                            // Reset PLL state after seek
+                            currentAppliedSpeed = safeSpeedB
+                            pB.setPlaybackSpeed(safeSpeedB)
+
+                            delay(50) // Brief stabilization delay after seek
+                            continue
+                        }
+                    }
+
+                    // --- 5. Mixer Logic (Volume & EQ) ---
                     val progress = if (transitionDurationBeats > 0)
-                        ((currentBeatA - entryBeatA) / transitionDurationBeats).toFloat()
+                        ((currentBeatA - transitionStartBeatA) / transitionDurationBeats).toFloat()
                     else 0f
 
                     var volA = 0f
                     var volB = 0f
 
                     if (progress < 0f) {
+                        // Preroll phase: A audible if past unmute point, B stays muted
                         volA = if (currentBeatA >= unmuteBeatA) 1f else 0f
-                        volB = 0f
+                        volB = 0f // Track B remains muted during preroll
                         resetEQ(eqA); resetEQ(eqB)
                     } else if (progress <= 1f) {
+                        // Unmute at transition: Crossfade begins
                         val stateA = TransitionMixer.getMixState("A", progress, _overlapMode.value, _eqMode.value, _effectMode.value)
                         val stateB = TransitionMixer.getMixState("B", progress, _overlapMode.value, _eqMode.value, _effectMode.value)
                         volA = stateA.volume
-                        volB = stateB.volume
+                        volB = stateB.volume // Track B unmutes here (at progress = 0)
                         applyDeckStateToEQ(eqA, stateA, minEQ, bandsA, _effectMode.value)
                         applyDeckStateToEQ(eqB, stateB, minEQ, bandsB, _effectMode.value)
+
+                        if (progress == 0f) {
+                            Log.d("PLAYBACK_DEBUG", "Unmute at transition zone: Phase error = ${phaseErrorBeats} beats")
+                        }
                     } else {
+                        // Post-transition: Only B plays
                         volA = 0f
                         volB = 1f
                         resetEQ(eqB)
@@ -577,51 +611,41 @@ class TransitionEditorViewModel @Inject constructor(
                     pA.volume = volA
                     pB.volume = volB
 
-                    // =========================================================
-                    // PLL SYNC LOGIC (Gated & Soft-Started)
-                    // =========================================================
+                    // --- 6. Soft PLL Adjustment Loop ---
+                    // Continuous speed adjustment runs even during muted preroll
 
-                    val elapsedBeatsA = currentBeatA - anchorBeatA
-                    val targetBeatB = if (trackBGridScalar == 1.0) internalBeatB + elapsedBeatsA
-                    else (beatOffsetB + visualMarginBeats + elapsedBeatsA) / trackBGridScalar
-                    val currentBeatB = getBeatForTimestamp(gridB, posB)
-
-                    // Wrap Phase Error (-0.5 to +0.5)
-                    var phaseError = (targetBeatB - currentBeatB).toFloat()
-                    while (phaseError > 0.5f) phaseError -= 1f
-                    while (phaseError < -0.5f) phaseError += 1f
-
-                    // Gain Scheduling
+                    // Adaptive gain scheduling based on mix state
                     val mix = volB.coerceIn(0f, 1f)
                     val baseKp = 0.03f + (0.60f - 0.03f) * (1f - mix)
                     val maxAdjust = 0.015f + (0.12f - 0.015f) * (1f - mix)
 
-                    // Warmup Boost (Still useful for first 250ms of *active* clock)
+                    // Warmup boost for first 250ms of active playback
                     val warmupFactor = if (System.currentTimeMillis() - clockBStartTime < 250) 1.4f else 1f
 
-                    // SOFT START: Ramp up correction power over first 150ms of audio
-                    // This prevents "Jerk" if the first clock tick was erratic
+                    // Soft start: Ramp up correction power over first 150ms
                     val clockStabilizationTime = System.currentTimeMillis() - clockBStartTime
                     val clockGain = (clockStabilizationTime / 150f).coerceIn(0f, 1f)
 
                     val effectiveKp = baseKp * warmupFactor * clockGain
 
-                    // Soft Saturation Shaping
-                    val shapedError = phaseError / (1f + kotlin.math.abs(phaseError) * 4f)
+                    // Soft saturation to prevent overcorrection
+                    val shapedError = phaseErrorBeats.toFloat() / (1f + abs(phaseErrorBeats.toFloat()) * 4f)
 
+                    // Calculate speed correction
                     val correction = (shapedError * effectiveKp).coerceIn(-maxAdjust, maxAdjust)
-                    val newSpeed = (safeSpeedB + correction).coerceIn(0.5f, 2.0f)
+                    val newSpeed = (safeSpeedB + correction).coerceIn(0.5f, 2.0f) // Clamped for safety
 
-                    if (kotlin.math.abs(newSpeed - currentAppliedSpeed) > 0.001f) {
+                    // Apply speed change if significant
+                    if (abs(newSpeed - currentAppliedSpeed) > 0.001f) {
                         pB.setPlaybackSpeed(newSpeed)
                         currentAppliedSpeed = newSpeed
                     }
 
-                    delay(33)
+                    delay(33) // ~30 FPS update rate
                 }
             } catch (e: Exception) {
                 if (e !is CancellationException) {
-                    Log.e("PLAYBACK_DEBUG", "Error", e)
+                    Log.e("PLAYBACK_DEBUG", "Playback error", e)
                     _isPlaying.value = false
                 }
             }
@@ -630,19 +654,36 @@ class TransitionEditorViewModel @Inject constructor(
 
     private fun stopPreview() {
         Log.d("PLAYBACK_DEBUG", "stopPreview() called")
-        _isPlaying.value = false
+
+        // 1. Cancel the playback job FIRST (stop the PLL loop)
+        playbackJob?.cancel()
+        playbackJob = null
+
+        // 2. Stop playback
         playerA?.pause()
         playerB?.pause()
+
+        // 3. Reset playback speed to nominal values
         playerA?.setPlaybackSpeed(1f)
         playerB?.setPlaybackSpeed(1f)
+
+        // 4. Reset volumes
         playerA?.volume = 1f
         playerB?.volume = 1f
+
+        // 5. Reset EQ completely
         resetEQ(eqA)
         resetEQ(eqB)
-        playbackJob?.cancel()
+
+        // 6. Clear playback markers
         _playbackBeatMarker.value = null
-        Log.d("PLAYBACK_DEBUG", "Players paused and reset")
+
+        // 7. Clear playing flag
+        _isPlaying.value = false
+
+        Log.d("PLAYBACK_DEBUG", "Players paused and fully reset")
     }
+
 
     private fun resetEQ(eq: Equalizer?) {
         if (eq == null) return
