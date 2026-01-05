@@ -10,27 +10,37 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
-import com.dd3boh.outertune.viewmodels.BeatSample
+import com.dd3boh.outertune.transition.editor.BeatSample
 import kotlinx.coroutines.launch
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
-// 1. New Data Model for Markers
-// Use this to define exactly where beats are and what they look like
+// NOTE: BeatGridMarker is now defined in EditorModels.kt or imported from there.
+// If it was previously defined here, we should remove the definition and import it.
+// Assuming it's shared, we use the one from the package.
+// For now, I will assume BeatGridMarker is defined in `com.dd3boh.outertune.ui.component`
+// as per your Phase 1 snippet (although Phase 1 put it in `EditorModels.kt` referencing `ui.component`).
+// Let's define it here if it's strictly a UI helper, or import it.
+
+// Re-using the class structure from your provided code, but ensuring imports match Phase 4.
 data class BeatGridMarker(
-    val beatIndex: Float,      // The X position (in beats)
-    val isDownbeat: Boolean,   // TRUE = Green/Big (Major), FALSE = Gray/Small (Minor)
-    val isGhost: Boolean = false // Optional: For beats estimated during silence
+    val beatIndex: Float,
+    val isDownbeat: Boolean,
+    val isGhost: Boolean = false
 )
+
+enum class BeatMarkerPosition {
+    TOP, BOTTOM
+}
 
 @Composable
 fun WaveformView(
     waveformData: List<BeatSample>,
-    beatMarkers: List<BeatGridMarker>, // 2. Updated signature
+    beatMarkers: List<BeatGridMarker>,
     markerPosition: BeatMarkerPosition,
-    songDurationSeconds: Float?,
+    // songDurationSeconds is not strictly needed for drawing if we trust waveformData indices,
+    // but useful for boundary checks if needed.
     modifier: Modifier = Modifier,
-    isBeatDomain: Boolean = true,
     pixelsPerBeat: Float = 48f,
     beatOffsetBeats: Float = 0f,
     initialOffset: Float,
@@ -39,6 +49,7 @@ fun WaveformView(
     val scope = rememberCoroutineScope()
     val horizontalOffset = remember { Animatable(initialOffset) }
 
+    // Sync external changes to internal state (if initialOffset changes significantly)
     LaunchedEffect(initialOffset) {
         if (abs(horizontalOffset.value - initialOffset) > 1f && !horizontalOffset.isRunning) {
             horizontalOffset.snapTo(initialOffset)
@@ -49,29 +60,34 @@ fun WaveformView(
         modifier = modifier.pointerInput(Unit) {
             detectHorizontalDragGestures(
                 onDragEnd = {
-                    if (isBeatDomain) {
-                        val viewCenter = size.width.toFloat() / 2f
-                        val currentScroll = horizontalOffset.value
-                        val shiftPixels = beatOffsetBeats * pixelsPerBeat
+                    // Snap to nearest beat logic
+                    val viewCenter = size.width.toFloat() / 2f
+                    val currentScroll = horizontalOffset.value
+                    val shiftPixels = beatOffsetBeats * pixelsPerBeat
 
-                        val exactBeatAtCenter = (viewCenter - currentScroll - shiftPixels) / pixelsPerBeat
-                        val nearestBeatIndex = exactBeatAtCenter.roundToInt()
-                        val targetScroll = viewCenter - (nearestBeatIndex * pixelsPerBeat) - shiftPixels
+                    // Calculate where the center currently is in "Beat Space"
+                    // visual_center_x = (beat_index * ppb) + scroll + shift
+                    // beat_index = (visual_center - scroll - shift) / ppb
+                    val exactBeatAtCenter = (viewCenter - currentScroll - shiftPixels) / pixelsPerBeat
+                    val nearestBeatIndex = exactBeatAtCenter.roundToInt()
 
-                        scope.launch {
-                            horizontalOffset.animateTo(
-                                targetValue = targetScroll,
-                                animationSpec = spring(stiffness = Spring.StiffnessMediumLow)
-                            )
-                            onOffsetChanged(targetScroll)
-                        }
+                    // Calculate target scroll to put that beat exactly in center
+                    val targetScroll = viewCenter - (nearestBeatIndex * pixelsPerBeat) - shiftPixels
+
+                    scope.launch {
+                        horizontalOffset.animateTo(
+                            targetValue = targetScroll,
+                            animationSpec = spring(stiffness = Spring.StiffnessMediumLow)
+                        )
+                        onOffsetChanged(targetScroll)
                     }
                 }
             ) { change, dragAmount ->
                 change.consume()
                 scope.launch {
-                    horizontalOffset.snapTo(horizontalOffset.value + dragAmount)
-                    onOffsetChanged(horizontalOffset.value)
+                    val newOffset = horizontalOffset.value + dragAmount
+                    horizontalOffset.snapTo(newOffset)
+                    onOffsetChanged(newOffset)
                 }
             }
         }
@@ -80,9 +96,9 @@ fun WaveformView(
         val height = size.height
         val centerY = height / 2f
         val maxAmplitude = height / 2f
+
         val currentOffset = horizontalOffset.value
-        val beatOffsetPixels = beatOffsetBeats * pixelsPerBeat
-        val totalShift = currentOffset + beatOffsetPixels
+        val totalShift = currentOffset + (beatOffsetBeats * pixelsPerBeat)
 
         // Center reference line
         drawLine(
@@ -92,12 +108,15 @@ fun WaveformView(
             strokeWidth = 2f
         )
 
-        if (isBeatDomain && waveformData.isNotEmpty()) {
-            // Calculate visible range for optimization
-            val startVisibleBeat = (-totalShift / pixelsPerBeat) - 1f
-            val endVisibleBeat = ((-totalShift + width) / pixelsPerBeat) + 1f
+        if (waveformData.isNotEmpty()) {
+            // Optimization: Only iterate visible samples
+            // sample.x = (index * ppb) + totalShift
+            // visible if 0 < x < width
+            // index * ppb > -totalShift  -> index > -totalShift/ppb
+            val startVisibleBeat = (-totalShift / pixelsPerBeat) - 2f
+            val endVisibleBeat = ((-totalShift + width) / pixelsPerBeat) + 2f
 
-            // Draw waveform
+            // Draw Waveform
             waveformData.forEach { sample ->
                 if (sample.beatIndex >= startVisibleBeat && sample.beatIndex <= endVisibleBeat) {
                     val x = (sample.beatIndex * pixelsPerBeat) + totalShift
@@ -113,25 +132,19 @@ fun WaveformView(
                 }
             }
 
-            // ============================================
-            // 3. Updated Drawing Logic
-            // ============================================
+            // Draw Markers
             beatMarkers.forEach { marker ->
-                // Check visibility using the marker's explicit index
                 if (marker.beatIndex >= startVisibleBeat && marker.beatIndex <= endVisibleBeat) {
                     val x = (marker.beatIndex * pixelsPerBeat) + totalShift
 
-                    // Use the property from the object, NOT modulo math
-                    val isMajorBeat = marker.isDownbeat
-
                     val color = when {
-                        isMajorBeat -> Color(0xFF4CAF50) // Green
-                        marker.isGhost -> Color.DarkGray // Faint for ghost beats
+                        marker.isDownbeat -> Color(0xFF4CAF50) // Green
+                        marker.isGhost -> Color.DarkGray
                         else -> Color.Gray.copy(alpha = 0.5f)
                     }
 
-                    val strokeWidth = if (isMajorBeat) 4f else 2f
-                    val lineLength = if (isMajorBeat) 30f else 20f
+                    val strokeWidth = if (marker.isDownbeat) 4f else 2f
+                    val lineLength = if (marker.isDownbeat) 30f else 20f
 
                     if (markerPosition == BeatMarkerPosition.BOTTOM) {
                         drawLine(
@@ -152,7 +165,7 @@ fun WaveformView(
             }
         }
 
-        // Playhead indicator
+        // Playhead indicator (Static Red Line)
         drawLine(
             color = Color.Red,
             start = Offset(width / 2f, 0f),
@@ -160,8 +173,4 @@ fun WaveformView(
             strokeWidth = 3f
         )
     }
-}
-
-enum class BeatMarkerPosition {
-    TOP, BOTTOM
 }

@@ -34,12 +34,12 @@ import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
 import androidx.media3.common.util.Log
 import coil3.compose.AsyncImage
 import com.dd3boh.outertune.db.entities.Song
+import com.dd3boh.outertune.transition.editor.BeatSample
 import com.dd3boh.outertune.ui.component.BeatMarkerPosition
 import com.dd3boh.outertune.ui.component.WaveformView
 import com.dd3boh.outertune.utils.TransitionMixer
 import com.dd3boh.outertune.utils.makeTimeString
 import com.dd3boh.outertune.viewmodels.TransitionEditorViewModel
-import com.dd3boh.outertune.viewmodels.BeatSample
 import com.dd3boh.outertune.ui.component.BeatGridMarker
 
 @Composable
@@ -50,19 +50,10 @@ fun TransitionEditorScreen(
     onSave: () -> Unit = {},
     viewModel: TransitionEditorViewModel = hiltViewModel()
 ) {
-    val context = androidx.compose.ui.platform.LocalContext.current
-
-    // --- Load Data--
+    // --- Load Data ---
     LaunchedEffect(songAId, songBId) {
         if (songAId.isNotEmpty() && songBId.isNotEmpty()) {
             viewModel.loadData(songAId, songBId)
-        }
-    }
-
-    // Listen for errors
-    LaunchedEffect(Unit) {
-        viewModel.errorMessage.collect { message ->
-            android.widget.Toast.makeText(context, message, android.widget.Toast.LENGTH_LONG).show()
         }
     }
 
@@ -73,34 +64,30 @@ fun TransitionEditorScreen(
     val waveformData1 by viewModel.waveformBeatDomain1.collectAsState()
     val waveformData2 by viewModel.waveformBeatDomain2.collectAsState()
 
-    val beatMarkers by viewModel.beatMarkers.collectAsState(initial = emptyList())
+    val beatMarkers by viewModel.beatMarkers.collectAsState()
 
     val pixelsPerBeat by viewModel.pixelsPerBeatBase.collectAsState()
 
+    // 0.0 to 1.0 (scrolling beat position) is confusing?
+    // Actually, playbackBeatMarker from ViewModel is "Current Beat Index on A"
     val playbackBeatMarker by viewModel.playbackBeatMarker.collectAsState()
 
-    // Independent offsets
     val track1OffsetBeats by viewModel.track1OffsetBeats.collectAsState()
     val track2OffsetBeats by viewModel.track2OffsetBeats.collectAsState()
 
     val barsCount by viewModel.barsCount.collectAsState()
-    val transitionDuration by viewModel.transitionDurationSeconds.collectAsState()
     val transitionWidthFraction by viewModel.transitionWidthFraction.collectAsState()
 
-    var selectedTab by remember { mutableStateOf(0) }
+    var selectedTab by remember { mutableIntStateOf(0) }
     val overlapMode by viewModel.overlapMode.collectAsState()
     val eqMode by viewModel.eqMode.collectAsState()
     val effectMode by viewModel.effectMode.collectAsState()
 
     val isPlaying by viewModel.isPlaying.collectAsState()
 
-
-
-
     // UI VISIBILITY STATE
     var controlsVisible by remember { mutableStateOf(true) }
 
-    // Auto-hide timer
     LaunchedEffect(controlsVisible, isPlaying) {
         if (controlsVisible && isPlaying) {
             kotlinx.coroutines.delay(3000)
@@ -114,24 +101,12 @@ fun TransitionEditorScreen(
             .background(Color.Black)
             .windowInsetsPadding(WindowInsets.safeDrawing)
             .pointerInput(Unit) {
-                detectTapGestures(
-                    onTap = { controlsVisible = true }
-                )
+                detectTapGestures(onTap = { controlsVisible = true })
             }
     ) {
         val screenWidthPx = constraints.maxWidth.toFloat()
 
-        // ------------------------
-        // COMPUTE ZOOM PROPERLY
-        // ------------------------
-        val totalBeats = (barsCount * 4).toFloat()
-        val transitionZoneWidthPx = screenWidthPx * transitionWidthFraction
-
-        // Core formula for correct zooming:
-        val computedPixelsPerBeat =
-            if (totalBeats > 0) transitionZoneWidthPx / totalBeats else 1f
-
-        // When screen width (layout) or barsCount changes, update the VM
+        // Sync screen width to VM for zoom calc
         LaunchedEffect(screenWidthPx, barsCount) {
             viewModel.setScreenWidth(screenWidthPx)
         }
@@ -139,9 +114,8 @@ fun TransitionEditorScreen(
         Column(modifier = Modifier.fillMaxSize()) {
             TopBar(
                 onCancel = onCancel,
-                onSave = {
-                    viewModel.saveTransition (onComplete = onSave)
-                })
+                onSave = { viewModel.saveTransition(onComplete = onSave) }
+            )
 
             Spacer(modifier = Modifier.height(24.dp))
 
@@ -149,6 +123,7 @@ fun TransitionEditorScreen(
 
             Spacer(modifier = Modifier.height(24.dp))
 
+            // Offsets are stored in Beats in VM, converted to Pixels for View
             val track1OffsetPixels = -track1OffsetBeats * pixelsPerBeat
             val track2OffsetPixels = -track2OffsetBeats * pixelsPerBeat
 
@@ -160,13 +135,13 @@ fun TransitionEditorScreen(
                 beatMarkers = beatMarkers,
                 pixelsPerBeat = pixelsPerBeat,
                 transitionWidthFraction = transitionWidthFraction,
-                transitionDuration = transitionDuration,
                 barsCount = barsCount,
                 isPlaying = isPlaying,
                 showControls = controlsVisible,
-                playbackBeatMarker = playbackBeatMarker,
+                playbackBeatMarker = playbackBeatMarker?.toFloat(),
                 track1OffsetPixels = track1OffsetPixels,
                 track2OffsetPixels = track2OffsetPixels,
+                track1OffsetBeats = track1OffsetBeats,
                 overlapMode = overlapMode,
                 eqMode = eqMode,
                 effectMode = effectMode,
@@ -191,11 +166,11 @@ fun TransitionEditorScreen(
                 selectedTab = selectedTab,
                 onTabSelected = { selectedTab = it },
                 overlapMode = overlapMode,
-                onOverlapModeChanged = { viewModel.setOverlapMode (it) },
+                onOverlapModeChanged = { viewModel.setOverlapMode(it) },
                 eqMode = eqMode,
                 onEqModeChanged = { viewModel.setEqMode(it) },
                 effectMode = effectMode,
-                onEffectModeChanged = { viewModel.setEffectMode (it) },
+                onEffectModeChanged = { viewModel.setEffectMode(it) },
                 modifier = Modifier.padding(16.dp)
             )
         }
@@ -211,13 +186,13 @@ fun WaveformsSection(
     beatMarkers: List<BeatGridMarker>,
     pixelsPerBeat: Float,
     transitionWidthFraction: Float,
-    transitionDuration: Float,
     barsCount: Int,
     isPlaying: Boolean,
     showControls: Boolean,
     playbackBeatMarker: Float?,
     track1OffsetPixels: Float,
     track2OffsetPixels: Float,
+    track1OffsetBeats: Float, // Needed for playhead alignment
     overlapMode: String,
     eqMode: String,
     effectMode: String,
@@ -227,44 +202,35 @@ fun WaveformsSection(
 ) {
     Box(modifier = Modifier.fillMaxWidth().height(300.dp)) {
         Column {
-            // Track 1 waveform
+            // Track 1
             key(barsCount, pixelsPerBeat) {
                 WaveformView(
                     waveformData = waveformData1,
                     beatMarkers = beatMarkers,
                     markerPosition = BeatMarkerPosition.BOTTOM,
-                    isBeatDomain = true,
                     pixelsPerBeat = pixelsPerBeat,
                     beatOffsetBeats = 0f,
                     initialOffset = track1OffsetPixels,
                     onOffsetChanged = onTrack1OffsetChanged,
-                    songDurationSeconds = track1?.song?.duration?.toFloat() ?: 1f,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(150.dp)
+                    modifier = Modifier.fillMaxWidth().height(150.dp)
                 )
             }
-            // Track 2 waveform
+            // Track 2
             key(barsCount, pixelsPerBeat) {
                 WaveformView(
                     waveformData = waveformData2,
                     beatMarkers = beatMarkers,
                     markerPosition = BeatMarkerPosition.TOP,
-                    isBeatDomain = true,
                     pixelsPerBeat = pixelsPerBeat,
                     beatOffsetBeats = 0f,
                     initialOffset = track2OffsetPixels,
                     onOffsetChanged = onTrack2OffsetChanged,
-                    songDurationSeconds = track2?.song?.duration?.toFloat() ?: 1f,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(150.dp)
+                    modifier = Modifier.fillMaxWidth().height(150.dp)
                 )
-
             }
         }
 
-        // Transition overlay
+        // Green Transition Box
         BoxWithConstraints(modifier = Modifier.fillMaxSize().align(Alignment.Center)) {
             val screenWidth = maxWidth
             val transitionWidth = screenWidth * transitionWidthFraction
@@ -282,51 +248,41 @@ fun WaveformsSection(
                         .border(2.dp, Color(0xFF4CAF50).copy(alpha = 0.6f), RoundedCornerShape(12.dp))
                 )
 
-                // Visualization curves
+                // Visualization Curves
                 Canvas(modifier = Modifier.fillMaxSize().padding(horizontal = 4.dp)) {
                     val w = size.width
                     val h = size.height
-
                     val steps = 50
                     val pathAVol = Path()
                     val pathBVol = Path()
-                    val pathABass = Path()
-                    val pathBBass = Path()
+                    // Reusable vars
+                    var stateA: com.dd3boh.outertune.utils.DeckState
+                    var stateB: com.dd3boh.outertune.utils.DeckState
 
                     for (i in 0..steps) {
                         val p = i / steps.toFloat()
                         val x = p * w
 
-                        val stateA = TransitionMixer.getMixState("A", p, overlapMode, eqMode, effectMode)
-                        val stateB = TransitionMixer.getMixState("B", p, overlapMode, eqMode, effectMode)
+                        stateA = TransitionMixer.getMixState("A", p, overlapMode, eqMode, effectMode)
+                        stateB = TransitionMixer.getMixState("B", p, overlapMode, eqMode, effectMode)
 
                         val yVolA = h - (stateA.volume * h)
                         val yVolB = h - (stateB.volume * h)
-                        val yBassA = h - (stateA.bass * h)
-                        val yBassB = h - (stateB.bass * h)
 
                         if (i == 0) {
                             pathAVol.moveTo(x, yVolA)
                             pathBVol.moveTo(x, yVolB)
-                            pathABass.moveTo(x, yBassA)
-                            pathBBass.moveTo(x, yBassB)
                         } else {
                             pathAVol.lineTo(x, yVolA)
                             pathBVol.lineTo(x, yVolB)
-                            pathABass.lineTo(x, yBassA)
-                            pathBBass.lineTo(x, yBassB)
                         }
                     }
 
-                    drawPath(pathAVol, Color.White.copy(alpha=0.7f), style = androidx.compose.ui.graphics.drawscope.Stroke(width=3.dp.toPx()))
-                    drawPath(pathBVol, Color.Cyan.copy(alpha=0.7f), style = androidx.compose.ui.graphics.drawscope.Stroke(width=3.dp.toPx()))
-
-                    if (eqMode != "None") {
-                        drawPath(pathABass, Color(0xFFFF5252).copy(alpha=0.8f), style = androidx.compose.ui.graphics.drawscope.Stroke(width=4.dp.toPx()))
-                        drawPath(pathBBass, Color(0xFFFF5252).copy(alpha=0.4f), style = androidx.compose.ui.graphics.drawscope.Stroke(width=4.dp.toPx()))
-                    }
+                    drawPath(pathAVol, Color.White.copy(alpha = 0.7f), style = androidx.compose.ui.graphics.drawscope.Stroke(width = 3.dp.toPx()))
+                    drawPath(pathBVol, Color.Cyan.copy(alpha = 0.7f), style = androidx.compose.ui.graphics.drawscope.Stroke(width = 3.dp.toPx()))
                 }
 
+                // Play/Pause Button
                 AnimatedVisibility(
                     visible = !isPlaying || showControls,
                     enter = fadeIn(),
@@ -352,6 +308,7 @@ fun WaveformsSection(
                     }
                 }
 
+                // Header
                 Surface(
                     modifier = Modifier.align(Alignment.TopCenter).padding(top = 8.dp),
                     shape = RoundedCornerShape(16.dp),
@@ -360,12 +317,17 @@ fun WaveformsSection(
                     Text("Transition Zone", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp))
                 }
 
+                // Vertical Guide Lines
                 Box(modifier = Modifier.width(2.dp).fillMaxHeight().align(Alignment.CenterStart).background(Color(0xFF4CAF50).copy(alpha = 0.8f)))
                 Box(modifier = Modifier.width(2.dp).fillMaxHeight().align(Alignment.CenterEnd).background(Color(0xFF4CAF50).copy(alpha = 0.8f)))
             }
         }
 
-        // GREEN LINE INDICATOR (Playback Head)
+        // Green Playhead Line
+        // Calculation:
+        // playbackBeatMarker is the current Beat Index on Track A.
+        // track1OffsetPixels is the current visual scroll of Track A.
+        // xPosition = (beatIndex * ppb) + scrollOffset
         if (playbackBeatMarker != null && pixelsPerBeat > 0) {
             val xPosition = (playbackBeatMarker * pixelsPerBeat) + track1OffsetPixels
 
