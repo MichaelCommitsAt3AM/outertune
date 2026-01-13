@@ -251,6 +251,15 @@ class MusicService : MediaLibraryService(),
         deckManager = DeckManager(this, { createExoPlayer() }) { newActivePlayer ->
             // Runs on the main thread when transition completes
             mediaSession.player = newActivePlayer
+            
+            // Pre-warm the 'new' standby deck for the NEXT transition
+            val transition = currentTransitionCache
+            val nextSong = queueBoard.peekNext()
+            
+            if (transition != null && nextSong != null && transition.toSongId == nextSong.id) {
+                val mediaItem = nextSong.toMediaItem()
+                deckManager.prepareNext(mediaItem, transition.entryPointMs, null)
+            }
         }
 
 
@@ -1165,9 +1174,21 @@ class MusicService : MediaLibraryService(),
         mediaItem?.mediaId?.let { currentId ->
             offloadScope.launch {
                 val nextSong = queueBoard.peekNext() // This works now
-                currentTransitionCache = if (nextSong != null) {
+                val transition = if (nextSong != null) {
                     transitionDao.getTransition(currentId, nextSong.id)
                 } else null
+                currentTransitionCache = transition
+
+                if (transition != null && nextSong != null) {
+                    // Pre-warm the secondary deck so it's ready for the crossfade
+                    val mediaItem = nextSong.toMediaItem()
+                    // CRITICAL: Only prepare if not currently playing (avoid cutting off active crossfade)
+                    withContext(Dispatchers.Main) {
+                        if (!deckManager.standbyDeck.isPlaying) {
+                            deckManager.prepareNext(mediaItem, transition.entryPointMs, null)
+                        }
+                    }
+                }
 
                 // Force an immediate update so UI has correct duration
                 withContext(Dispatchers.Main) {
