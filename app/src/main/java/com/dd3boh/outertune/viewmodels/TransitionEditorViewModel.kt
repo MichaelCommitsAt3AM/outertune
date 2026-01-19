@@ -28,6 +28,20 @@ class TransitionEditorViewModel @Inject constructor(
 
     private val editorEngine = TransitionEditorEngine(context, database)
     private val playbackEngine = TransitionPlaybackEngine(context)
+    
+    init {
+        // Monitor state changes for debugging
+        viewModelScope.launch {
+            playbackEngine.decksReady.collect { ready ->
+                android.util.Log.d(TAG, "playbackEngine.decksReady changed to: $ready")
+            }
+        }
+        viewModelScope.launch {
+            playbackEngine.loadingError.collect { error ->
+                android.util.Log.d(TAG, "playbackEngine.loadingError changed to: $error")
+            }
+        }
+    }
 
     // --- UI State ---
     private val _editorArtifacts = MutableStateFlow<EditorArtifacts?>(null)
@@ -50,7 +64,14 @@ class TransitionEditorViewModel @Inject constructor(
     }.stateIn(viewModelScope, SharingStarted.Lazily, null)
 
     // Expose Decks Ready state to UI (optional, can be used to disable Play button)
-    val areDecksReady = playbackEngine.decksReady.stateIn(viewModelScope, SharingStarted.Lazily, false)
+    val areDecksReady = playbackEngine.decksReady
+        .onEach { android.util.Log.d(TAG, "areDecksReady flow emitting: $it") }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, false)
+
+    // Expose loading error
+    val loadingError = playbackEngine.loadingError
+        .onEach { android.util.Log.d(TAG, "loadingError flow emitting: $it") }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, null)
 
     private val _config = MutableStateFlow(TransitionConfig())
     val barsCount = _config.map { it.barsCount }.stateIn(viewModelScope, SharingStarted.Lazily, 4)
@@ -82,10 +103,15 @@ class TransitionEditorViewModel @Inject constructor(
                 val pathB = artifacts.track2.song.localPath
 
                 if (pathA != null && pathB != null) {
+                    android.util.Log.d("TransitionEditorViewModel", "Calling prewarmDecks with paths: A=$pathA, B=$pathB")
                     playbackEngine.prewarmDecks(pathA, pathB)
+                } else {
+                    android.util.Log.e("TransitionEditorViewModel", "Cannot prewarm decks - paths are null: A=$pathA, B=$pathB")
                 }
 
                 recalculateZoom()
+            } else {
+                android.util.Log.e("TransitionEditorViewModel", "loadArtifacts returned null")
             }
         }
     }
@@ -191,5 +217,9 @@ class TransitionEditorViewModel @Inject constructor(
     override fun onCleared() {
         super.onCleared()
         playbackEngine.release()
+    }
+    
+    companion object {
+        private const val TAG = "TransitionEditorViewModel"
     }
 }
