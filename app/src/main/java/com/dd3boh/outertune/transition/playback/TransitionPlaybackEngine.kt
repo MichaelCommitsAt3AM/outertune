@@ -20,7 +20,7 @@ import kotlin.math.floor
 
 /**
  * Real-time audio engine for executing DJ transitions.
- * USES: RAM-based buffers and a custom software mixer for sample-accurate sync.
+ * USES: Windowed PCM streaming and a custom software mixer for sample-accurate sync.
  */
 class TransitionPlaybackEngine(
     private val context: Context
@@ -35,10 +35,9 @@ class TransitionPlaybackEngine(
     private val _loadingError = MutableStateFlow<String?>(null)
     val loadingError: StateFlow<String?> = _loadingError.asStateFlow()
 
-    // --- Audio Data (RAM) ---
-    // Interleaved Stereo ShortArrays
-    private var bufferA: ShortArray? = null
-    private var bufferB: ShortArray? = null
+    // --- Audio Sources (Streaming) ---
+    private var sourceA: PcmSource? = null
+    private var sourceB: PcmSource? = null
     private var sampleRateA: Int = 44100
     private var sampleRateB: Int = 44100
 
@@ -95,7 +94,8 @@ class TransitionPlaybackEngine(
     }
 
     /**
-     * Loads songs into RAM asynchronously.
+     * Initializes streaming PCM sources.
+     * Decks are ready as soon as sources are prepared (no full-track decoding).
      */
     fun prewarmDecks(pathA: String, pathB: String) {
         // Check if we already have these tracks loaded
@@ -108,34 +108,38 @@ class TransitionPlaybackEngine(
         loadingJob?.cancel()
         
         loadingJob = scope.launch(Dispatchers.IO) {
-            Log.d(TAG, "Starting prewarmDecks for A=$pathA, B=$pathB")
+            Log.d(TAG, "Starting prewarmDecks (streaming) for A=$pathA, B=$pathB")
             _decksReady.value = false
             _loadingError.value = null
             
-            val resultA = AudioDecoder.decodeToStereo(context, pathA)
-            if (resultA == null) {
-                 _loadingError.value = "Failed to load Track A"
-                 return@launch
+            try {
+                // Release old sources if any
+                sourceA?.release()
+                sourceB?.release()
+                
+                // Create and prepare new sources
+                val srcA = StreamingPcmSource(context, pathA, scope)
+                srcA.prepare()
+                sourceA = srcA
+                sampleRateA = srcA.sampleRate
+                
+                val srcB = StreamingPcmSource(context, pathB, scope)
+                srcB.prepare()
+                sourceB = srcB
+                sampleRateB = srcB.sampleRate
+                
+                Log.d(TAG, "Initialized Sources: A=${srcA.totalFrames} frames @ ${sampleRateA}Hz, B=${srcB.totalFrames} frames @ ${sampleRateB}Hz")
+                Log.d(TAG, "Setting _decksReady = true (immediate readiness)")
+                _decksReady.value = true
+                lastLoadedPathA = pathA
+                lastLoadedPathB = pathB
+                Log.d(TAG, "Decks ready, value is now: ${_decksReady.value}")
+                
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to prepare PCM sources", e)
+                _loadingError.value = "Failed to initialize audio sources: ${e.message}"
+                _decksReady.value = false
             }
-
-            val resultB = AudioDecoder.decodeToStereo(context, pathB)
-            if (resultB == null) {
-                 _loadingError.value = "Failed to load Track B"
-                 return@launch
-            }
-
-            bufferA = resultA.first
-            sampleRateA = resultA.second
-            
-            bufferB = resultB.first
-            sampleRateB = resultB.second
-            
-            Log.d(TAG, "Loaded Decks: A=${bufferA!!.size/2} frames @ ${sampleRateA}Hz, B=${bufferB!!.size/2} frames @ ${sampleRateB}Hz")
-            Log.d(TAG, "Setting _decksReady = true")
-            _decksReady.value = true
-            lastLoadedPathA = pathA
-            lastLoadedPathB = pathB
-            Log.d(TAG, "After setting _decksReady, value is now: ${_decksReady.value}")
         }
     }
 
@@ -172,9 +176,24 @@ class TransitionPlaybackEngine(
         audioTrack?.play()
         _playbackState.value = PlaybackState(isPlaying = true)
 
-        // Launch Mixer Loop
+        // Launch Mixer Loop (seeks sources internally before reading)
         playbackJob = scope.launch(Dispatchers.Default) {
+            // Seek sources BEFORE starting to read PCM
+            try {
+                withContext(Dispatchers.IO) {
+                    sourceA?.seek(cursorA.toLong())
+                    sourceB?.seek(cursorB.toLong())
+                    Log.d(TAG, "✅ Seeked sources to: A=${cursorA.toLong()}, B=${cursorB.toLong()}")
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "❌ Seek failed", e)
+                withContext(Dispatchers.Main) { stop() }
+                return@launch
+            }
+            
+            Log.d(TAG, "🎵 Starting mixer loop...")
             runMixerLoop(plan, powerSaveMode)
+            Log.d(TAG, "🛑 Mixer loop ended")
         }
     }
 
@@ -188,19 +207,22 @@ class TransitionPlaybackEngine(
 
     fun release() {
         stop()
+        loadingJob?.cancel()
         audioTrack?.release()
         audioTrack = null
-        bufferA = null
-        bufferB = null
+        sourceA?.release()
+        sourceB?.release()
+        sourceA = null
+        sourceB = null
     }
 
     /**
      * The High-Priority Audio Mixer Loop.
-     * Fills AudioTrack buffer with mixed samples.
+     * Fills AudioTrack buffer with mixed samples using streaming PCM sources.
      */
     private suspend fun runMixerLoop(plan: TransitionPlan, powerSaveMode: Boolean) {
-        val bA = bufferA ?: return
-        val bB = bufferB ?: return
+        val srcA = sourceA ?: return
+        val srcB = sourceB ?: return
         val track = audioTrack ?: return
 
         val outBuffer = ShortArray(BUFFER_SIZE_BYTES / 2) // Stereo Samples
@@ -222,8 +244,14 @@ class TransitionPlaybackEngine(
         // UI Throttling
         var lastUiUpdate = 0L
         val UI_UPDATE_INTERVAL_MS = if (powerSaveMode) 100L else 32L // 10fps vs 30fps
+        
+        // Debug tracking
+        var loopCount = 0
+        var lastDebugLog = 0L
+        val DEBUG_LOG_INTERVAL_MS = 1000L
 
         while (currentCoroutineContext().isActive) {
+            loopCount++
             val config = activeConfig
             
             // 1. Determine Current Progress (Beat Domain)
@@ -292,38 +320,28 @@ class TransitionPlaybackEngine(
             val stepA = rateA_base 
             val stepB = rateB_base * currentSpeedB
 
-            // 3. Fill Buffer
+            // 3. Fill Buffer with Streaming PCM
             val framesToFill = outBuffer.size / 2
             
             for (i in 0 until framesToFill) {
-                // Read Track A
+                // Read Track A with streaming
                 var sampleLA = 0f
                 var sampleRA = 0f
                 
-                // Optimization: Don't read if gain is 0 (Power Save)
-                if (gainA > 0.001f && cursorA + 1 < bA.size / 2) {
-                    val idx = floor(cursorA).toInt()
-                    val frac = (cursorA - idx).toFloat()
-                    val offset = idx * 2
-                    // Boundary check (lazy)
-                    if (offset + 3 < bA.size) {
-                        sampleLA = bA[offset] + frac * (bA[offset+2] - bA[offset])
-                        sampleRA = bA[offset+1] + frac * (bA[offset+3] - bA[offset+1])
-                    }
+                if (gainA > 0.001f) {
+                    val samples = readSampleFromSource(srcA, cursorA)
+                    sampleLA = samples.first
+                    sampleRA = samples.second
                 }
                 
-                // Read Track B
+                // Read Track B with streaming
                 var sampleLB = 0f
                 var sampleRB = 0f
                 
-                if (gainB > 0.001f && cursorB + 1 < bB.size / 2) {
-                    val idx = floor(cursorB).toInt()
-                    val frac = (cursorB - idx).toFloat()
-                    val offset = idx * 2
-                    if (offset + 3 < bB.size) {
-                        sampleLB = bB[offset] + frac * (bB[offset+2] - bB[offset])
-                        sampleRB = bB[offset+1] + frac * (bB[offset+3] - bB[offset+1])
-                    }
+                if (gainB > 0.001f) {
+                    val samples = readSampleFromSource(srcB, cursorB)
+                    sampleLB = samples.first
+                    sampleRB = samples.second
                 }
 
                 // Mix
@@ -341,7 +359,43 @@ class TransitionPlaybackEngine(
 
             // 4. Write to AudioTrack
             track.write(outBuffer, 0, outBuffer.size)
+            
+            // Debug logging every second
+            val now2 = System.currentTimeMillis()
+            if (now2 - lastDebugLog > DEBUG_LOG_INTERVAL_MS) {
+                Log.d(TAG, "📊 Mixer: loop=$loopCount, cursorA=${cursorA.toLong()}, cursorB=${cursorB.toLong()}, gainA=$gainA, gainB=$gainB, progress=$progress")
+                lastDebugLog = now2
+            }
         }
+    }
+    
+    /**
+     * Read and interpolate a stereo sample from the ring buffer.
+     * The ring buffer is continuously filled by background decode jobs in StreamingPcmSource.
+     * 
+     * Note: No context switching needed - ring buffer reads are thread-safe and non-blocking.
+     */
+    private suspend fun readSampleFromSource(
+        source: PcmSource,
+        cursor: Double
+    ): Pair<Float, Float> {
+        val frac = (cursor - floor(cursor)).toFloat()
+        
+        // Read 2 frames for linear interpolation
+        // Ring buffer read is already thread-safe, no context switch needed
+        val samples = source.readFrames(2)
+        
+        if (samples.size < 4) {
+            // Buffer underrun - return silence
+            // The background decoder will catch up
+            return Pair(0f, 0f)
+        }
+        
+        // Linear interpolation between frame N and N+1
+        val sampleL = samples[0] + frac * (samples[2] - samples[0])
+        val sampleR = samples[1] + frac * (samples[3] - samples[1])
+        
+        return Pair(sampleL, sampleR)
     }
 }
 
