@@ -269,7 +269,6 @@ fun LocalPlaylistScreen(
                     database.query {
                         update(playlistEntity.copy(name = name))
                     }
-
                     viewModel.viewModelScope.launch(syncCoroutine) {
                         playlistEntity.browseId?.let { YouTube.renamePlaylist(it, name) }
                     }
@@ -645,29 +644,26 @@ fun LocalPlaylistScreen(
                         )
                     }
 
-                    // NEW: Link Icon Logic
+                    // NEW: TransitionStatusChip
                     // Show only if Mix Mode is ON and this isn't the last song
                     if (playlistWithSongs.first?.playlist?.isMixModeActive == true && index < mutableSongs.size - 1) {
                         val nextSong = mutableSongs[index + 1]
+                        
+                        // Get transition state from ViewModel
+                        val transitionState by viewModel.getTransitionState(song.song.id, nextSong.song.id).collectAsState()
 
                         Box(
-                            modifier = Modifier.fillMaxWidth().height(24.dp),
+                            modifier = Modifier.fillMaxWidth().height(32.dp),
                             contentAlignment = Alignment.Center
                         ) {
-                            IconButton(
+                            com.dd3boh.outertune.ui.component.TransitionStatusChip(
+                                state = transitionState,
                                 onClick = {
-                                    // Phase 1: Navigate to Editor
+                                    // Navigate to TransitionEditorScreen
                                     navController.navigate("transition_editor/${song.song.id}/${nextSong.song.id}")
                                 },
-                                modifier = Modifier.size(24.dp)
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Rounded.Link,
-                                    contentDescription = "Edit Transition",
-                                    tint = MaterialTheme.colorScheme.primary,
-                                    modifier = Modifier.size(16.dp)
-                                )
-                            }
+                                modifier = Modifier
+                            )
                         }
                     }
                 }

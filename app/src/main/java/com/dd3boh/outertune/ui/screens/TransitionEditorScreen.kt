@@ -120,9 +120,14 @@ fun TransitionEditorScreen(
         }
 
         Column(modifier = Modifier.fillMaxSize()) {
+            val isSaving by viewModel.isSaving.collectAsState()
+            val hasChanges by viewModel.hasChanges.collectAsState()
+
             TopBar(
                 onCancel = onCancel,
-                onSave = { viewModel.saveTransition(onComplete = onSave) }
+                onSave = { viewModel.saveTransition(onComplete = onSave) },
+                isSaving = isSaving,
+                isEnabled = hasChanges
             )
 
             Spacer(modifier = Modifier.height(24.dp))
@@ -374,7 +379,9 @@ fun WaveformsSection(
 @Composable
 fun TopBar(
     onCancel: () -> Unit,
-    onSave: () -> Unit
+    onSave: () -> Unit,
+    isSaving: Boolean = false,
+    isEnabled: Boolean = false
 ) {
     Row(
         modifier = Modifier
@@ -404,12 +411,30 @@ fun TopBar(
             Spacer(modifier = Modifier.height(4.dp))
         }
 
-        TextButton(onClick = onSave) {
-            Text(
-                text = "Save",
-                color = Color(0xFF4CAF50),
-                fontSize = 16.sp
-            )
+        if (isSaving) {
+            Box(
+                modifier = Modifier
+                    .padding(end = 16.dp)
+                    .size(24.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(20.dp),
+                    color = Color(0xFF4CAF50),
+                    strokeWidth = 2.dp
+                )
+            }
+        } else {
+            TextButton(
+                onClick = onSave,
+                enabled = isEnabled
+            ) {
+                Text(
+                    text = "Save",
+                    color = if (isEnabled) Color(0xFF4CAF50) else Color.Gray,
+                    fontSize = 16.sp
+                )
+            }
         }
     }
 }

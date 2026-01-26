@@ -8,6 +8,10 @@
 // BTrack Header
 #include "BTrack.h"
 
+// libKeyFinder Headers
+#include "keyfinder.h"
+#include "audiodata.h"
+
 #define TAG "OuterTune-Native"
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__)
 
@@ -143,10 +147,16 @@ Java_com_dd3boh_outertune_utils_analysis_AudioAnalyzer_analyzeBpm(
         jfloatArray pcmData,
         jint sampleRate) {
 
+    LOGD("=== [BTrack] Starting BPM analysis ===");
+    
     jfloat* data = env->GetFloatArrayElements(pcmData, nullptr);
-    if (!data) return nullptr;
+    if (!data) {
+        LOGD("[BTrack] FAILED: Could not get PCM array elements");
+        return nullptr;
+    }
 
     jsize length = env->GetArrayLength(pcmData);
+    LOGD("[BTrack] Input: %d samples @ %d Hz (%.2f seconds)", length, sampleRate, (double)length / sampleRate);
 
     BTrack beatTracker(HOP_SIZE, FRAME_SIZE);
 
@@ -157,6 +167,7 @@ Java_com_dd3boh_outertune_utils_analysis_AudioAnalyzer_analyzeBpm(
     std::vector<double> detectedBeatsMs;
 
     if (length >= FRAME_SIZE) {
+        int framesProcessed = 0;
         for (int i = 0; i <= length - FRAME_SIZE; i += HOP_SIZE) {
             for (int j = 0; j < FRAME_SIZE; ++j) {
                 processingFrame[j] = (double)data[i + j];
@@ -172,26 +183,47 @@ Java_com_dd3boh_outertune_utils_analysis_AudioAnalyzer_analyzeBpm(
                 double timestamp = (((double)i + (FRAME_SIZE / 2.0)) / (double)sampleRate) * 1000.0;
                 detectedBeatsMs.push_back(timestamp);
             }
+            framesProcessed++;
         }
+        LOGD("[BTrack] Processed %d frames, detected %zu raw beats", framesProcessed, detectedBeatsMs.size());
+    }
+
+    if (detectedBeatsMs.empty()) {
+        LOGD("[BTrack] WARNING: No beats detected");
+        env->ReleaseFloatArrayElements(pcmData, data, 0);
+        return nullptr;
     }
 
     // Rec #3: Calculate raw BPM, then clean the grid using that BPM as a reference
     double calculatedBpm = calculateBpmFromBeats(detectedBeatsMs);
+    LOGD("[BTrack] Calculated BPM: %.2f", calculatedBpm);
+    
     std::vector<double> cleanedBeats = cleanBeatGrid(detectedBeatsMs, calculatedBpm);
 
     env->ReleaseFloatArrayElements(pcmData, data, 0);
 
-    LOGD("Analysis Done. Raw BPM: %.2f. Beats Raw: %zu, Cleaned: %zu",
+    LOGD("[BTrack] Final: BPM=%.2f, Beats (raw=%zu, cleaned=%zu)",
          calculatedBpm, detectedBeatsMs.size(), cleanedBeats.size());
 
     jclass resultClass = env->FindClass("com/dd3boh/outertune/utils/analysis/AudioAnalysisResult");
-    if (!resultClass) return nullptr;
+    if (!resultClass) {
+        LOGD("[BTrack] FAILED: Could not find AudioAnalysisResult class");
+        return nullptr;
+    }
 
-    jmethodID constructor = env->GetMethodID(resultClass, "<init>", "(FJ[J)V");
-    if (!constructor) return nullptr;
+    // Updated constructor signature to include the optional key parameter
+    // Signature: (Float, Long, LongArray, MusicalKey?) -> AudioAnalysisResult
+    jmethodID constructor = env->GetMethodID(resultClass, "<init>", "(FJ[JLcom/dd3boh/outertune/utils/analysis/MusicalKey;)V");
+    if (!constructor) {
+        LOGD("[BTrack] FAILED: Could not find AudioAnalysisResult constructor with signature (FJ[JLcom/dd3boh/outertune/utils/analysis/MusicalKey;)V");
+        return nullptr;
+    }
 
     jlongArray beatGrid = env->NewLongArray((jsize)cleanedBeats.size());
-    if (!beatGrid) return nullptr;
+    if (!beatGrid) {
+        LOGD("[BTrack] FAILED: Could not allocate beat grid array");
+        return nullptr;
+    }
 
     std::vector<jlong> beatsLong;
     beatsLong.reserve(cleanedBeats.size());
@@ -205,5 +237,122 @@ Java_com_dd3boh_outertune_utils_analysis_AudioAnalyzer_analyzeBpm(
 
     jlong firstBeatMs = beatsLong.empty() ? 0 : beatsLong[0];
 
-    return env->NewObject(resultClass, constructor, (jfloat)calculatedBpm, firstBeatMs, beatGrid);
+    LOGD("[BTrack] === Complete: Returning result ===");
+    // Pass null for the key parameter since BTrack doesn't detect musical keys
+    return env->NewObject(resultClass, constructor, (jfloat)calculatedBpm, firstBeatMs, beatGrid, nullptr);
+}
+
+/**
+ * Helper function to convert libKeyFinder key_t to Camelot index (1-24).
+ * 
+ * libKeyFinder keys:
+ * A_MAJOR=0, A_MINOR=1, B_FLAT_MAJOR=2, B_FLAT_MINOR=3, B_MAJOR=4, B_MINOR=5,
+ * C_MAJOR=6, C_MINOR=7, D_FLAT_MAJOR=8, D_FLAT_MINOR=9, D_MAJOR=10, D_MINOR=11,
+ * E_FLAT_MAJOR=12, E_FLAT_MINOR=13, E_MAJOR=14, E_MINOR=15, F_MAJOR=16, F_MINOR=17,
+ * G_FLAT_MAJOR=18, G_FLAT_MINOR=19, G_MAJOR=20, G_MINOR=21, A_FLAT_MAJOR=22, A_FLAT_MINOR=23
+ * 
+ * Camelot wheel mapping (1-24):
+ * 1A-12A = Minor keys, 1B-12B = Major keys
+ */
+int keyFinderToCamelot(KeyFinder::key_t key) {
+    // Map libKeyFinder enum to Camelot index
+    switch(key) {
+        // Minors (A suffix)
+        case KeyFinder::A_MINOR:        return 1;  // 8A
+        case KeyFinder::E_MINOR:        return 2;  // 9A
+        case KeyFinder::B_MINOR:        return 3;  // 10A
+        case KeyFinder::G_FLAT_MINOR:   return 4;  // 11A (F# minor enharmonic)
+        case KeyFinder::D_FLAT_MINOR:   return 5;  // 12A
+        case KeyFinder::A_FLAT_MINOR:   return 6;  // 1A
+        case KeyFinder::E_FLAT_MINOR:   return 7;  // 2A
+        case KeyFinder::B_FLAT_MINOR:   return 8;  // 3A
+        case KeyFinder::F_MINOR:        return 9;  // 4A
+        case KeyFinder::C_MINOR:        return 10; // 5A
+        case KeyFinder::G_MINOR:        return 11; // 6A
+        case KeyFinder::D_MINOR:        return 12; // 7A
+        
+        // Majors (B suffix)
+        case KeyFinder::B_MAJOR:        return 13; // 8B
+        case KeyFinder::G_FLAT_MAJOR:   return 14; // 9B (F# major enharmonic)
+        case KeyFinder::D_FLAT_MAJOR:   return 15; // 10B
+        case KeyFinder::A_FLAT_MAJOR:   return 16; // 11B
+        case KeyFinder::E_FLAT_MAJOR:   return 17; // 12B
+        case KeyFinder::B_FLAT_MAJOR:   return 18; // 1B
+        case KeyFinder::F_MAJOR:        return 19; // 2B
+        case KeyFinder::C_MAJOR:        return 20; // 3B
+        case KeyFinder::G_MAJOR:        return 21; // 4B
+        case KeyFinder::D_MAJOR:        return 22; // 5B
+        case KeyFinder::A_MAJOR:        return 23; // 6B
+        case KeyFinder::E_MAJOR:        return 24; // 7B
+        
+        case KeyFinder::SILENCE:
+        default:
+            return -1; // Unknown/silence
+    }
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_dd3boh_outertune_utils_analysis_KeyDetector_detectKeyNative(
+        JNIEnv* env,
+        jobject,
+        jfloatArray pcmData,
+        jint sampleRate) {
+    
+    LOGD("=== [KeyFinder] Starting key detection ===");
+    
+    jfloat* data = env->GetFloatArrayElements(pcmData, nullptr);
+    if (!data) {
+        LOGD("[KeyFinder] FAILED: Could not get PCM array elements");
+        return -1;
+    }
+    
+    jsize length = env->GetArrayLength(pcmData);
+    LOGD("[KeyFinder] Input: %d samples @ %d Hz (%.2f seconds)", length, sampleRate, (double)length / sampleRate);
+    
+    try {
+        // Create libKeyFinder instance
+        KeyFinder::KeyFinder kf;
+        
+        // Prepare AudioData
+        KeyFinder::AudioData audioData;
+        audioData.setFrameRate(sampleRate);
+        audioData.setChannels(1); // Mono
+        audioData.addToSampleCount(length);
+        
+        LOGD("[KeyFinder] Copying PCM data (%d samples)...", length);
+        
+        // Copy PCM data
+        for (int i = 0; i < length; i++) {
+            audioData.setSample(i, (double)data[i]);
+        }
+        
+        env->ReleaseFloatArrayElements(pcmData, data, 0);
+        
+        LOGD("[KeyFinder] Running key detection algorithm...");
+        
+        // Run key detection
+        KeyFinder::key_t detectedKey = kf.keyOfAudio(audioData);
+        
+        LOGD("[KeyFinder] Raw result: key_t=%d", (int)detectedKey);
+        
+        // Convert to Camelot index
+        int camelotIndex = keyFinderToCamelot(detectedKey);
+        
+        if (camelotIndex > 0) {
+            LOGD("[KeyFinder] === Complete: Camelot=%d ===", camelotIndex);
+        } else {
+            LOGD("[KeyFinder] === Result: Silence/Unknown (returning -1) ===");
+        }
+        
+        return camelotIndex;
+        
+    } catch (const std::exception& e) {
+        LOGD("[KeyFinder] EXCEPTION: %s", e.what());
+        env->ReleaseFloatArrayElements(pcmData, data, 0);
+        return -1;
+    } catch (...) {
+        LOGD("[KeyFinder] UNKNOWN EXCEPTION");
+        env->ReleaseFloatArrayElements(pcmData, data, 0);
+        return -1;
+    }
 }

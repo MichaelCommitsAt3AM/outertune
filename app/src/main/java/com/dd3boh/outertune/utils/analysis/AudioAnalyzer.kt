@@ -5,7 +5,8 @@ import android.util.Log
 data class AudioAnalysisResult(
     val bpm: Float,
     val firstBeatMs: Long,
-    val beatGrid: LongArray
+    val beatGrid: LongArray,
+    val key: MusicalKey? = null
 )
 
 object AudioAnalyzer {

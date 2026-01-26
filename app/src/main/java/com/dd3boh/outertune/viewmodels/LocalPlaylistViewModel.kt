@@ -33,12 +33,14 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import javax.inject.Inject
 import java.util.concurrent.TimeUnit
+import com.dd3boh.outertune.transition.model.TransitionState
+import kotlinx.coroutines.flow.StateFlow
 
 
 @HiltViewModel
 class LocalPlaylistViewModel @Inject constructor(
     @ApplicationContext context: Context,
-    database: MusicDatabase,
+    private val database: MusicDatabase,
     savedStateHandle: SavedStateHandle,
     private val downloadDao: DownloadDao,
 ) : ViewModel() {
@@ -193,6 +195,43 @@ class LocalPlaylistViewModel @Inject constructor(
                     _analysisProgress.value = completed.toFloat() / total.toFloat()
                 }
             }
+        }
+    }
+
+    private val transitionFlows = mutableMapOf<Pair<String, String>, StateFlow<TransitionState>>()
+
+    /**
+     * Get the transition state between two songs reactively.
+     *
+     * This method queries the database for a saved transition and maps it to a TransitionState.
+     * The result is cached as a StateFlow to avoid redundant queries during scroll/recomposition.
+     *
+     * @param fromId ID of the outgoing song
+     * @param toId ID of the incoming song
+     * @return StateFlow that emits Auto if no transition exists, or Custom if a saved transition is found
+     */
+    fun getTransitionState(fromId: String, toId: String): StateFlow<TransitionState> {
+        val key = fromId to toId
+        return transitionFlows.getOrPut(key) {
+            database.transitionDao().getTransitionFlow(fromId, toId)
+                .map { entity ->
+                    if (entity == null) {
+                        TransitionState.Auto
+                    } else {
+                        TransitionState.Custom(
+                            durationMs = entity.durationMs,
+                            overlapMode = entity.overlapMode,
+                            eqMode = entity.eqMode,
+                            effectMode = entity.effectMode,
+                            type = entity.type
+                        )
+                    }
+                }
+                .stateIn(
+                    scope = viewModelScope,
+                    started = SharingStarted.WhileSubscribed(5000),
+                    initialValue = TransitionState.Auto
+                )
         }
     }
 }

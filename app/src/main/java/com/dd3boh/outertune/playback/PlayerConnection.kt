@@ -49,7 +49,15 @@ class PlayerConnection(
     val TAG = PlayerConnection::class.simpleName.toString()
 
     val service = binder.getService()!!
-    val player = service.player
+
+    
+    // Use a getter so we always get the *current* active player from the service
+    val player: Player
+        get() = service.player
+
+    // Keep track of the player we are currently listening to
+    private var internalPlayer: Player? = null
+    
     val scope = binder.viewModelScope
 
     val playbackState = MutableStateFlow(player.playbackState)
@@ -91,20 +99,45 @@ class PlayerConnection(
     val error = MutableStateFlow<PlaybackException?>(null)
 
     init {
-        player.addListener(this)
-
-        playbackState.value = player.playbackState
-        playWhenReady.value = player.playWhenReady
-        queuePlaylistId.value = service.queuePlaylistId
-        queueWindows.value = player.getQueueWindows()
-        currentWindowIndex.value = player.getCurrentQueueIndex()
-        currentMediaItemIndex.value = player.currentMediaItemIndex
-        shuffleModeEnabled.value = player.shuffleModeEnabled
-        repeatMode.value = player.repeatMode
-
+        // Observe the active player from MusicService
         scope.launch {
-            mediaMetadata.value = player.currentMetadata ?: database.getResumptionQueue()?.getCurrentSong()
+            service.activePlayer.collect { newPlayer ->
+                if (newPlayer != null && newPlayer != internalPlayer) {
+                    internalPlayer?.removeListener(this@PlayerConnection)
+                    internalPlayer = newPlayer
+                    newPlayer.addListener(this@PlayerConnection)
+                    
+                    Log.d(TAG, "PlayerConnection switched to new player: $newPlayer")
+
+                    // Sync state immediately
+                    playbackState.value = newPlayer.playbackState
+                    playWhenReady.value = newPlayer.playWhenReady
+                    shuffleModeEnabled.value = newPlayer.shuffleModeEnabled
+                    repeatMode.value = newPlayer.repeatMode
+                    mediaMetadata.value = newPlayer.currentMetadata
+                    
+                    updateCanSkipPreviousAndNext()
+                    
+                    // Queue info
+                    queueWindows.value = newPlayer.getQueueWindows()
+                    // currentMediaItemIndex.value = newPlayer.currentMediaItemIndex // DON'T USE PLAYER INDEX (Decks = 0)
+                    currentWindowIndex.value = newPlayer.getCurrentQueueIndex()
+                    
+                    error.value = newPlayer.playerError
+                }
+            }
         }
+        
+        // Bind logical index
+        scope.launch {
+            service.logicalIndex.collect {
+                currentMediaItemIndex.value = it
+            }
+        }
+    
+        // Initial sync 
+         queuePlaylistId.value = service.queuePlaylistId
+         currentMediaItemIndex.value = service.queueBoard.getCurrentQueue()?.queuePos ?: 0
     }
 
     fun playQueue(
@@ -170,7 +203,7 @@ class PlayerConnection(
 
     override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
         mediaMetadata.value = mediaItem?.metadata
-        currentMediaItemIndex.value = player.currentMediaItemIndex
+        // currentMediaItemIndex.value = player.currentMediaItemIndex // Controlled by service.logicalIndex
         currentWindowIndex.value = player.getCurrentQueueIndex()
         updateCanSkipPreviousAndNext()
     }
@@ -178,7 +211,7 @@ class PlayerConnection(
     override fun onTimelineChanged(timeline: Timeline, reason: Int) {
         queueWindows.value = player.getQueueWindows()
         queuePlaylistId.value = service.queuePlaylistId
-        currentMediaItemIndex.value = player.currentMediaItemIndex
+        // currentMediaItemIndex.value = player.currentMediaItemIndex // Controlled by service.logicalIndex
         currentWindowIndex.value = player.getCurrentQueueIndex()
         updateCanSkipPreviousAndNext()
     }

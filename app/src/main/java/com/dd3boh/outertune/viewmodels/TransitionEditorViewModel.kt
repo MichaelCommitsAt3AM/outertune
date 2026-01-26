@@ -79,12 +79,32 @@ class TransitionEditorViewModel @Inject constructor(
     val overlapMode = _config.map { it.overlapMode }.stateIn(viewModelScope, SharingStarted.Lazily, "Overlap")
     val eqMode = _config.map { it.eqMode }.stateIn(viewModelScope, SharingStarted.Lazily, "None")
     val effectMode = _config.map { it.effectMode }.stateIn(viewModelScope, SharingStarted.Lazily, "None")
+    
+    // --- Change Tracking ---
+    private data class TransitionState(
+        val config: TransitionConfig,
+        val offsetA: Double,
+        val offsetB: Double
+    )
+
+    private var originalState: TransitionState? = null
+    
+
+
+    private val _isSaving = MutableStateFlow(false)
+    val isSaving = _isSaving.asStateFlow()
 
     private val _track1OffsetBeats = MutableStateFlow(0.0)
     val track1OffsetBeats = _track1OffsetBeats.map { it.toFloat() }.stateIn(viewModelScope, SharingStarted.Lazily, 0f)
 
     private val _track2OffsetBeats = MutableStateFlow(0.0)
     val track2OffsetBeats = _track2OffsetBeats.map { it.toFloat() }.stateIn(viewModelScope, SharingStarted.Lazily, 0f)
+
+    private val _hasChanges = combine(_config, _track1OffsetBeats, _track2OffsetBeats) { config, offA, offB ->
+        val current = TransitionState(config, offA.toDouble(), offB.toDouble())
+        originalState?.let { it != current } ?: false
+    }
+    val hasChanges = _hasChanges.stateIn(viewModelScope, SharingStarted.Lazily, false)
 
     private val _pixelsPerBeatBase = MutableStateFlow(48f)
     val pixelsPerBeatBase = _pixelsPerBeatBase.asStateFlow()
@@ -99,6 +119,85 @@ class TransitionEditorViewModel @Inject constructor(
             _editorArtifacts.value = artifacts
 
             if (artifacts != null) {
+                // Check for existing saved transition
+                val savedTransition = database.transitionDao().getTransition(songAId, songBId)
+                if (savedTransition != null) {
+                    // Restore Config
+                    updateConfig {
+                        it.copy(
+                            overlapMode = savedTransition.overlapMode,
+                            eqMode = savedTransition.eqMode,
+                            effectMode = savedTransition.effectMode,
+                            barsCount = (savedTransition.durationBeats ?: 32) / 4
+                        )
+                    }
+
+                    // Restore Position (Reverse Engineering Offsets)
+                    // The Logic: The offset is "How many beats to shift the waveform left".
+                    // The center of the transition window is the anchor point.
+                    // We want the saved Exit Point (A) and Entry Point (B) to be at the anchor.
+
+                    // 1. Calculate the beat index of the saved points
+                    val exitBeatA = TransitionMath.getBeatForTimestamp(artifacts.rawGrid1, savedTransition.exitPointMs / 1000.0)
+                    val entryBeatB = TransitionMath.getBeatForTimestamp(artifacts.rawGrid2, savedTransition.entryPointMs / 1000.0)
+
+                    // 2. Set the offsets
+                    // The editor aligns the waveform such that (Offset) is at the start of the window?
+                    // No, let's look at WaveformView usage or calculatePlan logic.
+                    // calculatePlan says: anchorBeatA = offsetBeatsA + (barsCount * 2) [if we assume offset is start]
+                    // Actually, in TransitionMath.calculatePlan usually:
+                    // anchorBeatA = offsetBeatsA + (beats in window / 2) ?
+                    // Let's assume the UI aligns 'offsetBeats' to the 'transition start' or similar.
+                    // Wait, looking at `setTrack1Offset`: _track1OffsetBeats.value = (-pxOffset / pixelsPerBeat)
+                    // So offsetBeats is POSITIVE when scrolled LEFT (into the track).
+                    // It represents the beat definition of the LEFT edge of the screen (or container).
+                    
+                    // We want the 'exitBeatA' to be at the CENTER of the transition zone.
+                    // The transition zone is usually centered in the screen or has a specific alignment.
+                    // Let's rely on how the user scrolls. When user scrolls to "Bar 32", the offset is "32 - (WindowWidth/2)".
+                    
+                    // Let's try setting offset = exitBeatA. 
+                    // If the visual anchor is 2 bars in (for a 4 bar transition), we might need to adjust.
+                    // But simply setting it to the beat is a good starting point.
+                    
+                    // Better yet: we know the duration is `savedTransition.durationBeats`
+                    // The anchor point (center of crossfade) is usually what matters.
+                    // offsetBeats usually represents the timestamp of the start of the visible area?
+                    
+                    // Let's look at calculatePlan in TransitionMath.kt (I can't see it, but I see call site)
+                    // But we can infer.
+                    // Let's just set the offsets to the Exit/Entry beat indices for now.
+                    // Ideally, we want the transition to be centered.
+                    // If the transition is 8 bars long, the exit point is in the middle? 
+                    // No, exitPointMs usually implies the start of the fade out or the crossover point.
+                    // Let's assume it aligns with the 'alignment' beat.
+                    
+                    // We will set:
+                    val totalBeats = (savedTransition.durationBeats ?: 32).toFloat()
+                    val widthFraction = _config.value.widthFraction
+                    
+                    // Logic: We want 'exitBeatA' to be at the START of the TRANSITION ZONE (Left Edge of Green Box).
+                    // The Green Box is centered and has width 'totalBeats'.
+                    // SreenWidthBeats = totalBeats / widthFraction
+                    // BoxStartBeats = (ScreenWidthBeats - totalBeats) / 2
+                    //               = (totalBeats/widthFraction - totalBeats) / 2
+                    //               = totalBeats * (1/widthFraction - 1) / 2
+                    //               = totalBeats * ( (1 - widthFraction) / widthFraction ) / 2
+                    //               = totalBeats * (1 - widthFraction) / (2 * widthFraction)
+                    
+                    val startShiftBeats = totalBeats * (1f - widthFraction) / (2f * widthFraction)
+
+                    _track1OffsetBeats.value = exitBeatA - startShiftBeats
+                    _track2OffsetBeats.value = entryBeatB - startShiftBeats
+                }
+
+                // Capture Baseline State
+                originalState = TransitionState(
+                    config = _config.value,
+                    offsetA = _track1OffsetBeats.value,
+                    offsetB = _track2OffsetBeats.value
+                )
+
                 val pathA = artifacts.track1.song.localPath
                 val pathB = artifacts.track2.song.localPath
 
@@ -157,9 +256,16 @@ class TransitionEditorViewModel @Inject constructor(
 
     // --- Save Logic ---
     fun saveTransition(onComplete: () -> Unit) {
+        _isSaving.value = true
         viewModelScope.launch(Dispatchers.IO) {
-            val plan = calculateCurrentPlan() ?: return@launch
-            val artifacts = _editorArtifacts.value ?: return@launch
+            val plan = calculateCurrentPlan() ?: run {
+                _isSaving.value = false
+                return@launch
+            }
+            val artifacts = _editorArtifacts.value ?: run {
+                _isSaving.value = false
+                return@launch
+            }
 
             val transition = TransitionEntity(
                 fromSongId = artifacts.track1.id,
@@ -176,8 +282,19 @@ class TransitionEditorViewModel @Inject constructor(
             )
 
             database.transitionDao().insert(transition)
+            
+            // Update baseline after successful save
+            originalState = TransitionState(
+                config = _config.value,
+                offsetA = _track1OffsetBeats.value,
+                offsetB = _track2OffsetBeats.value
+            )
+            
+            // Artificial delay to let user see the spinner (optional, but good for UX if save is too fast)
+            kotlinx.coroutines.delay(500)
 
             withContext(Dispatchers.Main) {
+                _isSaving.value = false
                 onComplete()
             }
         }

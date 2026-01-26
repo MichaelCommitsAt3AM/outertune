@@ -191,4 +191,43 @@ object AudioDecoder {
             try { extractor.release() } catch (e: Exception) {}
         }
     }
+    fun loadBeatGrid(file: File, startMs: Long? = null, endMs: Long? = null): List<Float>? {
+        if (!file.exists()) {
+            Log.e(TAG, "loadBeatGrid: File does not exist: ${file.absolutePath}")
+            return null
+        }
+
+        return try {
+            val content = file.readText()
+            if (content.isBlank()) {
+                Log.e(TAG, "loadBeatGrid: File is empty: ${file.absolutePath}")
+                return null
+            }
+
+            // Split by comma OR newline, then trim whitespace
+            val beats = content.split(Regex("[,\\n]"))
+                .map { it.trim() }
+                .filter { it.isNotEmpty() }
+                .mapNotNull { it.toFloatOrNull() }
+                .filter { beatMs ->
+                    val afterStart = startMs == null || beatMs >= startMs
+                    val beforeEnd = endMs == null || beatMs <= endMs
+                    afterStart && beforeEnd
+                }
+
+            if (beats.isEmpty()) {
+                // If we filtered everything out, that's technically a valid (but empty) result for the range.
+                // But usually implies a logic error if we expected beats.
+                // However, for the calling code, an empty list usually aborts the transition.
+                Log.w(TAG, "loadBeatGrid: Loaded 0 beats from ${file.absolutePath} (Range: $startMs - $endMs)")
+                return null
+            }
+            
+            Log.d(TAG, "loadBeatGrid: Successfully loaded ${beats.size} beats from ${file.absolutePath} (Range: $startMs - $endMs)")
+            beats
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to parse beatgrid file: ${file.absolutePath}", e)
+            null
+        }
+    }
 }
