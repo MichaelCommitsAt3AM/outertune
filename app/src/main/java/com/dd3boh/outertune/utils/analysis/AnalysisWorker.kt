@@ -57,7 +57,7 @@ class AnalysisWorker @AssistedInject constructor(
 
         return try {
             // 2. Decode Raw Audio
-            val (pcmData, sampleRate) = AudioDecoder.decodeToMono(absolutePath) ?: return Result.failure()
+            val (pcmData, sampleRate) = AudioDecoder.decodeToMono(applicationContext, absolutePath) ?: return Result.failure()
             val exactDurationSeconds = pcmData.size.toFloat() / sampleRate.toFloat()
 
             // 150Hz cutoff keeps the kick, removes snare/vocals/hats

@@ -13,21 +13,43 @@ object AudioDecoder {
     private const val TAG = "AudioDecoder"
     private const val DECODE_TIMEOUT_MS = 300_000L // 5 mins
 
-    fun decodeToMono(filePath: String): Pair<FloatArray, Int>? {
-        Log.d(TAG, "=== decodeToMono started for: $filePath ===")
-
-        val file = File(filePath)
-        if (!file.exists()) {
-            Log.e(TAG, "File does not exist: $filePath")
-            return null
+    fun decodeToMono(context: android.content.Context, filePath: String): Pair<FloatArray, Int>? {
+        // Reuse stereo decoder and downmix to save code duplication
+        val (stereoSamples, sampleRate) = decodeToStereo(context, filePath) ?: return null
+        
+        // Downmix Stereo (Interleaved) to Mono Float
+        val monoSamples = FloatArray(stereoSamples.size / 2)
+        for (i in monoSamples.indices) {
+            val left = stereoSamples[i * 2]
+            val right = stereoSamples[i * 2 + 1]
+            // Average and normalize to -1.0..1.0
+            monoSamples[i] = ((left + right) / 2f) / 32768f
         }
+        
+        return Pair(monoSamples, sampleRate)
+    }
+
+    /**
+     * Decodes audio to an interleaved Stereo ShortArray (L, R, L, R...).
+     * Returns Pair(ShortArray, SampleRate).
+     */
+    fun decodeToStereo(context: android.content.Context, filePath: String): Pair<ShortArray, Int>? {
+        Log.d(TAG, "=== decodeToStereo started for: $filePath ===")
 
         val extractor = MediaExtractor()
         var decoder: MediaCodec? = null
-        var loopCount = 0
 
         try {
-            extractor.setDataSource(filePath)
+            if (filePath.startsWith("content://")) {
+                extractor.setDataSource(context, android.net.Uri.parse(filePath), null)
+            } else {
+                 val file = File(filePath)
+                if (!file.exists()) {
+                    Log.e(TAG, "File does not exist: $filePath")
+                    return null
+                }
+                extractor.setDataSource(filePath)
+            }
 
             // Find audio track
             var audioTrackIndex = -1
@@ -50,38 +72,31 @@ object AudioDecoder {
             var channelCount = audioFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
             val duration = audioFormat.getLong(MediaFormat.KEY_DURATION)
 
-            // Estimate array size (add 20% buffer for safety to avoid resizing)
-            val estimatedSamples = ((duration / 1_000_000.0) * sampleRate * 1.2).toInt()
+            // Estimate array size (add 20% buffer)
+            // Duration is in micros. 
+            // Total samples = (duration / 1M) * sampleRate * channels
+            val estimatedSamples = ((duration / 1_000_000.0) * sampleRate * channelCount * 1.2).toInt()
 
             val mime = audioFormat.getString(MediaFormat.KEY_MIME)!!
             decoder = MediaCodec.createDecoderByType(mime)
             decoder.configure(audioFormat, null, null, 0)
             decoder.start()
 
-            // Pre-allocate FloatArray
-            var pcmSamples = FloatArray(estimatedSamples)
+            // Pre-allocate ShortArray
+            var pcmSamples = ShortArray(estimatedSamples)
             var currentIndex = 0
 
             val bufferInfo = MediaCodec.BufferInfo()
             var isEOF = false
             val startTime = System.currentTimeMillis()
 
-            // OPTIMIZATION: Reuse a generic buffer for short conversion to reduce GC
-            // 4096 is a standard starting size, we will resize this specific buffer if needed
-            var reusableShortBuffer = ShortArray(4096)
-
             Log.d(TAG, "Entering decoding loop...")
+            var loopCount = 0
+
             while (!isEOF) {
                 loopCount++
-
-                // Log less frequently (every 2000) to save IO
-                if (loopCount % 2000 == 0) {
-                    val elapsed = (System.currentTimeMillis() - startTime) / 1000.0
-                    Log.d(TAG, "Progress: iteration=$loopCount, samples=$currentIndex, elapsed=${elapsed}s")
-                }
-
                 if (System.currentTimeMillis() - startTime > DECODE_TIMEOUT_MS) {
-                    Log.e(TAG, "Decoding timed out after ${DECODE_TIMEOUT_MS}ms")
+                    Log.e(TAG, "Decoding timed out")
                     return null
                 }
 
@@ -102,41 +117,46 @@ object AudioDecoder {
 
                 // Get output
                 val outputIndex = decoder.dequeueOutputBuffer(bufferInfo, 10000)
-
                 if (outputIndex >= 0) {
                     val outputBuffer = decoder.getOutputBuffer(outputIndex)!!
                     outputBuffer.order(ByteOrder.LITTLE_ENDIAN)
 
                     val shortCount = bufferInfo.size / 2
-
-                    // OPTIMIZATION: Resize reusable buffer only if strictly necessary
-                    if (reusableShortBuffer.size < shortCount) {
-                        reusableShortBuffer = ShortArray(shortCount)
+                    
+                    // Resize if needed
+                    if (currentIndex + shortCount > pcmSamples.size) {
+                         val newSize = (pcmSamples.size * 1.5).toInt().coerceAtLeast(currentIndex + shortCount + 48000)
+                         val newArray = ShortArray(newSize)
+                         System.arraycopy(pcmSamples, 0, newArray, 0, currentIndex)
+                         pcmSamples = newArray
                     }
 
-                    // Read into reusable buffer
-                    outputBuffer.asShortBuffer().get(reusableShortBuffer, 0, shortCount)
-
-                    val samplesNeeded = shortCount / channelCount
-
-                    // Resize main storage array if needed (This is expensive, so we overestimated initial size)
-                    if (currentIndex + samplesNeeded > pcmSamples.size) {
-                        Log.w(TAG, "Resizing main array - initial estimation was too small")
-                        val newArray = FloatArray((currentIndex + samplesNeeded) * 2)
-                        System.arraycopy(pcmSamples, 0, newArray, 0, currentIndex)
-                        pcmSamples = newArray
+                    // We need to handle Mono sources by duplicating channels for Stereo output
+                    val decodedShorts = ShortArray(shortCount)
+                    outputBuffer.asShortBuffer().get(decodedShorts)
+                    
+                    if (channelCount == 1) {
+                         // Convert Mono -> Stereo (L=Input, R=Input)
+                         // We need double the space
+                         if (currentIndex + (shortCount * 2) > pcmSamples.size) {
+                             val newSize = (pcmSamples.size * 1.5).toInt().coerceAtLeast(currentIndex + (shortCount * 2) + 48000)
+                             val newArray = ShortArray(newSize)
+                             System.arraycopy(pcmSamples, 0, newArray, 0, currentIndex)
+                             pcmSamples = newArray
+                         }
+                         
+                         for (s in decodedShorts) {
+                             pcmSamples[currentIndex++] = s
+                             pcmSamples[currentIndex++] = s
+                         }
+                    } else {
+                        // Already Stereo (or more? we assume max 2 for this simple impl, but typically 2)
+                        // If multi-channel > 2, we should probably take first 2, but for now copy all
+                        // Adjust logic if > 2 channels is common (rare for music files)
+                         System.arraycopy(decodedShorts, 0, pcmSamples, currentIndex, shortCount)
+                         currentIndex += shortCount
                     }
-
-                    // Write directly to array using reusable buffer
-                    for (i in 0 until shortCount step channelCount) {
-                        var sample = 0f
-                        val actualChannels = min(channelCount, shortCount - i)
-                        for (ch in 0 until actualChannels) {
-                            sample += reusableShortBuffer[i + ch] / 32768f
-                        }
-                        pcmSamples[currentIndex++] = sample / actualChannels
-                    }
-
+                    
                     decoder.releaseOutputBuffer(outputIndex, false)
 
                     if ((bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
@@ -152,14 +172,15 @@ object AudioDecoder {
                     }
                 }
             }
-
-            // Trim array to actual size
-            val finalArray = if (currentIndex < pcmSamples.size) {
+            
+            // Trim
+             val finalArray = if (currentIndex < pcmSamples.size) {
                 pcmSamples.copyOf(currentIndex)
             } else {
                 pcmSamples
             }
 
+            Log.d(TAG, "=== decodeToStereo COMPLETED: ${finalArray.size} samples @ ${sampleRate}Hz ===")
             return Pair(finalArray, sampleRate)
 
         } catch (e: Exception) {

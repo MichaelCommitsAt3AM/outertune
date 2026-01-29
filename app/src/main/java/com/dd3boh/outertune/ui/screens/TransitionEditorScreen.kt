@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.*
@@ -84,6 +85,13 @@ fun TransitionEditorScreen(
     val effectMode by viewModel.effectMode.collectAsState()
 
     val isPlaying by viewModel.isPlaying.collectAsState()
+    val decksReady by viewModel.areDecksReady.collectAsState()
+    val loadingError by viewModel.loadingError.collectAsState()
+
+    // Debug: Log state changes
+    LaunchedEffect(decksReady, loadingError) {
+        Log.d("TransitionEditorScreen", "UI State - decksReady: $decksReady, loadingError: $loadingError")
+    }
 
     // UI VISIBILITY STATE
     var controlsVisible by remember { mutableStateOf(true) }
@@ -138,6 +146,8 @@ fun TransitionEditorScreen(
                 barsCount = barsCount,
                 isPlaying = isPlaying,
                 showControls = controlsVisible,
+                decksReady = decksReady,
+                loadingError = loadingError,
                 playbackBeatMarker = playbackBeatMarker?.toFloat(),
                 track1OffsetPixels = track1OffsetPixels,
                 track2OffsetPixels = track2OffsetPixels,
@@ -189,6 +199,8 @@ fun WaveformsSection(
     barsCount: Int,
     isPlaying: Boolean,
     showControls: Boolean,
+    decksReady: Boolean,
+    loadingError: String?,
     playbackBeatMarker: Float?,
     track1OffsetPixels: Float,
     track2OffsetPixels: Float,
@@ -290,20 +302,35 @@ fun WaveformsSection(
                     modifier = Modifier.align(Alignment.Center)
                 ) {
                     Surface(
-                        onClick = onPlayPauseClick,
+                        onClick = { if (decksReady) onPlayPauseClick() },
                         shape = CircleShape,
-                        color = Color(0xFF2C2C2C).copy(alpha = 0.95f),
-                        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF4CAF50)),
+                        color = Color(0xFF2C2C2C).copy(alpha = if (decksReady) 0.95f else 0.5f),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, if (decksReady) Color(0xFF4CAF50) else if (loadingError != null) Color.Red else Color.Gray),
                         modifier = Modifier.size(64.dp),
                         shadowElevation = 8.dp
                     ) {
                         Box(contentAlignment = Alignment.Center) {
-                            Icon(
-                                imageVector = if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
-                                contentDescription = if (isPlaying) "Pause" else "Play",
-                                tint = Color.White,
-                                modifier = Modifier.size(32.dp)
-                            )
+                            if (loadingError != null) {
+                                Icon(
+                                    imageVector = Icons.Filled.Close, // Warning: needs context or import! Assuming generic Close or Warning
+                                    contentDescription = "Error",
+                                    tint = Color.Red,
+                                    modifier = Modifier.size(32.dp)
+                                )
+                            } else if (!decksReady) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(32.dp),
+                                    color = Color.Gray,
+                                    strokeWidth = 3.dp
+                                )
+                            } else {
+                                Icon(
+                                    imageVector = if (isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                                    contentDescription = if (isPlaying) "Pause" else "Play",
+                                    tint = if (decksReady) Color.White else Color.Gray,
+                                    modifier = Modifier.size(32.dp)
+                                )
+                            }
                         }
                     }
                 }
