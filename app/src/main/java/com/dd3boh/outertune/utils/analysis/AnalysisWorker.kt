@@ -57,7 +57,7 @@ class AnalysisWorker @AssistedInject constructor(
 
         return try {
             // 2. Decode Raw Audio
-            val (pcmData, sampleRate) = AudioDecoder.decodeToMono(absolutePath) ?: return Result.failure()
+            val (pcmData, sampleRate) = AudioDecoder.decodeToMono(applicationContext, absolutePath) ?: return Result.failure()
             val exactDurationSeconds = pcmData.size.toFloat() / sampleRate.toFloat()
 
             // 150Hz cutoff keeps the kick, removes snare/vocals/hats
@@ -104,10 +104,11 @@ class AnalysisWorker @AssistedInject constructor(
 
             val beatGridSeconds = snappedGrid.map { it / 1000f }
 
-            // CRITICAL CHANGE: Pass 'bassData' here.
-            // Bar detection works significantly better when isolating the bass line.
+            // CRITICAL UPDATE: Pass FULL 'pcmData' here.
+            // The new BarDetector performs its own internal 3-band split (Low/Mid/High).
+            // Passing 'bassData' would strip the Mid/High bands, breaking the new algorithm.
             val barResult = BarDetector.detect(
-                pcmData = bassData,
+                pcmData = pcmData,
                 sampleRate = sampleRate,
                 beatGrid = beatGridSeconds,
                 timeSignature = 4

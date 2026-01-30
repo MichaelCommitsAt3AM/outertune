@@ -69,7 +69,14 @@ fun WaveformView(
                     // visual_center_x = (beat_index * ppb) + scroll + shift
                     // beat_index = (visual_center - scroll - shift) / ppb
                     val exactBeatAtCenter = (viewCenter - currentScroll - shiftPixels) / pixelsPerBeat
-                    val nearestBeatIndex = exactBeatAtCenter.roundToInt()
+                    
+                    // Snap to nearest beat marker
+                    val nearestBeatIndex = if (beatMarkers.isNotEmpty()) {
+                        beatMarkers.minByOrNull { abs(it.beatIndex - exactBeatAtCenter) }?.beatIndex
+                            ?: exactBeatAtCenter.roundToInt().toFloat()
+                    } else {
+                        exactBeatAtCenter.roundToInt().toFloat()
+                    }
 
                     // Calculate target scroll to put that beat exactly in center
                     val targetScroll = viewCenter - (nearestBeatIndex * pixelsPerBeat) - shiftPixels

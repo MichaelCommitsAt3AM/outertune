@@ -47,21 +47,79 @@ object BeatGridNormalizer {
             }
         }
 
-        // 3. Forward fill
+        // 3. Adaptive Forward Fill ("Magnet Grid")
+        // Instead of blind projection, we "magnetically" snap to nearby detected beats
+        // to handle tempo drift (e.g. live drummers or older recordings).
+        
         var currentBeat = bestAnchor
-        // Align the start exactly to our calculated best anchor
-        if (normalizedGrid.isNotEmpty() && abs(normalizedGrid.last() - currentBeat) < 0.01f) {
-            // prevent duplicate if backfill landed exactly on anchor
-        } else {
-            // Determine starting point if backfill didn't reach
-            if (normalizedGrid.isEmpty() && currentBeat < 0) {
-                while(currentBeat < 0) currentBeat += perfectInterval
-            }
+        var currentInterval = perfectInterval
+        
+        // Tuning Parameters
+        val alpha = 0.6f // Phase Correction Strength (0.0 = rigid, 1.0 = strict snap)
+        val beta = 0.1f  // Tempo Adaptation Strength (0.0 = fixed, 1.0 = fluid)
+
+        val sortedDetected = detectedGrid.sorted()
+        var searchIndex = sortedDetected.indexOfFirst { it >= bestAnchor }
+        if (searchIndex == -1) searchIndex = sortedDetected.size
+
+        // Add the anchor itself if not already covered by backfill
+        if (normalizedGrid.isEmpty() || abs(normalizedGrid.last() - currentBeat) > 0.01f) {
+             if (currentBeat <= durationSec) normalizedGrid.add(currentBeat)
         }
 
         while (currentBeat <= durationSec) {
-            if (currentBeat >= 0f) normalizedGrid.add(currentBeat)
-            currentBeat += perfectInterval
+            val predictedNext = currentBeat + currentInterval
+            if (predictedNext > durationSec) break
+            
+            // Search Window: Look for a confirming raw beat within +/- 30% of the interval
+            val window = currentInterval * 0.3f
+            val minSearch = predictedNext - window
+            val maxSearch = predictedNext + window
+            
+            // Fast-forward search index
+            while (searchIndex < sortedDetected.size && sortedDetected[searchIndex] < minSearch) {
+                searchIndex++
+            }
+            
+            // Find closest candidate in window
+            var bestMatch: Float? = null
+            var minDiff = Float.MAX_VALUE
+            
+            var i = searchIndex
+            while (i < sortedDetected.size) {
+                 val candidate = sortedDetected[i]
+                 if (candidate > maxSearch) break 
+                 
+                 val diff = abs(candidate - predictedNext)
+                 if (diff < minDiff) {
+                     minDiff = diff
+                     bestMatch = candidate
+                 }
+                 i++
+            }
+            
+            var nextBeat = predictedNext
+            
+            // --- ADAPTATION ---
+            if (bestMatch != null) {
+                val error = bestMatch - predictedNext
+                
+                // 1. Phase Correction: Nudge towards the specific beat
+                nextBeat = predictedNext + (error * alpha)
+                
+                // 2. Tempo Correction: If we had to move far, adjust the interval for next time
+                val actualStep = nextBeat - currentBeat
+                
+                // Sanity check: Only adapt if the step is reasonable (not double/half time glitches)
+                if (abs(actualStep - currentInterval) < currentInterval * 0.25f) {
+                    currentInterval += (actualStep - currentInterval) * beta
+                }
+            }
+            
+            if (nextBeat <= durationSec) {
+                normalizedGrid.add(nextBeat)
+            }
+            currentBeat = nextBeat
         }
 
         return normalizedGrid.sorted().distinct()

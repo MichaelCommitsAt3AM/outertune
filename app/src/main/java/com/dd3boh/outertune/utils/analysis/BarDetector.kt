@@ -132,30 +132,83 @@ object BarDetector {
 
         if (maxFeature <= 0f) return BarDetectionResult(0, 0f)
 
-        // --- 5. Silence gating to avoid quiet sections biasing the histogram ---
-        val silenceThreshold = maxFeature * 0.12f
+        // --- 5. Adaptive Silence Threshold & Sliding Window Histogram ---
+        // Instead of a global threshold (which fails on dynamic songs) and global histogram (where loud parts dominate),
+        // we process the song in windows. Each window votes for the downbeat offset based on its own local energy.
 
-        // --- 6. Beat-phase histogram accumulation ---
-        val buckets = FloatArray(timeSignature) { 0f }
-        val counts = IntArray(timeSignature) { 0 }
-
-        for (i in skipInitialBeats until nBeats) {
-            val off = i % timeSignature
-            val valFeature = features[i]
-            if (valFeature < silenceThreshold) continue
-            buckets[off] += valFeature
-            counts[off]++
+        // A. Dynamic Start (Skip quiet intros)
+        val significantThreshold = maxFeature * 0.40f
+        var firstRobustBeat = 0
+        for (i in 0 until nBeats) {
+            if (features[i] >= significantThreshold) {
+                firstRobustBeat = i
+                break
+            }
         }
+        val effectiveStart = max(skipInitialBeats, firstRobustBeat)
 
-        // If no buckets have counts (all quiet), return low confidence
-        val anyCounts = counts.any { it > 0 }
-        if (!anyCounts) return BarDetectionResult(0, 0f)
+        // B. Sliding Window Processing
+        val windowSize = 32 // 8 bars (4/4) - good balance of local vs global
+        val globalBuckets = FloatArray(timeSignature) { 0f }
+        var windowsProcessed = 0
+        
+        var chunkStart = effectiveStart
+        
+        while (chunkStart < nBeats) {
+            val chunkEnd = min(nBeats, chunkStart + windowSize)
+            
+            // Skip small incomplete windows at the end
+            if (chunkEnd - chunkStart < 16) {
+                chunkStart += windowSize
+                continue
+            }
 
-        // Mean per bucket to avoid long songs dominating by sheer count
-        val means = FloatArray(timeSignature) { 0f }
+            // 1. Compute Local Threshold (Adaptive)
+            // Use median of features in this window. 
+            // This ensures we can detect beats in a quiet bridge just as well as a loud drop.
+            val windowFeatures = FloatArray(chunkEnd - chunkStart) { j -> features[chunkStart + j] }
+            val windowMedian = median(windowFeatures)
+            
+            // Sanity check: if this window is effectively silence (relative to song peak), skip it.
+            if (windowMedian < maxFeature * 0.05f) {
+                chunkStart += windowSize
+                continue 
+            }
+            
+            val localThreshold = windowMedian * 0.5f 
+
+            // 2. Accumulate Local Histogram
+            val localBuckets = FloatArray(timeSignature) { 0f }
+            var localSum = 0f
+            
+            for (i in chunkStart until chunkEnd) {
+                 val valFeature = features[i]
+                 if (valFeature < localThreshold) continue
+                 
+                 val off = i % timeSignature
+                 localBuckets[off] += valFeature
+                 localSum += valFeature
+            }
+            
+            // 3. Normalize and Vote
+            // Normalization is CRITICAL. It ensures a quiet window casts a vote worth exactly 1.0,
+            // same as a loud window. This enforces "Temporal Consistency".
+            if (localSum > 0f) {
+                for (o in 0 until timeSignature) {
+                    globalBuckets[o] += (localBuckets[o] / localSum)
+                }
+                windowsProcessed++
+            }
+            
+            chunkStart += windowSize
+        }
+        
+        if (windowsProcessed == 0) return BarDetectionResult(0, 0f)
+
+        // --- 6. Aggregate Results ---
+        val means = FloatArray(timeSignature)
         for (o in 0 until timeSignature) {
-            if (counts[o] > 0) means[o] = buckets[o] / counts[o]
-            else means[o] = 0f
+             means[o] = globalBuckets[o] / windowsProcessed
         }
 
         // --- 7. Softmax-based confidence (stable numerics) ---

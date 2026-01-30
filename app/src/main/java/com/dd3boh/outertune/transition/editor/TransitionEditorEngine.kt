@@ -60,10 +60,15 @@ class TransitionEditorEngine(
             val wfA = loadWaveform(songA.song.waveformPath, songAId)
             val wfB = loadWaveform(songB.song.waveformPath, songBId)
 
+            // 4.5. Refine Grids using Waveform Data (Snap to Peaks)
+            // This ensures the visual markers verifyably line up with the audio peaks
+            val alignedGridA = alignGridToWaveform(gridA, wfA, durA)
+            val alignedGridB = alignGridToWaveform(gridB, wfB, durB)
+
             // Convert to Beat Domain (Visual alignment)
             // Note: Waveform B is scaled if we are doing Interval Matching to visually align beats
-            val beatWfA = convertWaveformToBeatDomain(wfA, gridA, durA, samplesPerBeat, 1.0)
-            val beatWfB = convertWaveformToBeatDomain(wfB, gridB, durB, samplesPerBeat, scalarB)
+            val beatWfA = convertWaveformToBeatDomain(wfA, alignedGridA, durA, samplesPerBeat, 1.0)
+            val beatWfB = convertWaveformToBeatDomain(wfB, alignedGridB, durB, samplesPerBeat, scalarB)
 
             // 5. Generate Markers
             val markers = generateBeatMarkers(beatWfA, songA.song.timeSignature, songA.song.downbeatOffset)
@@ -76,8 +81,8 @@ class TransitionEditorEngine(
                 waveformBeatDomain1 = beatWfA,
                 waveformBeatDomain2 = beatWfB,
                 beatMarkers = markers,
-                rawGrid1 = gridA,
-                rawGrid2 = gridB,
+                rawGrid1 = alignedGridA,
+                rawGrid2 = alignedGridB,
                 durationSec1 = durA,
                 durationSec2 = durB
             )
@@ -236,5 +241,58 @@ class TransitionEditorEngine(
         }
 
         return fileToLoad.readText().split(",").mapNotNull { it.toFloatOrNull() }.toFloatArray()
+    }
+
+    private fun alignGridToWaveform(
+        grid: List<Double>,
+        waveform: FloatArray,
+        durationSec: Double
+    ): List<Double> {
+        if (grid.isEmpty() || waveform.isEmpty()) return grid
+
+        val indicesPerSecond = waveform.size.toDouble() / durationSec
+        // Estimate average interval
+        val avgInterval = if (grid.size > 1) (grid.last() - grid.first()) / (grid.size - 1) else 0.5
+
+        // Search window: +/- 35% of the beat interval (avoid jumping to next beat)
+        val searchRange = avgInterval * 0.35
+        val steps = 30 // Granularity
+        var bestOffset = 0.0
+        var bestEnergy = -1.0
+
+        // Scan offsets
+        for (i in -steps..steps) {
+            val offset = (i.toDouble() / steps) * searchRange
+
+            var totalEnergy = 0.0
+            var count = 0
+
+            // Check energy at grid points
+            // Optimization: check a subset of beats if grid is huge, but usually <500 items, so fast.
+            for (beatTime in grid) {
+                val t = beatTime + offset
+                if (t >= 0 && t < durationSec) {
+                    val index = (t * indicesPerSecond).toInt()
+                    // Sum 3 samples around the point for robustness
+                    if (index >= 1 && index < waveform.size - 1) {
+                        val e = abs(waveform[index-1]) + abs(waveform[index]) + abs(waveform[index+1])
+                        totalEnergy += e
+                        count++
+                    }
+                }
+            }
+
+            val avgEnergy = if (count > 0) totalEnergy / count else 0.0
+
+            if (avgEnergy > bestEnergy) {
+                bestEnergy = avgEnergy
+                bestOffset = offset
+            }
+        }
+
+        Log.d(TAG, "Refined grid by offset: ${bestOffset * 1000} ms")
+
+        // Apply the best offset
+        return grid.map { it + bestOffset }
     }
 }

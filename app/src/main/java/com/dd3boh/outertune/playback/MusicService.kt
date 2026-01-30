@@ -436,7 +436,8 @@ class MusicService : MediaLibraryService(),
                 normalizeFactor.value = if (normalizeAudio && format?.loudnessDb != null) {
                     min(10f.pow(-format.loudnessDb.toFloat() / 20), 1f)
                 } else {
-                    1f
+                    // Safe default: 0.5f (-6dB) to prevent volume bursts while loading format
+                    0.5f
                 }
             }
 
@@ -1082,7 +1083,7 @@ class MusicService : MediaLibraryService(),
         val nextSong = queueBoard.peekNext()
         if (nextSong == null || nextSong.id != transition.toSongId) {
             Log.w(TAG, "⚠️ Queue Changed! Expected: ${transition.toSongId}, Got: ${nextSong?.id}")
-            monitorCurrentTransition(player.currentMediaItem?.mediaId ?: "", nextSong?.id)
+            loadTransitionOnce(player.currentMediaItem?.mediaId ?: "", nextSong?.id)
             return
         }
 
@@ -1117,8 +1118,11 @@ class MusicService : MediaLibraryService(),
                          val startB = ((entrySec - preroll).coerceAtLeast(0.0) * 1000).toLong()
                          val endB = ((entrySec + durSec + 10.0) * 1000).toLong()
                     
-                         val gridA = loadGrid(songA, startA, endA)
-                         val gridB = loadGrid(songB, startB, endB)
+                         val (gridA, gridB) = withContext(Dispatchers.IO) {
+                             val gA = loadGrid(songA, startA, endA)
+                             val gB = loadGrid(songB, startB, endB)
+                             gA to gB
+                         }
 
                          val bpmA = songA.displayBpm ?: 0f
                          val bpmB = songB.displayBpm ?: 0f
@@ -1206,7 +1210,7 @@ class MusicService : MediaLibraryService(),
 
                 offloadScope.launch {
                     val songAfterNext = queueBoard.getSongAtIndex(nextIndex + 1)
-                    monitorCurrentTransition(nextSong.id, songAfterNext?.id)
+                    loadTransitionOnce(nextSong.id, songAfterNext?.id)
 
                     withContext(Dispatchers.Main) {
                         _logicalState.value = LogicalPlayerState(
@@ -1471,7 +1475,7 @@ class MusicService : MediaLibraryService(),
 
             offloadScope.launch {
                 val nextSong = queueBoard.peekNext() // This works now
-                monitorCurrentTransition(currentId, nextSong?.id)
+                loadTransitionOnce(currentId, nextSong?.id)
             }
         }
 
@@ -1479,83 +1483,81 @@ class MusicService : MediaLibraryService(),
     }
     
     // --- Transition Monitoring ---
-    private var transitionJob: Job? = null
+    private var loadJob: Job? = null
     private var isTransitionDataLoaded = false
 
-    private fun monitorCurrentTransition(currentId: String, nextId: String?) {
-        transitionJob?.cancel()
+    private fun loadTransitionOnce(currentId: String, nextId: String?) {
+        loadJob?.cancel()
         currentTransitionCache = null // Clear old cache immediately
         currentTransitionPlan = null
         currentTransitionConfig = null
         isTransitionDataLoaded = false
         
         if (nextId == null) {
-            Log.d(TAG, "monitorCurrentTransition: Next song is null (EndOfQueue). Monitoring disabled.")
+            Log.d(TAG, "loadTransitionOnce: Next song is null (EndOfQueue). Monitoring disabled.")
             return
         }
 
-        Log.d(TAG, "monitorCurrentTransition: Monitoring Transition Flow for $currentId -> $nextId")
+        Log.d(TAG, "loadTransitionOnce: Checking Transition for $currentId -> $nextId (One-time)")
         
-        transitionJob = offloadScope.launch {
-             transitionDao.getTransitionFlow(currentId, nextId)
-                 .distinctUntilChanged()
-                 .collect { transition ->
-                     currentTransitionCache = transition
-                     // Reset plan when transition definition changes
-                     currentTransitionPlan = null 
-                     currentTransitionConfig = null
-                     isTransitionDataLoaded = false
+        loadJob = offloadScope.launch {
+             val transition = transitionDao.getTransition(currentId, nextId)
+             
+             currentTransitionCache = transition
+             // Reset plan data
+             currentTransitionPlan = null 
+             currentTransitionConfig = null
+             isTransitionDataLoaded = false
 
-                     if (transition != null) {
-                        Log.d(TAG, "Transition Updated in Cache! Exit=${transition.exitPointMs}, Dur=${transition.durationMs}")
+             if (transition != null) {
+                Log.d(TAG, "Transition Found! Exit=${transition.exitPointMs}, Dur=${transition.durationMs}")
 
-                        // --- CHECK FILE EXISTENCE (Lightweight) ---
-                        val songA = database.song(currentId).firstOrNull()?.song
-                        val songB = database.song(nextId).firstOrNull()?.song
-                        
-                        if (songA != null && songB != null) {
-                             val hasGridA = songA.beatGridPath != null && java.io.File(songA.beatGridPath).exists()
-                             val hasGridB = songB.beatGridPath != null && java.io.File(songB.beatGridPath).exists()
-                             
-                             if (!hasGridA || !hasGridB) {
-                                  // Try Simple Grid?
-                                  if (songA.displayBpm == null || songB.displayBpm == null) {
-                                      Log.w(TAG, "Transition exists but missing BeatGrids/BPM. Optimistic monitoring.")
-                                  }
-                             }
-                        }
-
-                        // Pre-warm the secondary deck (player only, no beats yet)
-                        val nextSong = queueBoard.peekNext() 
-                        
-                        if (nextSong != null && nextSong.id == nextId) {
-                            val bpmA = songA?.displayBpm ?: 120f 
-                            val bpmB = songB?.displayBpm ?: 120f
-                            val speedRatio = if (transition.syncTempo && bpmB > 0) bpmA / bpmB else null
-                            
-                            // Pre-fetch normalization
-                            val nextFormat = database.format(nextId).firstOrNull()
-                            val nextNorm = if (nextFormat?.loudnessDb != null) {
-                                min(10f.pow(-nextFormat.loudnessDb.toFloat() / 20), 1f)
-                            } else 1f
-                            nextSongnormFactorCache = nextNorm
-
-                            val mediaItem = nextSong.toMediaItem()
-                            
-                            // Approximate start time (Entry Point - 3s) since we don't have accurate grid yet
-                            val startMs = (transition.entryPointMs - 3000).coerceAtLeast(0)
-
-                            withContext(Dispatchers.Main) {
-                                if (!deckManager.standbyDeck.isPlaying) {
-                                    deckManager.prepareNext(mediaItem, startMs, speedRatio)
-                                    deckManager.setStandbyVolumeMultiplier(nextNorm)
-                                }
-                            }
-                        }
-                     } else {
-                        Log.d(TAG, "Transition Flow emitted NULL (No saved transition)")
+                // --- CHECK FILE EXISTENCE (Lightweight) ---
+                val songA = database.song(currentId).firstOrNull()?.song
+                val songB = database.song(nextId).firstOrNull()?.song
+                
+                if (songA != null && songB != null) {
+                     val hasGridA = songA.beatGridPath != null && java.io.File(songA.beatGridPath).exists()
+                     val hasGridB = songB.beatGridPath != null && java.io.File(songB.beatGridPath).exists()
+                     
+                     if (!hasGridA || !hasGridB) {
+                          // Try Simple Grid?
+                          if (songA.displayBpm == null || songB.displayBpm == null) {
+                              Log.w(TAG, "Transition exists but missing BeatGrids/BPM. Optimistic monitoring.")
+                          }
                      }
-                 }
+                }
+
+                // Pre-warm the secondary deck (player only, no beats yet)
+                val nextSong = queueBoard.peekNext() 
+                
+                if (nextSong != null && nextSong.id == nextId) {
+                    val bpmA = songA?.displayBpm ?: 120f 
+                    val bpmB = songB?.displayBpm ?: 120f
+                    val speedRatio = if (transition.syncTempo && bpmB > 0) bpmA / bpmB else null
+                    
+                    // Pre-fetch normalization
+                    val nextFormat = database.format(nextId).firstOrNull()
+                    val nextNorm = if (nextFormat?.loudnessDb != null) {
+                        min(10f.pow(-nextFormat.loudnessDb.toFloat() / 20), 1f)
+                    } else 1f
+                    nextSongnormFactorCache = nextNorm
+
+                    val mediaItem = nextSong.toMediaItem()
+                    
+                    // Approximate start time (Entry Point - 3s) since we don't have accurate grid yet
+                    val startMs = (transition.entryPointMs - 3000).coerceAtLeast(0)
+
+                    withContext(Dispatchers.Main) {
+                        if (!deckManager.standbyDeck.isPlaying) {
+                            deckManager.prepareNext(mediaItem, startMs, speedRatio)
+                            deckManager.setStandbyVolumeMultiplier(nextNorm)
+                        }
+                    }
+                }
+             } else {
+                Log.d(TAG, "No transition found in DB.")
+             }
         }
     }
     

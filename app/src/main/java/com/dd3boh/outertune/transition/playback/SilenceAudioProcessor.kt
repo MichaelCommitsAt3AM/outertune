@@ -36,8 +36,9 @@ class SilenceAudioProcessor : BaseAudioProcessor() {
 
         if (isEnabled) {
             // Write zeros
-            // We use a simple ByteArray for now; could be optimized with a cached zero buffer
-            buffer.put(ByteArray(remaining))
+            val zeroBuffer = ByteBuffer.allocate(remaining) // Allocates 0s by default
+            buffer.put(zeroBuffer)
+            
             // Consume the input by advancing its position
             inputBuffer.position(inputBuffer.position() + remaining)
         } else {

@@ -42,6 +42,9 @@ class TransitionPlaybackEngine(
     private val _decksReady = MutableStateFlow(false)
     val decksReady: StateFlow<Boolean> = _decksReady.asStateFlow()
 
+    private val _loadingError = MutableStateFlow<String?>(null)
+    val loadingError: StateFlow<String?> = _loadingError.asStateFlow()
+
     data class PlaybackState(
         val isPlaying: Boolean = false,
         val currentBeatA: Float = 0f,
@@ -93,6 +96,7 @@ class TransitionPlaybackEngine(
         deckAState = DeckWarmState.PREPARING
         deckBState = DeckWarmState.PREPARING
         _decksReady.value = false
+        _loadingError.value = null
 
         // Enable Silence for pre-warm
         silenceProcessorA.isEnabled = true
@@ -140,6 +144,9 @@ class TransitionPlaybackEngine(
 
             if (resultA && resultB) {
                 _decksReady.value = true
+            } else {
+                 if (!resultA) _loadingError.value = "Deck A Failed to Warm Up"
+                 if (!resultB) _loadingError.value = "Deck B Failed to Warm Up"
             }
         }
     }
@@ -158,6 +165,7 @@ class TransitionPlaybackEngine(
                 }
             } ?: run {
                 Log.e(TAG, "Deck $label timed out waiting for STATE_READY")
+                _loadingError.value = "Deck $label timeout (Ready)"
                 return false
             }
 
@@ -171,6 +179,7 @@ class TransitionPlaybackEngine(
                 }
             } ?: run {
                 Log.e(TAG, "Deck $label timed out waiting for playback start")
+                _loadingError.value = "Deck $label timeout (Playback)"
                 return false
             }
 
@@ -180,6 +189,7 @@ class TransitionPlaybackEngine(
             true
         } catch (e: Exception) {
             Log.e(TAG, "Failed to warm up deck $label", e)
+            _loadingError.value = "Deck $label error: ${e.message}"
             false
         }
     }

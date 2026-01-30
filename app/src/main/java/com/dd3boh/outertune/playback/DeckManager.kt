@@ -186,7 +186,8 @@ class DeckManager(
         // 1. Setup
         val pA = activeDeck
         val pB = standbyDeck
-        val outMult = activeMultiplier
+        // Use current volume to prevent jumps
+        val outMult = pA.volume
         val inMult = standbyMultiplier
 
         Log.e(TAG, "  Active Deck: ${if (pA == playerA) "A" else "B"}")
@@ -529,6 +530,7 @@ class DeckManager(
                 return androidx.media3.exoplayer.audio.DefaultAudioSink.Builder(context)
                     .setPcmEncodingRestrictionLifted(pcmEncodingRestrictionLifted)
                     .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
+                    .setEnableFloatOutput(enableFloatOutput) // Enable 32-bit Float High-Res Audio
                     .setAudioProcessorChain(
                         androidx.media3.exoplayer.audio.DefaultAudioSink.DefaultAudioProcessorChain(
                             androidx.media3.exoplayer.audio.SilenceSkippingAudioProcessor(),

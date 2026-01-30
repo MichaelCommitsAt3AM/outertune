@@ -127,8 +127,8 @@ class MusicDatabase(
         AutoMigration(from = 17, to = 18, spec = Migration17To18::class), // Fix Room nonsense
         AutoMigration(from = 18, to = 19), // Recent activity
         AutoMigration(from = 19, to = 20, spec = Migration19To20::class), // Db optimization, remove totalplaytime, local media fields
-        AutoMigration(from = 22, to = 23, spec = Migration22To23::class),
-        AutoMigration(from = 23, to = 24),
+//        AutoMigration(from = 22, to = 23, spec = Migration22To23::class),
+//        AutoMigration(from = 23, to = 24),
     ]
 )
 @TypeConverters(Converters::class)
@@ -150,6 +150,8 @@ abstract class InternalDatabase : RoomDatabase() {
                     .addMigrations(MIGRATION_16_17)
                     .addMigrations(MIGRATION_20_21)
                     .addMigrations(MIGRATION_21_22)
+                    .addMigrations(MIGRATION_22_23)
+                    .addMigrations(MIGRATION_23_24)
                     .addMigrations(MIGRATION_24_25) // New Bar Detection Migration
                     .addMigrations(MIGRATION_25_26)
                     .build()
@@ -164,6 +166,8 @@ abstract class InternalDatabase : RoomDatabase() {
                     .addMigrations(MIGRATION_15_16)
                     .addMigrations(MIGRATION_16_17)
                     .addMigrations(MIGRATION_21_22)
+                    .addMigrations(MIGRATION_22_23)
+                    .addMigrations(MIGRATION_23_24)
                     .addMigrations(MIGRATION_24_25) // New Bar Detection Migration
                     .addMigrations(MIGRATION_25_26)
                     .build()
@@ -749,6 +753,59 @@ val MIGRATION_21_22 = object : Migration(21, 22) {
     }
 }
 
+val MIGRATION_22_23 = object : Migration(22, 23) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        // Drop columns from downloads table: bpm, beatGrid, waveformData, analysisStatus, analyzedAt
+        // Retain: songId, localPath, downloadedAt, fileSize
+        // We must recreate the table as SQLite usually doesn't support DROP COLUMN on older SDKs reliably, 
+        // and it's cleaner to ensure schema matches DownloadEntity.
+        
+        db.execSQL("CREATE TABLE IF NOT EXISTS `downloads_new` (`songId` TEXT NOT NULL, `localPath` TEXT NOT NULL, `downloadedAt` INTEGER NOT NULL, `fileSize` INTEGER, PRIMARY KEY(`songId`))")
+
+        // If 'downloads' table exists, copy data
+        // We check if table exists first
+        val curs = db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='downloads'")
+        if (curs.moveToFirst()) {
+            // Copy data columns that exist in both
+            // We only copy songId, localPath, downloadedAt, fileSize if they exist
+            // Assuming they exist. If 'downloads' was created with extra columns, these should be there.
+            // However, we handle the case where 'downloads' might be missing or empty.
+             db.execSQL("""
+                INSERT OR IGNORE INTO downloads_new (songId, localPath, downloadedAt, fileSize)
+                SELECT songId, localPath, downloadedAt, fileSize FROM downloads
+            """)
+            db.execSQL("DROP TABLE downloads")
+        }
+        curs.close()
+
+        db.execSQL("ALTER TABLE downloads_new RENAME TO downloads")
+    }
+}
+
+val MIGRATION_23_24 = object : Migration(23, 24) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        // Add display_bpm to song
+        // We use try-catch or check column existence to be safe, but generic add column is usually fine if not exists
+        // SQLite doesn't support ADD COLUMN IF NOT EXISTS in all versions, but we can catch error
+        
+        // Check if column exists
+        val cursor = db.query("PRAGMA table_info(song)")
+        var exists = false
+        while (cursor.moveToNext()) {
+            if (cursor.getString(cursor.getColumnIndexOrThrow("name")) == "display_bpm") {
+                exists = true
+                break
+            }
+        }
+        cursor.close()
+
+        if (!exists) {
+            db.execSQL("ALTER TABLE song ADD COLUMN display_bpm REAL DEFAULT NULL")
+        }
+    }
+}
+
+/*
 @DeleteColumn.Entries(
     DeleteColumn(tableName = "downloads", columnName = "bpm"),
     DeleteColumn(tableName = "downloads", columnName = "beatGrid"),
@@ -757,6 +814,7 @@ val MIGRATION_21_22 = object : Migration(21, 22) {
     DeleteColumn(tableName = "downloads", columnName = "analyzedAt")
 )
 class Migration22To23 : AutoMigrationSpec
+*/
 
 /**
  * Nonsense migration failure
