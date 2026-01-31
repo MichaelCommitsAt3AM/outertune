@@ -47,6 +47,7 @@ import com.dd3boh.outertune.extensions.toMediaItem
 import com.dd3boh.outertune.extensions.togglePlayPause
 import com.dd3boh.outertune.models.toMediaMetadata
 import com.dd3boh.outertune.playback.queues.ListQueue
+import com.dd3boh.outertune.playback.queues.YouTubeQueue
 import com.dd3boh.outertune.ui.component.ChipsRow
 import com.dd3boh.outertune.ui.component.EmptyPlaceholder
 import com.dd3boh.outertune.ui.component.LazyColumnScrollbar
@@ -172,19 +173,10 @@ fun OnlineSearchResult(
                                         if (item.id == mediaMetadata?.id) {
                                             playerConnection.player.togglePlayPause()
                                         } else {
-                                            val songSuggestions = collection.filter { it is SongItem }
                                             playerConnection.playQueue(
-                                                ListQueue(
-                                                    title = "${context.getString(R.string.queue_searched_songs_ot)} ${
-                                                        URLDecoder.decode(
-                                                            viewModel.query,
-                                                            "UTF-8"
-                                                        )
-                                                    }",
-                                                    items = songSuggestions.map { (it as SongItem).toMediaMetadata() },
-                                                    startIndex = songSuggestions.indexOf(item)
-                                                ),
+                                                YouTubeQueue.radio(item.toMediaMetadata()),
                                                 replace = true,
+                                                isRadio = true,
                                             )
                                         }
                                     }

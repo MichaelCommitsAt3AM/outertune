@@ -373,7 +373,10 @@ class DeckManager(
         val player = activeDeck
         val startSpeed = player.playbackParameters.speed
 
-        if (startSpeed == 1f) {
+        // Optimization: If speed is already very close to 1.0 (within 1%), just snap it instantly.
+        // This avoids running the Sonic processor for 10s unnecessarily, which causes "choppy" artifacts.
+        if (abs(startSpeed - 1f) < 0.01f) {
+            if (startSpeed != 1f) player.setPlaybackSpeed(1f)
             _activeDeckSpeed.value = 1f
             return
         }
@@ -393,7 +396,8 @@ class DeckManager(
                 player.setPlaybackSpeed(newSpeed)
                 _activeDeckSpeed.value = newSpeed
 
-                delay(100)
+                // Reduce update frequency to 500ms to allow Sonic to stabilize
+                delay(500)
             }
             player.setPlaybackSpeed(1f)
             _activeDeckSpeed.value = 1f

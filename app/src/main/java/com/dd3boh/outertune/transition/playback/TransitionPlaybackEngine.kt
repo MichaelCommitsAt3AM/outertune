@@ -24,6 +24,10 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.io.File
 import kotlin.math.abs
+import android.os.Handler
+import android.os.HandlerThread
+import android.os.Process
+import kotlinx.coroutines.android.asCoroutineDispatcher
 
 /**
  * Real-time audio engine for executing DJ transitions.
@@ -73,8 +77,18 @@ class TransitionPlaybackEngine(
     private var deckAState = DeckWarmState.COLD
     private var deckBState = DeckWarmState.COLD
 
+    // EQ optimization state
+    private var lastBassA = -1f
+    private var lastFilterA = -1f
+    private var lastBassB = -1f
+    private var lastFilterB = -1f
+
     private var playbackJob: Job? = null
-    private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+    
+    // Dedicated Audio Thread to prevent UI Jitter AND satisfy ExoPlayer thread confinement
+    private val audioThread = HandlerThread("TransitionAudioThread", Process.THREAD_PRIORITY_AUDIO).apply { start() }
+    private val audioDispatcher = Handler(audioThread.looper).asCoroutineDispatcher()
+    private val scope = CoroutineScope(audioDispatcher + SupervisorJob())
 
     @Volatile
     private var activeConfig: TransitionConfig? = null
@@ -91,43 +105,46 @@ class TransitionPlaybackEngine(
      * 4. Enters "soft-idle" mode.
      */
     fun prewarmDecks(uriA: String, uriB: String) {
-        cancelControlLoopOnly()
-
-        deckAState = DeckWarmState.PREPARING
-        deckBState = DeckWarmState.PREPARING
+        // Reset state immediately for UI responsiveness
         _decksReady.value = false
         _loadingError.value = null
 
-        // Enable Silence for pre-warm
-        silenceProcessorA.isEnabled = true
-        silenceProcessorB.isEnabled = true
-
-        if (playerA == null) playerA = createPlayer("A")
-        if (playerB == null) playerB = createPlayer("B")
-
-        val mediaItemA = MediaItem.fromUri(Uri.fromFile(File(uriA)))
-        val mediaItemB = MediaItem.fromUri(Uri.fromFile(File(uriB)))
-
-        // Reset players
-        playerA?.apply {
-            setMediaItem(mediaItemA)
-            volume = 1.0f // Full volume, handled by SilenceProcessor
-            repeatMode = Player.REPEAT_MODE_OFF
-            setPlaybackSpeed(1.0f)
-        }
-
-        playerB?.apply {
-            setMediaItem(mediaItemB)
-            volume = 1.0f // Full volume, handled by SilenceProcessor
-            repeatMode = Player.REPEAT_MODE_OFF
-            setPlaybackSpeed(1.0f)
-        }
-
-        eqA?.release(); eqA = null
-        eqB?.release(); eqB = null
-
-        // Launch prewarm sequence
+        // Dispatch heavy lifting and player creation to Audio Thread
         scope.launch {
+            cancelControlLoopOnly()
+
+            deckAState = DeckWarmState.PREPARING
+            deckBState = DeckWarmState.PREPARING
+            
+            // Enable Silence for pre-warm
+            silenceProcessorA.isEnabled = true
+            silenceProcessorB.isEnabled = true
+
+            if (playerA == null) playerA = createPlayer("A")
+            if (playerB == null) playerB = createPlayer("B")
+
+            val mediaItemA = MediaItem.fromUri(Uri.fromFile(File(uriA)))
+            val mediaItemB = MediaItem.fromUri(Uri.fromFile(File(uriB)))
+
+            // Reset players
+            playerA?.apply {
+                setMediaItem(mediaItemA)
+                volume = 1.0f // Full volume, handled by SilenceProcessor
+                repeatMode = Player.REPEAT_MODE_OFF
+                setPlaybackSpeed(1.0f)
+            }
+
+            playerB?.apply {
+                setMediaItem(mediaItemB)
+                volume = 1.0f // Full volume, handled by SilenceProcessor
+                repeatMode = Player.REPEAT_MODE_OFF
+                setPlaybackSpeed(1.0f)
+            }
+
+            eqA?.release(); eqA = null
+            eqB?.release(); eqB = null
+
+            // Launch prewarm sequence (already on correct thread, but async for parallelism)
             val jobA = async { warmUpDeck(playerA, "A") }
             val jobB = async { warmUpDeck(playerB, "B") }
 
@@ -203,56 +220,52 @@ class TransitionPlaybackEngine(
      * Assumes decks are already WARM (Soft-Idle).
      */
     fun play(plan: TransitionPlan, config: TransitionConfig) {
-        val pA = playerA ?: return
-        val pB = playerB ?: return
-
-        if (deckAState != DeckWarmState.WARM || deckBState != DeckWarmState.WARM) {
-            Log.e(TAG, "Play called on cold decks - Ignoring request to prevent jitter.")
-            return
-        }
-
-        activeConfig = config
-        initEQs()
-
-        cancelControlLoopOnly()
+        // Update state immediately for UI
         _playbackState.value = _playbackState.value.copy(isPlaying = true)
-
-        // --- 1. Calculate Start Times ---
-        val timeAnchorA = TransitionMath.getTimestampForBeat(plan.gridA, plan.anchorBeatA)
-        val timeAnchorB = TransitionMath.getTimestampForBeat(plan.gridB, plan.anchorBeatB)
-
-        val seekA = (timeAnchorA - PREROLL_SECONDS).coerceAtLeast(0.0)
-        val prerollB = if (plan.gridScalarB == 1.0) PREROLL_SECONDS else PREROLL_SECONDS * plan.initialSpeedB
-        val seekB = (timeAnchorB - prerollB).coerceAtLeast(0.0)
-
-        // --- 2. Setup Players ---
-        // Disable silence for Deck A (it needs to be heard immediately usually, or controlled by mixer)
-        // Deck B starts silent until mixed in
-        // Ideally, we keep silence ENABLED until the loop decides to unmute them.
-        // But for instant start, let's keep them silenced and let the loop unmute.
         
-        // Actually, for safety, let's rely on volume 0 initially in the loop, 
-        // OR better: flip silence OFF but set volume to 0.001 (or 0) via mixer.
-        // BUT the whole point was to avoid volume 0.
-        // So:
-        silenceProcessorA.isEnabled = false
-        silenceProcessorB.isEnabled = false
-        
-        // Set initial volumes
-        pA.volume = 0f 
-        pB.volume = 0f
-
-        pA.setPlaybackSpeed(1.0f)
-        pB.setPlaybackSpeed(plan.initialSpeedB.toFloat())
-
-        pA.seekTo((seekA * 1000).toLong())
-        pB.seekTo((seekB * 1000).toLong())
-
-        pA.play()
-        pB.play()
-
-        // --- 3. Start Control Loop ---
+        // Dispatch to Audio Thread
         playbackJob = scope.launch {
+            val pA = playerA
+            val pB = playerB
+            
+            if (pA == null || pB == null) return@launch
+
+            if (deckAState != DeckWarmState.WARM || deckBState != DeckWarmState.WARM) {
+                Log.e(TAG, "Play called on cold decks - Ignoring request to prevent jitter.")
+                return@launch
+            }
+
+            activeConfig = config
+            initEQs()
+
+            // cancelControlLoopOnly() // No need, we are essentially starting it
+            // _playbackState value is already set
+
+            // --- 1. Calculate Start Times ---
+            val timeAnchorA = TransitionMath.getTimestampForBeat(plan.gridA, plan.anchorBeatA)
+            val timeAnchorB = TransitionMath.getTimestampForBeat(plan.gridB, plan.anchorBeatB)
+
+            val seekA = (timeAnchorA - PREROLL_SECONDS).coerceAtLeast(0.0)
+            val prerollB = if (plan.gridScalarB == 1.0) PREROLL_SECONDS else PREROLL_SECONDS * plan.initialSpeedB
+            val seekB = (timeAnchorB - prerollB).coerceAtLeast(0.0)
+
+            // --- 2. Setup Players ---
+            silenceProcessorA.isEnabled = false
+            silenceProcessorB.isEnabled = false
+            
+            pA.volume = 0f 
+            pB.volume = 0f
+
+            pA.setPlaybackSpeed(1.0f)
+            pB.setPlaybackSpeed(plan.initialSpeedB.toFloat())
+
+            pA.seekTo((seekA * 1000).toLong())
+            pB.seekTo((seekB * 1000).toLong())
+
+            pA.play()
+            pB.play()
+
+            // --- 3. Start Control Loop ---
             runControlLoop(pA, pB, plan, seekA)
         }
     }
@@ -261,33 +274,35 @@ class TransitionPlaybackEngine(
      * Stops playback and returns to Soft-Idle state.
      */
     fun stop() {
-        cancelControlLoopOnly()
-
-        // Re-enable Silence
-        silenceProcessorA.isEnabled = true
-        silenceProcessorB.isEnabled = true
-
-        // Keep clock hot
-        playerA?.apply {
-            volume = 1f
-            setPlaybackSpeed(1f)
-            seekTo(currentPosition) // Flush buffer to kill residual sound
-            play()
-        }
-        playerB?.apply {
-            volume = 1f
-            setPlaybackSpeed(1f)
-            seekTo(currentPosition) // Flush buffer to kill residual sound
-            play()
-        }
-
-        resetEQ(eqA)
-        resetEQ(eqB)
-
-        deckAState = DeckWarmState.WARM
-        deckBState = DeckWarmState.WARM
-
         _playbackState.value = PlaybackState(isPlaying = false)
+        
+        scope.launch {
+            cancelControlLoopOnly()
+
+            // Re-enable Silence
+            silenceProcessorA.isEnabled = true
+            silenceProcessorB.isEnabled = true
+
+            // Keep clock hot
+            playerA?.apply {
+                volume = 1f
+                setPlaybackSpeed(1f)
+                seekTo(currentPosition) // Flush buffer to kill residual sound
+                play()
+            }
+            playerB?.apply {
+                volume = 1f
+                setPlaybackSpeed(1f)
+                seekTo(currentPosition) // Flush buffer to kill residual sound
+                play()
+            }
+
+            resetEQ(eqA)
+            resetEQ(eqB)
+
+            deckAState = DeckWarmState.WARM
+            deckBState = DeckWarmState.WARM
+        }
     }
 
     private fun cancelControlLoopOnly() {
@@ -296,18 +311,27 @@ class TransitionPlaybackEngine(
     }
 
     fun release() {
-        cancelControlLoopOnly()
-        playerA?.release()
-        playerB?.release()
-        eqA?.release()
-        eqB?.release()
-        playerA = null
-        playerB = null
-        eqA = null
-        eqB = null
-        deckAState = DeckWarmState.COLD
-        deckBState = DeckWarmState.COLD
-        _decksReady.value = false
+        val oldJob = playbackJob
+        
+        scope.launch {
+            oldJob?.cancel()
+            playbackJob = null
+            
+            playerA?.release()
+            playerB?.release()
+            eqA?.release()
+            eqB?.release()
+            playerA = null
+            playerB = null
+            eqA = null
+            eqB = null
+            deckAState = DeckWarmState.COLD
+            deckBState = DeckWarmState.COLD
+            _decksReady.value = false
+            
+            // Quit the thread after cleanup
+            audioThread.quitSafely()
+        }
     }
 
     // --- The Core Loop (PLL & Mixer) ---
@@ -324,10 +348,13 @@ class TransitionPlaybackEngine(
         var currentAppliedSpeed = plan.initialSpeedB.toFloat()
         var isAligned = false
         var firstTick = true
+        var loopTicks = 0
+        var transitionComplete = false
 
         delay(33) // Allow seek to register
 
         while (currentCoroutineContext().isActive) {
+            loopTicks++
             if (!_playbackState.value.isPlaying) break
 
             val currentConfig = activeConfig ?: break
@@ -335,43 +362,52 @@ class TransitionPlaybackEngine(
             if (firstTick) {
                 deckAState = DeckWarmState.ACTIVE
                 deckBState = DeckWarmState.ACTIVE
+                // Reset tracker to force first update
+                lastBassA = -1f; lastFilterA = -1f
+                lastBassB = -1f; lastFilterB = -1f
                 firstTick = false
             }
 
-            val posA = pA.currentPosition / 1000.0
-            val posB = pB.currentPosition / 1000.0
-
-            // 1. Watchdog
-            if (pA.playbackState == Player.STATE_READY && !pA.isPlaying) pA.play()
+            // 1. Watchdog (Only check A if active)
+            if (!transitionComplete && pA.playbackState == Player.STATE_READY && !pA.isPlaying) pA.play()
             if (pB.playbackState == Player.STATE_READY && !pB.isPlaying) pB.play()
 
             // 2. Current Position in Beats
-            val currentBeatA = TransitionMath.getBeatForTimestamp(plan.gridA, posA)
-            val elapsedBeatsA = currentBeatA - transitionStartBeatA
-            val targetBeatB = plan.anchorBeatB + elapsedBeatsA
+            val currentBeatA = if (!transitionComplete) {
+                val posA = pA.currentPosition / 1000.0
+                TransitionMath.getBeatForTimestamp(plan.gridA, posA)
+            } else 0.0
+
+            val posB = pB.currentPosition / 1000.0
             val currentBeatB = TransitionMath.getBeatForTimestamp(plan.gridB, posB)
 
-            // 3. Phase Error Calculation
-            var phaseErrorBeats = targetBeatB - currentBeatB
-            val isInPreroll = currentBeatA < transitionStartBeatA
+            val phaseErrorBeats = if (!transitionComplete) {
+                val elapsedBeatsA = currentBeatA - transitionStartBeatA
+                val targetBeatB = plan.anchorBeatB + elapsedBeatsA
 
-            // 4. Preroll Correction
-            if (isInPreroll) {
-                if (!isAligned && abs(phaseErrorBeats) > 0.2) {
-                    val correctedTimeB = TransitionMath.getTimestampForBeat(plan.gridB, targetBeatB)
-                    pB.seekTo((correctedTimeB * 1000).toLong())
+                // Phase Error Calculation
+                var pe = targetBeatB - currentBeatB
+                val isInPreroll = currentBeatA < transitionStartBeatA
 
-                    currentAppliedSpeed = plan.initialSpeedB.toFloat()
-                    pB.setPlaybackSpeed(currentAppliedSpeed)
-                    delay(50)
-                    continue
-                } else if (!isAligned && abs(phaseErrorBeats) < 0.05) {
-                    isAligned = true
+                // Preroll Correction
+                if (isInPreroll) {
+                    if (!isAligned && abs(pe) > 0.2) {
+                        val correctedTimeB = TransitionMath.getTimestampForBeat(plan.gridB, targetBeatB)
+                        pB.seekTo((correctedTimeB * 1000).toLong())
+
+                        currentAppliedSpeed = plan.initialSpeedB.toFloat()
+                        pB.setPlaybackSpeed(currentAppliedSpeed)
+                        // delay(50) // removed to avoid blocking logic, will correct next tick
+                        // continue causes issues with scope variables, let's just accept the seek
+                    } else if (!isAligned && abs(pe) < 0.05) {
+                        isAligned = true
+                    }
+                } else {
+                    while (pe > 0.5) pe -= 1.0
+                    while (pe < -0.5) pe += 1.0
                 }
-            } else {
-                while (phaseErrorBeats > 0.5) phaseErrorBeats -= 1.0
-                while (phaseErrorBeats < -0.5) phaseErrorBeats += 1.0
-            }
+               pe
+            } else 0.0
 
             _playbackState.value = PlaybackState(
                 true,
@@ -381,7 +417,7 @@ class TransitionPlaybackEngine(
             )
 
             // 5. Mixer Logic
-            val progress = if (plan.transitionDurationBeats > 0)
+            val progress = if (transitionComplete) 2f else if (plan.transitionDurationBeats > 0)
                 ((currentBeatA - transitionStartBeatA) / plan.transitionDurationBeats).toFloat()
             else 0f
 
@@ -394,20 +430,69 @@ class TransitionPlaybackEngine(
                 volA = if (currentBeatA >= unmuteBeatA) 1f else 0f
                 volB = 0f
                 if (currentBeatA >= unmuteBeatA) {
-                    resetEQ(eqA)
-                    resetEQ(eqB)
+                    if (abs(lastBassA - 1f) > 0.01f || abs(lastFilterA - 1f) > 0.01f) {
+                        resetEQ(eqA)
+                        lastBassA = 1f; lastFilterA = 1f
+                    }
+                    if (abs(lastBassB - 1f) > 0.01f || abs(lastFilterB - 1f) > 0.01f) {
+                        resetEQ(eqB)
+                        lastBassB = 1f; lastFilterB = 1f
+                    }
                 }
             } else if (progress <= 1f) {
-                val stateA = TransitionMixer.getMixState("A", progress, currentConfig.overlapMode, currentConfig.eqMode, currentConfig.effectMode)
-                val stateB = TransitionMixer.getMixState("B", progress, currentConfig.overlapMode, currentConfig.eqMode, currentConfig.effectMode)
+                // Calculate Current Audio Timestamps (Seconds)
+                // Note: pA.currentPosition is unreliable during Seek/Speed changes, so we use our calculated beat time converted back to seconds?
+                // No, sidechain needs high precision. Use currentPosition / 1000.0
+                val tsA = pA.currentPosition / 1000.0
+                val tsB = pB.currentPosition / 1000.0
+
+                val stateA = TransitionMixer.getMixState(
+                    "A", 
+                    progress, 
+                    currentConfig.overlapMode, 
+                    currentConfig.eqMode, 
+                    currentConfig.effectMode,
+                    currentTimestamp = tsA,
+                    beatGridA = plan.gridA,
+                    beatGridB = plan.gridB
+                )
+                
+                val stateB = TransitionMixer.getMixState(
+                    "B", 
+                    progress, 
+                    currentConfig.overlapMode, 
+                    currentConfig.eqMode, 
+                    currentConfig.effectMode,
+                    currentTimestamp = tsB,
+                    beatGridA = plan.gridA,
+                    beatGridB = plan.gridB
+                )
                 volA = stateA.volume
                 volB = stateB.volume
-                applyDeckStateToEQ(eqA, stateA, minEQ, (eqA?.numberOfBands ?: 0).toShort(), currentConfig.effectMode)
-                applyDeckStateToEQ(eqB, stateB, minEQ, (eqB?.numberOfBands ?: 0).toShort(), currentConfig.effectMode)
+                
+                if (abs(stateA.bass - lastBassA) > 0.01f || abs(stateA.filterHigh - lastFilterA) > 0.01f) {
+                    applyDeckStateToEQ(eqA, stateA, minEQ, (eqA?.numberOfBands ?: 0).toShort(), currentConfig.effectMode)
+                    lastBassA = stateA.bass
+                    lastFilterA = stateA.filterHigh
+                }
+                
+                if (abs(stateB.bass - lastBassB) > 0.01f || abs(stateB.filterHigh - lastFilterB) > 0.01f) {
+                    applyDeckStateToEQ(eqB, stateB, minEQ, (eqB?.numberOfBands ?: 0).toShort(), currentConfig.effectMode)
+                    lastBassB = stateB.bass
+                    lastFilterB = stateB.filterHigh
+                }
             } else {
                 volA = 0f
                 volB = 1f
-                resetEQ(eqB)
+                if (!transitionComplete) {
+                     resetEQ(eqB) // Optimization not strictly necessary here as it only happens once at end, but good for consistency
+                     lastBassB = 1f; lastFilterB = 1f
+                     transitionComplete = true
+                     
+                     // Freeze A
+                     pA.volume = 0f
+                     // We could resetEQ(eqA) here if we wanted clean state
+                }
             }
 
             // Apply mixing volumes
@@ -424,21 +509,24 @@ class TransitionPlaybackEngine(
             pB.volume = volB
 
             // 6. PLL Control Law
-            val mixConfidence = volB.coerceIn(0f, 1f)
-            val kp = 0.04f + (0.50f * (1f - mixConfidence))
+            // Optimization: Relax PLL cadence to ~165ms when aligned to reduce Sonic overhead
+            if (!transitionComplete && (!isAligned || loopTicks % 5 == 0)) {
+                val mixConfidence = volB.coerceIn(0f, 1f)
+                val kp = 0.04f + (0.50f * (1f - mixConfidence))
 
-            val correction = if (abs(phaseErrorBeats) > 0.005) {
-                (phaseErrorBeats.toFloat() * kp).coerceIn(-0.1f, 0.1f)
-            } else 0f
+                val correction = if (abs(phaseErrorBeats) > 0.005) {
+                    (phaseErrorBeats.toFloat() * kp).coerceIn(-0.1f, 0.1f)
+                } else 0f
 
-            val targetSpeed = (plan.initialSpeedB.toFloat() + correction).coerceIn(0.5f, 2.0f)
+                val targetSpeed = (plan.initialSpeedB.toFloat() + correction).coerceIn(0.5f, 2.0f)
 
-            if (abs(targetSpeed - currentAppliedSpeed) > 0.002f) {
-                pB.setPlaybackSpeed(targetSpeed)
-                currentAppliedSpeed = targetSpeed
+                if (abs(targetSpeed - currentAppliedSpeed) > 0.002f) {
+                    pB.setPlaybackSpeed(targetSpeed)
+                    currentAppliedSpeed = targetSpeed
+                }
             }
 
-            delay(33)
+            delay(16)
         }
     }
 
@@ -478,6 +566,7 @@ class TransitionPlaybackEngine(
             .setRenderersFactory(renderersFactory)
             .setAudioAttributes(audioAttributes, false)
             .setHandleAudioBecomingNoisy(true)
+            .setLooper(audioThread.looper)
             .build()
     }
 

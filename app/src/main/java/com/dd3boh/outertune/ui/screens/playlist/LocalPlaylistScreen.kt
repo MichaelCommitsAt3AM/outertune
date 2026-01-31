@@ -627,15 +627,16 @@ fun LocalPlaylistScreen(
                             isSelected = selection.contains(song.song.id),
 
                             onPlay = {
-                                playerConnection.playQueue(
-                                    ListQueue(
-                                        title = playlistWithSongs.first!!.playlist.name,
-                                        items = mutableSongs.map { it.song.toMediaMetadata() },
-                                        startIndex = index,
-                                        playlistId = playlistWithSongs.first?.playlist?.browseId
+                                    playerConnection.playQueue(
+                                        ListQueue(
+                                            title = playlistWithSongs.first!!.playlist.name,
+                                            items = mutableSongs.map { it.song.toMediaMetadata() },
+                                            startIndex = index,
+                                            playlistId = playlistWithSongs.first?.playlist?.browseId
+                                        ),
+                                        isMixMode = playlistWithSongs.first?.playlist?.isMixModeActive == true
                                     )
-                                )
-                            },
+                                },
                             dragHandleModifier = if (sortType == PlaylistSongSortType.CUSTOM && !locked && !isSearching && editable) Modifier.draggableHandle() else null,
                             isMixModeActive = playlistWithSongs.first?.playlist?.isMixModeActive == true,
                             modifier = Modifier

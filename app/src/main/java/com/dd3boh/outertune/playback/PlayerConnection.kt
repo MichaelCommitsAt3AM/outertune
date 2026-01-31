@@ -145,6 +145,7 @@ class PlayerConnection(
         shouldResume: Boolean = false,
         replace: Boolean = true,
         isRadio: Boolean = false,
+        isMixMode: Boolean = false,
         title: String? = null
     ) {
         service.playQueue(
@@ -152,7 +153,8 @@ class PlayerConnection(
             shouldResume = shouldResume,
             replace = replace,
             title = title,
-            isRadio = isRadio
+            isRadio = isRadio,
+            isMixMode = isMixMode
         )
     }
 

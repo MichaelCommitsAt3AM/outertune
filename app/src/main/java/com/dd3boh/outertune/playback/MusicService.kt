@@ -103,7 +103,6 @@ import com.dd3boh.outertune.extensions.currentMetadata
 import com.dd3boh.outertune.extensions.findNextMediaItemById
 import com.dd3boh.outertune.extensions.metadata
 import com.dd3boh.outertune.extensions.setOffloadEnabled
-import com.dd3boh.outertune.extensions.toMediaItem
 import com.dd3boh.outertune.lyrics.LyricsHelper
 import com.dd3boh.outertune.models.LogicalPlayerState
 import com.dd3boh.outertune.models.HybridCacheDataSinkFactory
@@ -126,10 +125,6 @@ import com.google.common.util.concurrent.MoreExecutors
 import com.zionhuang.innertube.YouTube
 import com.zionhuang.innertube.models.SongItem
 import com.zionhuang.innertube.models.WatchEndpoint
-import com.dd3boh.outertune.transition.model.TransitionPlan
-import com.dd3boh.outertune.transition.model.TransitionConfig
-import com.dd3boh.outertune.transition.math.TransitionMath
-import com.dd3boh.outertune.db.entities.SongEntity
 import dagger.hilt.android.AndroidEntryPoint
 import io.github.anilbeesetti.nextlib.media3ext.ffdecoder.NextRenderersFactory
 import kotlinx.coroutines.CoroutineScope
@@ -144,13 +139,10 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
@@ -160,9 +152,11 @@ import java.net.SocketTimeoutException
 import java.net.UnknownHostException
 import java.time.LocalDateTime
 import javax.inject.Inject
-import kotlin.math.abs
 import kotlin.math.min
 import kotlin.math.pow
+
+import androidx.compose.runtime.snapshotFlow
+import kotlinx.coroutines.flow.filterNotNull
 
 @OptIn(ExperimentalCoroutinesApi::class, FlowPreview::class)
 @AndroidEntryPoint
@@ -202,10 +196,11 @@ class MusicService : MediaLibraryService(),
     @DownloadCache
     lateinit var downloadCache: SimpleCache
 
-    lateinit var deckManager: DeckManager
+    // lateinit var deckManager: DeckManager // Removed
     // Helper property to keep existing code working (points to currently hearing player)
     val player: ExoPlayer
-        get() = deckManager.activeDeck
+        get() = playbackEngine?.activePlayer?.value ?: fakePlayer!! // Fallback during init
+    private var fakePlayer: ExoPlayer? = null
 
     private lateinit var mediaSession: MediaLibrarySession
 
@@ -248,6 +243,8 @@ class MusicService : MediaLibraryService(),
 
     private val normalizeFactor = MutableStateFlow(1f)
 
+    private var playbackEngine: PlaybackEngine? = null
+
     private val audioDecoder = dataStore.get(AudioDecoderKey, DefaultRenderersFactory.EXTENSION_RENDERER_MODE_OFF)
     private val isGaplessOffloadAllowed = dataStore.get(AudioGaplessOffloadKey, false)
     val playerVolume = MutableStateFlow(dataStore.get(PlayerVolumeKey, 1f).coerceIn(0f, 1f))
@@ -255,73 +252,51 @@ class MusicService : MediaLibraryService(),
     private var isAudioEffectSessionOpened = false
 
     var consecutivePlaybackErr = 0
+    @Volatile private var isActiveDeckPlaying = false
 
     override fun onCreate() {
         Log.i(TAG, "Starting MusicService")
+        val t0 = System.currentTimeMillis()
         super.onCreate()
 
-        deckManager = DeckManager(this, ::createDataSourceFactory) { newActivePlayer ->
-            Log.e(TAG, "╔════════════════════════════════════════════════════════════╗")
-            Log.e(TAG, "║  onActiveDeckChanged CALLBACK                              ║")
-            Log.e(TAG, "╚════════════════════════════════════════════════════════════╝")
-            Log.e(TAG, "  New Active Player: ${if (newActivePlayer == deckManager.playerA) "A" else "B"}")
-            Log.e(TAG, "  Old MediaSession Player: ${if (mediaSession.player == deckManager.playerA) "A" else "B"}")
+        // Initialize Default Engine (Simple)
+        fakePlayer = createExoPlayer() // Temporary for initialization
+        Log.i(TAG, "MusicService: createExoPlayer took ${System.currentTimeMillis() - t0}ms")
 
-            // Update MediaSession to point to the new active player
-            mediaSession.player = newActivePlayer
-            _activePlayer.value = newActivePlayer // UPDATE FLOW
-            Log.e(TAG, "  → MediaSession.player updated")
+        val t1 = System.currentTimeMillis()
+        playbackEngine = SimplePlaybackEngine(fakePlayer!!)
+        _activePlayer.value = fakePlayer
+        Log.i(TAG, "MusicService: SimplePlaybackEngine init took ${System.currentTimeMillis() - t1}ms")
 
-            // NOW advance the queue since the physical transition is complete
-            // NOW advance the queue since the physical transition is complete
-            // Note: newActivePlayer.currentMediaItemIndex is likely 0 if using Decks with single items.
-            // We must advance the logical queue board position.
-            val currentQ = queueBoard.getCurrentQueue()
-            val nextIndex = if (currentQ != null) currentQ.queuePos + 1 else -1
+        // Listen to active player changes
+        scope.launch {
+             snapshotFlow { playbackEngine }
+                .filterNotNull()
+                .flatMapLatest { it.activePlayer }
+                .collect { player ->
+                    _activePlayer.value = player
+                    mediaSession.player = player
 
-            if (currentQ != null) {
-                Log.e(TAG, "  → Advancing queue from index ${currentQ.queuePos} to $nextIndex")
-                queueBoard.setCurrQueuePosIndex(nextIndex)
-                _logicalIndex.value = nextIndex
-            } else {
-                 Log.e(TAG, "  → Current queue is null, cannot advance index")
-            }
-            Log.e(TAG, "  → Queue advanced")
-
-            // Update current metadata
-            currentMediaMetadata.value = newActivePlayer.currentMetadata
-            Log.e(TAG, "  → currentMediaMetadata updated to: ${newActivePlayer.currentMetadata?.title}")
-
-            // Pre-warm the 'new' standby deck for the NEXT transition
-            val transition = currentTransitionCache
-            val songAfterNext = queueBoard.getSongAtIndex(nextIndex + 1)
-
-            Log.e(TAG, "  Checking if we should pre-warm next song...")
-            Log.e(TAG, "    Transition: ${if (transition != null) "YES" else "NULL"}")
-            Log.e(TAG, "    Song After Next: ${songAfterNext?.title ?: "NULL"}")
-
-            if (transition != null && songAfterNext != null && transition.toSongId == songAfterNext.id) {
-                Log.e(TAG, "  → Pre-warming standby for: ${songAfterNext.title}")
-                val mediaItem = songAfterNext.toMediaItem()
-                deckManager.prepareNext(mediaItem, transition.entryPointMs, null)
-            } else {
-                Log.e(TAG, "  → No pre-warm needed")
-            }
-
-            // Reset the logical transition state
-            _logicalState.value = _logicalState.value.copy(isTransitionActive = false)
-            Log.e(TAG, "  → Logical transition state reset")
-            Log.e(TAG, "╚════════════════════════════════════════════════════════════╝")
+                    // Note: Queue advancement and Metadata updates for MIX mode are handled by MixPlaybackEngine
+                    // But for Simple Mode, we need to ensure things are synced.
+                    // Actually, simple flow:
+                    // Engine updates ActivePlayer -> Service updates Session.
+                    // Metadata update:
+                    currentMediaMetadata.value = player.currentMetadata
+                }
         }
-        
-        // Initialize Flow
-        _activePlayer.value = deckManager.activeDeck
 
-        // Attach listeners to DeckManager (which attaches to both A and B)
-        deckManager.addListener(this)
+        // Attach listeners (Moved from DeckManager/Player init)
+        // Note: SimplePlaybackEngine's player needs listeners.
+        // We really should attach listeners inside the engines or have a common setup.
+        // For now, let's attach to the *active* player whenever it changes?
+        // Or better: Use the PlaybackEngine to manage listeners?
+        // SimplePlaybackEngine wraps a player.
+        // Let's add listeners to the initial player.
+        fakePlayer!!.addListener(this)
 
         sleepTimer = SleepTimer(scope, player)
-        deckManager.addListener(sleepTimer)
+        // deckManager.addListener(sleepTimer) // TODO: Handle SleepTimer across engines
 
 //        player = ExoPlayer.Builder(this)
 //            .setMediaSourceFactory(DefaultMediaSourceFactory(createDataSourceFactory()))
@@ -355,6 +330,7 @@ class MusicService : MediaLibraryService(),
             toggleLibrary = ::toggleLibrary
         }
 
+        val t2 = System.currentTimeMillis()
         mediaSession = MediaLibrarySession.Builder(this, player, mediaLibrarySessionCallback)
             .setSessionActivity(
                 PendingIntent.getActivity(
@@ -367,6 +343,7 @@ class MusicService : MediaLibraryService(),
             // TODO: do i even want to have smaller art for media notification
             .setBitmapLoader(CoilBitmapLoader(this))
             .build()
+        Log.i(TAG, "MusicService: MediaSession build took ${System.currentTimeMillis() - t2}ms")
 
         player.repeatMode = dataStore.get(RepeatModeKey, REPEAT_MODE_OFF)
 
@@ -396,11 +373,13 @@ class MusicService : MediaLibraryService(),
         // lateinit tasks
         offloadScope.launch {
             Log.i(TAG, "Launching MusicService offloadScope tasks")
+            val t3 = System.currentTimeMillis()
             if (!qbInit.value) {
                 initQueue()
             }
+            Log.i(TAG, "MusicService: initQueue (bg) took ${System.currentTimeMillis() - t3}ms")
 
-            combine(playerVolume, normalizeFactor, deckManager.isCrossfading) { playerVolume, normalizeFactor, isCrossing ->
+            combine(playerVolume, normalizeFactor, playbackEngine!!.isCrossfading) { playerVolume, normalizeFactor, isCrossing ->
                 Triple(playerVolume, normalizeFactor, isCrossing)
             }.collectLatest(scope) { (playerVolume, normalizeFactor, isCrossing) ->
                 withContext(Dispatchers.Main) {
@@ -464,7 +443,7 @@ class MusicService : MediaLibraryService(),
                 }
             }
         }
-        startMixPoller()
+        // startMixPoller() // Removed
     }
 
 
@@ -570,6 +549,7 @@ class MusicService : MediaLibraryService(),
         shouldResume: Boolean = false,
         replace: Boolean = false,
         isRadio: Boolean = false,
+        isMixMode: Boolean = false,
         title: String? = null
     ) {
         if (!qbInit.value) {
@@ -577,6 +557,51 @@ class MusicService : MediaLibraryService(),
                 initQueue()
             }
         }
+
+        // --- Engine Switching Logic (Hard Reset) ---
+        val targetEngineIsMix = isMixMode
+        val currentEngineIsMix = playbackEngine is MixPlaybackEngine
+
+        if (targetEngineIsMix != currentEngineIsMix) {
+            Log.i(TAG, "Switching Playback Engine: MixMode=$targetEngineIsMix")
+            // Destroy current
+            try {
+                playbackEngine?.destroy()
+            } catch (e: Exception) { e.printStackTrace() }
+
+            // Create new
+            if (targetEngineIsMix) {
+                 var mixEngine: MixPlaybackEngine? = null
+                 val deckManager = DeckManager(this, ::createDataSourceFactory) { player ->
+                    mixEngine?.onActiveDeckChanged(player)
+                 }
+                 deckManager.addListener(this) // Attach service as listener too? Or rely on ActivePlayer flow?
+                 // Service needs events like playbackStateChanged.
+                 // DeckManager forwards events.
+
+                 mixEngine = MixPlaybackEngine(
+                    deckManager,
+                    scope,
+                    database,
+                    transitionDao,
+                    queueBoard
+                 ) { state -> _logicalState.value = state }
+
+                 playbackEngine = mixEngine
+            } else {
+                val newPlayer = createExoPlayer()
+                newPlayer.addListener(this)
+                playbackEngine = SimplePlaybackEngine(newPlayer)
+            }
+            playbackEngine?.start()
+
+            // Force update flows
+            _activePlayer.value = playbackEngine?.activePlayer?.value
+            // Restore SleepTimer listener if needed?
+            // SleepTimer takes `player` which is now new.
+            // TODO: SleepTimer logic might need update.
+        }
+        // -------------------------------------------
 
         var queueTitle = title
         queuePlaylistId = queue.playlistId
@@ -937,345 +962,14 @@ class MusicService : MediaLibraryService(),
         }
     }
 
-    private var currentTransitionPlan: TransitionPlan? = null
-    private var currentTransitionConfig: TransitionConfig? = null
 
 
 
-    private fun loadGrid(song: SongEntity, rangeStart: Long? = null, rangeEnd: Long? = null): List<Double>? {
-        // STRICT MODE: No fallbacks.
-        if (song.beatGridPath != null) {
-            try {
-                // AudioDecoder.loadBeatGrid now returns List<Float>?
-                // We pass the range to AudioDecoder to optimize filtering
-                val loaded = com.dd3boh.outertune.utils.analysis.AudioDecoder.loadBeatGrid(java.io.File(song.beatGridPath), rangeStart, rangeEnd)
-                if (loaded != null && loaded.isNotEmpty()) {
-                    val result = loaded.map { it.toDouble() / 1000.0 }
-                    
-                    if (result.isNotEmpty()) {
-                        Log.d(TAG, "STRICT: Loaded ${result.size} beats for ${song.title}. " +
-                                "Range: ${result.first()}s to ${result.last()}s. " +
-                                "Duration covered: ${result.last() - result.first()}s")
-                    }
-                    return result
-                } else {
-                    Log.e(TAG, "STRICT: BeatGrid file existed but returned null/empty. Failing.")
-                    return null
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "STRICT: Exception loading BeatGrid. Failing.", e)
-                return null
-            }
-        }
-        
-        // If no file path, try simple grid, but that too is strict now.
-        return generateSimpleGrid(song)
-    }
-
-    private fun generateSimpleGrid(song: SongEntity): List<Double>? {
-        val bpm = song.displayBpm ?: 0f
-        val firstBeat = (song.firstBeatMs ?: 0L) / 1000.0
-        val beatDur = 60.0 / bpm
-
-        // STRICT: No fabricated numbers.
-        if (bpm <= 0.1f) {
-             Log.e(TAG, "STRICT: Invalid BPM ($bpm) for ${song.title}. Cannot generate grid.")
-             return null
-        }
-
-        val dbDuration = if (song.duration > 0) song.duration.toDouble() else 0.0
-        
-        if (dbDuration <= 0.1) {
-             Log.e(TAG, "STRICT: Invalid Duration ($dbDuration) for ${song.title}. Cannot generate grid.")
-             return null
-        }
-
-        val grid = mutableListOf<Double>()
-        var t = firstBeat
-        // Safety check to prevent infinite loops
-        if (beatDur <= 0.0) return null
-
-        while (t < dbDuration) {
-            grid.add(t)
-            t += beatDur
-        }
-        
-        if (grid.isEmpty()) {
-            Log.e(TAG, "STRICT: Generated grid was empty.")
-            return null
-        }
-        
-        return grid
-    }
 
 
-    private fun startMixPoller() {
-        offloadScope.launch {
-            var lastLogTime = 0L
-            while (isActive) {
-                withContext(Dispatchers.Main) {
-                    if (player.isPlaying) {
-                        // 1. Update the UI Clock (NEW)
-                        updateLogicalState()
 
-                        // 2. Check for Transition Triggers (EXISTING)
-                        checkMixStatus()
-                        
-                        if (System.currentTimeMillis() - lastLogTime > 3000) {
-                            val trans = currentTransitionCache
-                            Log.d(TAG, "MixPoller [3s]: Pos=${player.currentPosition}ms / ${player.duration}ms. " +
-                                    "LogStateTransActive=${_logicalState.value.isTransitionActive}. " +
-                                    "Cache=${if (trans != null) "YES (Exit=${trans.exitPointMs}, To=${trans.toSongId})" else "NULL"}")
-                            lastLogTime = System.currentTimeMillis()
-                        }
-                    }
-                }
-                delay(20) // 20ms = 50 업데이트 per second (Low latency)
-            }
-        }
-    }
 
-    private var nextSongPreparedId: String? = null // Track what we prepared
 
-    // Track if we already triggered the PLL for this transition
-    private var isPllTriggered = false
-
-    private suspend fun checkMixStatus() {
-        val currentPosition = player.currentPosition
-        val transition = currentTransitionCache
-
-        // Detailed status every 3 seconds (already exists, but enhance it)
-        if (System.currentTimeMillis() - lastLogTime > 3000) {
-            Log.d(TAG, "═══════════════════════════════════════════════════════════")
-            Log.d(TAG, "MixPoller Status Check:")
-            Log.d(TAG, "  Current Pos: ${currentPosition}ms / ${player.duration}ms")
-            Log.d(TAG, "  Transition Cache: ${if (transition != null) "YES" else "NULL"}")
-            if (transition != null) {
-                Log.d(TAG, "    Exit Point: ${transition.exitPointMs}ms")
-                Log.d(TAG, "    Entry Point: ${transition.entryPointMs}ms")
-                Log.d(TAG, "    Duration: ${transition.durationMs}ms")
-                Log.d(TAG, "    To Song: ${transition.toSongId}")
-            }
-            Log.d(TAG, "  Logical State:")
-            Log.d(TAG, "    Active Song: ${_logicalState.value.activeMetadata?.title}")
-            Log.d(TAG, "    Is Transitioning: ${_logicalState.value.isTransitionActive}")
-            Log.d(TAG, "  PLL Triggered: $isPllTriggered")
-            Log.d(TAG, "  DeckManager isCrossfading: ${deckManager.isCrossfading.value}")
-            Log.d(TAG, "═══════════════════════════════════════════════════════════")
-            lastLogTime = System.currentTimeMillis()
-        }
-
-        // 0. Prevent double-triggering
-        if (_logicalState.value.isTransitionActive) return
-
-        // 1. Basic Checks
-        if (!player.isPlaying) return
-        if (transition == null) return
-
-        // 2. Validate Data Integrity
-        val realDuration = player.duration
-        if (realDuration > 0 && transition.exitPointMs > (realDuration - 500)) {
-            Log.w(TAG, "⚠️ Bad Transition Data! ExitPoint: ${transition.exitPointMs} > Duration: $realDuration")
-            return
-        }
-
-        // 3. Validate Queue Integrity
-        val nextSong = queueBoard.peekNext()
-        if (nextSong == null || nextSong.id != transition.toSongId) {
-            Log.w(TAG, "⚠️ Queue Changed! Expected: ${transition.toSongId}, Got: ${nextSong?.id}")
-            loadTransitionOnce(player.currentMediaItem?.mediaId ?: "", nextSong?.id)
-            return
-        }
-
-        // 4. Handle Repeat Mode
-        if (player.repeatMode == Player.REPEAT_MODE_ONE) return
-
-        // === 5. LAZY LOADING (15s Prior) ===
-        // If we have a transition but data isn't loaded, check if we should load it now.
-        if (!isTransitionDataLoaded && !isPllTriggered && transition.exitPointMs > 5000) {
-            val loadTrigger = transition.exitPointMs - 15000 // 15s before
-            if (currentPosition >= loadTrigger) {
-                Log.d(TAG, "Late-loading Transition Data (15s prior)...")
-                val currentId = player.currentMediaItem?.mediaId
-                val nextId = nextSong.id
-                
-                if (currentId != null) {
-                    val songA = database.song(currentId).firstOrNull()?.song
-                    val songB = database.song(nextId).firstOrNull()?.song
-                    
-                    if (songA != null && songB != null) {
-                         val exitSec = transition.exitPointMs / 1000.0
-                         val entrySec = transition.entryPointMs / 1000.0
-                         val durSec = transition.durationMs / 1000.0
-                         val preroll = 5.0
-                         
-                         // Load Partial Grids
-                         // Grid A: Exit - 10s to Exit + Duration + 5s
-                         val startA = ((exitSec - 10.0).coerceAtLeast(0.0) * 1000).toLong()
-                         val endA = ((exitSec + durSec + preroll) * 1000).toLong()
-                         
-                         // Grid B: Entry - 5s to Entry + Duration + 10s
-                         val startB = ((entrySec - preroll).coerceAtLeast(0.0) * 1000).toLong()
-                         val endB = ((entrySec + durSec + 10.0) * 1000).toLong()
-                    
-                         val (gridA, gridB) = withContext(Dispatchers.IO) {
-                             val gA = loadGrid(songA, startA, endA)
-                             val gB = loadGrid(songB, startB, endB)
-                             gA to gB
-                         }
-
-                         val bpmA = songA.displayBpm ?: 0f
-                         val bpmB = songB.displayBpm ?: 0f
-
-                         if (gridA != null && gridB != null && bpmA > 0 && bpmB > 0) {
-                             currentTransitionConfig = TransitionConfig(
-                                 overlapMode = transition.overlapMode,
-                                 eqMode = transition.eqMode,
-                                 effectMode = transition.effectMode,
-                                 barsCount = (transition.durationBeats ?: 32) / 4
-                             )
-                             
-                             // Re-calc anchors based on PARTIAL grid
-                             val exitBeatA = TransitionMath.getBeatForTimestamp(gridA, exitSec)
-                             val entryBeatB = TransitionMath.getBeatForTimestamp(gridB, entrySec)
-
-                             currentTransitionPlan = TransitionPlan(
-                                 initialSpeedB = (if (transition.syncTempo && bpmB > 0) bpmA / bpmB else 1f).toDouble(),
-                                 gridScalarB = 1.0,
-                                 anchorBeatA = exitBeatA,
-                                 anchorBeatB = entryBeatB,
-                                 transitionDurationBeats = (durSec * (bpmA/60.0)).toDouble(), 
-                                 exitPointMs = transition.exitPointMs,
-                                 entryPointMs = transition.entryPointMs,
-                                 durationMs = transition.durationMs,
-                                 gridA = gridA,
-                                 gridB = gridB
-                             )
-                             isTransitionDataLoaded = true
-                             Log.d(TAG, "Lazy loading complete. Plan ready.")
-                         } else {
-                             Log.w(TAG, "Lazy loading failed (missing grids or BPM).")
-                             // Don't try again repeatedly
-                             isTransitionDataLoaded = true 
-                         }
-                    }
-                }
-            }
-        }
-
-        // === EXECUTION PHASE (PLL Trigger) ===
-        val triggerTime = transition.exitPointMs - 3000
-
-        if (currentPosition >= triggerTime && !isPllTriggered) {
-            val plan = currentTransitionPlan
-            val config = currentTransitionConfig
-
-            if (plan != null && config != null) {
-                withContext(Dispatchers.Main) {
-                    Log.e(TAG, "╔════════════════════════════════════════════════════════════╗")
-                    Log.e(TAG, "║  TRIGGERING PLL TRANSITION NOW!                            ║")
-                    Log.e(TAG, "╚════════════════════════════════════════════════════════════╝")
-                    Log.e(TAG, "  Current Position: $currentPosition")
-                    Log.e(TAG, "  Trigger Time: $triggerTime")
-                    Log.e(TAG, "  Exit Point: ${transition.exitPointMs}")
-                    Log.e(TAG, "  Next Song: ${nextSong.title}")
-
-                    isPllTriggered = true
-
-                    deckManager.startPllTransition(plan, transition.durationMs, config)
-
-                    Log.e(TAG, "╚════════════════════════════════════════════════════════════╝")
-                }
-            } else {
-                Log.e(TAG, "⚠️ Cannot trigger PLL - Plan or Config is NULL!")
-            }
-        }
-
-        // === LOGICAL SWITCH PHASE ===
-        if (currentPosition >= transition.exitPointMs) {
-            withContext(Dispatchers.Main) {
-                if (_logicalState.value.activeMetadata?.id == nextSong.id) {
-                    return@withContext
-                }
-
-                Log.w(TAG, "╔════════════════════════════════════════════════════════════╗")
-                Log.w(TAG, "║  LOGICAL SWITCH TRIGGERED (UI Update)                      ║")
-                Log.w(TAG, "╚════════════════════════════════════════════════════════════╝")
-                Log.w(TAG, "  Switching UI to show: ${nextSong.title}")
-                Log.w(TAG, "  NOTE: Physical player still on Song A!")
-                Log.w(TAG, "  NOTE: Queue will advance in completeTransition()")
-
-                // CAPTURE ON MAIN THREAD
-                val nextIndex = player.currentMediaItemIndex + 1
-
-                offloadScope.launch {
-                    val songAfterNext = queueBoard.getSongAtIndex(nextIndex + 1)
-                    loadTransitionOnce(nextSong.id, songAfterNext?.id)
-
-                    withContext(Dispatchers.Main) {
-                        _logicalState.value = LogicalPlayerState(
-                            activeMetadata = nextSong,
-                            currentPositionMs = 0L,
-                            durationMs = currentTransitionCache?.exitPointMs ?: (nextSong.duration * 1000L),
-                            isTransitionActive = true
-                        )
-                        isPllTriggered = false
-                        Log.w(TAG, "  → Logical state updated, isPllTriggered reset")
-                    }
-                }
-            }
-        }
-    }
-
-    private fun updateLogicalState() {
-        val currentMeta = player.currentMetadata ?: return
-        val realPos = player.currentPosition
-        val realDur = player.duration
-
-        // 1. Determine Logical Duration
-        // If there is a transition, the track "ends" for the UI at the Exit Point.
-        val logicalDuration = currentTransitionCache?.exitPointMs ?: realDur
-
-        // 2. Determine Logical Position
-        // Clamp position to logical duration. This prevents the UI slider from
-        // jumping past the end during the audio crossfade overlap.
-        val logicalPos = min(realPos, logicalDuration)
-
-        // 3. Update State
-        if (_logicalState.value.activeMetadata?.id == currentMeta.id) {
-            _logicalState.value = _logicalState.value.copy(
-                currentPositionMs = logicalPos,
-                durationMs = logicalDuration,
-                // If we are just playing normally, ensure this is false
-                isTransitionActive = false
-            )
-        } else if (_logicalState.value.isTransitionActive) {
-            // We are in a transition. The UI is showing the incoming song (Song B).
-            // We should update the position based on the standby player.
-            val standbyPos = deckManager.standbyDeck.currentPosition
-            val standbyDur = deckManager.standbyDeck.duration
-            _logicalState.value = _logicalState.value.copy(
-                currentPositionMs = standbyPos,
-                durationMs = if (standbyDur > 0) standbyDur else _logicalState.value.durationMs
-            )
-        } else if (_logicalState.value.activeMetadata == null) {
-            // Initial/Reset State
-            _logicalState.value = LogicalPlayerState(
-                activeMetadata = currentMeta,
-                currentPositionMs = logicalPos,
-                durationMs = logicalDuration
-            )
-        } else {
-            // User changed song manually (or queue advanced normally without transition)
-            // The active metadata ID changed, but we are not in a transition.
-            _logicalState.value = LogicalPlayerState(
-                activeMetadata = currentMeta,
-                currentPositionMs = logicalPos,
-                durationMs = logicalDuration,
-                isTransitionActive = false
-            )
-        }
-    }
 
 
 // Misc
@@ -1362,7 +1056,7 @@ class MusicService : MediaLibraryService(),
 
     override fun onPlayerError(error: PlaybackException) {
         // IGNORE errors from Standby Deck
-        if (deckManager.activeDeck.playerError == null) {
+        if (playbackEngine?.activePlayer?.value?.playerError == null) {
             Log.w(TAG, "onPlayerError: Ignoring error from Standby Deck: ${error.message}")
             return
         }
@@ -1408,7 +1102,7 @@ class MusicService : MediaLibraryService(),
     override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
         // FILTER: Ignore events from the standby deck (e.g. when pre-warming)
         // We only want to react to the Active Deck changing tracks.
-        val activeMediaId = deckManager.activeDeck.currentMediaItem?.mediaId
+        val activeMediaId = playbackEngine?.activePlayer?.value?.currentMediaItem?.mediaId
         if (mediaItem?.mediaId != activeMediaId && activeMediaId != null) {
             Log.d(TAG, "Ignoring onMediaItemTransition from Standby Deck. Event=${mediaItem?.mediaId}, Active=$activeMediaId")
             return
@@ -1466,103 +1160,20 @@ class MusicService : MediaLibraryService(),
 
         // --- NEW: Refresh Transition Cache ---
         mediaItem?.mediaId?.let { currentId ->
-            // Apply cached normalization immediately to prevent loudness jump
-            if (nextSongnormFactorCache != null && deckManager.activeDeck.currentMediaItem?.mediaId == currentId) {
-                 Log.d(TAG, "Applying cached normalization factor: $nextSongnormFactorCache")
-                 normalizeFactor.value = nextSongnormFactorCache!!
-                 nextSongnormFactorCache = null
-            }
-
-            offloadScope.launch {
-                val nextSong = queueBoard.peekNext() // This works now
-                loadTransitionOnce(currentId, nextSong?.id)
+            // Note: Use playbackEngine to refresh!
+            if (playbackEngine is MixPlaybackEngine) {
+                 (playbackEngine as MixPlaybackEngine).refreshTransition(currentId)
+            } else {
+                 // Nothing to do for Simple Engine transition monitoring
             }
         }
 
         updateNotification() // also updates when queue changes
     }
-    
+
     // --- Transition Monitoring ---
-    private var loadJob: Job? = null
-    private var isTransitionDataLoaded = false
+    // Moved to MixPlaybackEngine
 
-    private fun loadTransitionOnce(currentId: String, nextId: String?) {
-        loadJob?.cancel()
-        currentTransitionCache = null // Clear old cache immediately
-        currentTransitionPlan = null
-        currentTransitionConfig = null
-        isTransitionDataLoaded = false
-        
-        if (nextId == null) {
-            Log.d(TAG, "loadTransitionOnce: Next song is null (EndOfQueue). Monitoring disabled.")
-            return
-        }
-
-        Log.d(TAG, "loadTransitionOnce: Checking Transition for $currentId -> $nextId (One-time)")
-        
-        loadJob = offloadScope.launch {
-             val transition = transitionDao.getTransition(currentId, nextId)
-             
-             currentTransitionCache = transition
-             // Reset plan data
-             currentTransitionPlan = null 
-             currentTransitionConfig = null
-             isTransitionDataLoaded = false
-
-             if (transition != null) {
-                Log.d(TAG, "Transition Found! Exit=${transition.exitPointMs}, Dur=${transition.durationMs}")
-
-                // --- CHECK FILE EXISTENCE (Lightweight) ---
-                val songA = database.song(currentId).firstOrNull()?.song
-                val songB = database.song(nextId).firstOrNull()?.song
-                
-                if (songA != null && songB != null) {
-                     val hasGridA = songA.beatGridPath != null && java.io.File(songA.beatGridPath).exists()
-                     val hasGridB = songB.beatGridPath != null && java.io.File(songB.beatGridPath).exists()
-                     
-                     if (!hasGridA || !hasGridB) {
-                          // Try Simple Grid?
-                          if (songA.displayBpm == null || songB.displayBpm == null) {
-                              Log.w(TAG, "Transition exists but missing BeatGrids/BPM. Optimistic monitoring.")
-                          }
-                     }
-                }
-
-                // Pre-warm the secondary deck (player only, no beats yet)
-                val nextSong = queueBoard.peekNext() 
-                
-                if (nextSong != null && nextSong.id == nextId) {
-                    val bpmA = songA?.displayBpm ?: 120f 
-                    val bpmB = songB?.displayBpm ?: 120f
-                    val speedRatio = if (transition.syncTempo && bpmB > 0) bpmA / bpmB else null
-                    
-                    // Pre-fetch normalization
-                    val nextFormat = database.format(nextId).firstOrNull()
-                    val nextNorm = if (nextFormat?.loudnessDb != null) {
-                        min(10f.pow(-nextFormat.loudnessDb.toFloat() / 20), 1f)
-                    } else 1f
-                    nextSongnormFactorCache = nextNorm
-
-                    val mediaItem = nextSong.toMediaItem()
-                    
-                    // Approximate start time (Entry Point - 3s) since we don't have accurate grid yet
-                    val startMs = (transition.entryPointMs - 3000).coerceAtLeast(0)
-
-                    withContext(Dispatchers.Main) {
-                        if (!deckManager.standbyDeck.isPlaying) {
-                            deckManager.prepareNext(mediaItem, startMs, speedRatio)
-                            deckManager.setStandbyVolumeMultiplier(nextNorm)
-                        }
-                    }
-                }
-             } else {
-                Log.d(TAG, "No transition found in DB.")
-             }
-        }
-    }
-    
-    // Add this cache variable
-    private var nextSongnormFactorCache: Float? = null
 
     override fun onPlaybackStateChanged(@Player.State playbackState: Int) {
         // IGNORE events from standby deck
@@ -1574,7 +1185,8 @@ class MusicService : MediaLibraryService(),
     }
 
     override fun onEvents(player: Player, events: Player.Events) {
-        if (player != deckManager.activeDeck) return
+        if (player != playbackEngine?.activePlayer?.value) return
+        isActiveDeckPlaying = player.isPlaying
 
         if (events.containsAny(Player.EVENT_PLAYBACK_STATE_CHANGED, Player.EVENT_PLAY_WHEN_READY_CHANGED)) {
             val isBufferingOrReady =
@@ -1643,34 +1255,7 @@ class MusicService : MediaLibraryService(),
     }
 
     fun seekToLogical(newPositionMs: Long) {
-        val state = _logicalState.value
-        val logicalDuration = state.durationMs
-
-        // 1. Clamp to Logical Duration
-        // Ensure we don't seek past the exit point (transition start)
-        val clampedPosition = if (logicalDuration > 0) {
-            newPositionMs.coerceIn(0L, logicalDuration)
-        } else {
-            newPositionMs
-        }
-
-        // 2. Handle "Scrubbing backwards across boundary"
-        // If the user was visually on "Song B" (transition active) but scrubs back to 0:00,
-        // we are still effectively playing Song B (or about to).
-        // Since we physically switch tracks at the transition point,
-        // standard seeking usually works, BUT we must cancel any active crossfade.
-
-        if (deckManager.activeDeck.isPlaying && state.isTransitionActive) {
-            // Cancel any active crossfade if the user interrupts
-            deckManager.cancelCrossfade()
-            // Reset logical state to match physical reality
-            // (The update loop will fix it next tick, but good to be explicit)
-        }
-
-        player.seekTo(clampedPosition)
-
-        // Update state immediately for UI responsiveness (optimistic update)
-        _logicalState.value = state.copy(currentPositionMs = clampedPosition)
+        playbackEngine?.seekTo(newPositionMs)
     }
 
     override fun onRepeatModeChanged(repeatMode: Int) {
@@ -1707,7 +1292,8 @@ class MusicService : MediaLibraryService(),
         mediaSession.player.stop()
         mediaSession.release()
         mediaSession.player.release()
-        deckManager.release()
+        // deckManager.release() // Removed
+        playbackEngine?.destroy()
         super.onDestroy()
         Log.i(TAG, "Terminated MusicService.")
     }

@@ -705,7 +705,7 @@ fun BottomSheetContent(
         // Options based on tab
         when (selectedTab) {
             0 -> {
-                listOf("Overlap", "Crossfade", "Cut").forEach { option ->
+                listOf("Overlap", "Crossfade", "Cut", "Dynamic Sidechain").forEach { option ->
                     ModernOptionItem(
                         text = option,
                         selected = option == overlapMode,
@@ -713,6 +713,7 @@ fun BottomSheetContent(
                         icon = when (option) {
                             "Overlap" -> "○○"
                             "Crossfade" -> "◐◑"
+                            "Dynamic Sidechain" -> "⚡"
                             else -> "●○"
                         }
                     )
