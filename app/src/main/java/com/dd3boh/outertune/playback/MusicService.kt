@@ -1143,6 +1143,20 @@ class MusicService : MediaLibraryService(),
         }
 
         queueBoard.setCurrQueuePosIndex(player.currentMediaItemIndex)
+        
+        // Update logical state for Mix mode when user manually changes songs
+        if (playbackEngine is MixPlaybackEngine && 
+            (reason == MEDIA_ITEM_TRANSITION_REASON_SEEK || reason == MEDIA_ITEM_TRANSITION_REASON_AUTO)) {
+            player.currentMetadata?.let { metadata ->
+                _logicalState.value = LogicalPlayerState(
+                    activeMetadata = metadata,
+                    currentPositionMs = player.currentPosition,
+                    durationMs = player.duration,
+                    isTransitionActive = false
+                )
+                Log.d(TAG, "Updated logical state for manual song change: ${metadata.title}")
+            }
+        }
 
         // reshuffle queue when shuffle AND repeat all are enabled
         // no, when repeat mode is on, player does not "STATE_ENDED"
@@ -1202,6 +1216,18 @@ class MusicService : MediaLibraryService(),
         }
         if (events.containsAny(EVENT_TIMELINE_CHANGED, EVENT_POSITION_DISCONTINUITY)) {
             currentMediaMetadata.value = player.currentMetadata
+            
+            // Update logical state for Simple mode (Mix mode handles its own state)
+            if (playbackEngine !is MixPlaybackEngine) {
+                player.currentMetadata?.let { metadata ->
+                    _logicalState.value = LogicalPlayerState(
+                        activeMetadata = metadata,
+                        currentPositionMs = player.currentPosition,
+                        durationMs = player.duration,
+                        isTransitionActive = false
+                    )
+                }
+            }
         }
     }
 

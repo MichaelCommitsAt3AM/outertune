@@ -213,21 +213,44 @@ class DeckManager(
         val prerollSeconds = 3.0
         val startB = (TransitionMath.getTimestampForBeat(plan.gridB, plan.anchorBeatB) - (prerollSeconds * plan.initialSpeedB)).coerceAtLeast(0.0)
 
-        Log.e(TAG, "  → Calculated Start B: ${startB}s (${startB * 1000}ms)")
 
-        Log.e(TAG, "  → Calculated Start B: ${startB}s (${startB * 1000}ms)")
 
-        // IMPORTANT: Seek to the correct position and set speed BEFORE starting playback
-        // Optimization: If we are already close to the target position (pre-warmed), SKIP SEEK to avoid buffering!
-        val currentPos = pB.currentPosition
-        val targetPos = (startB * 1000).toLong()
+        // CRITICAL FIX: Account for monitoring delays by predicting future positions
+        // The problem: During the ~100ms of monitoring, both decks advance, creating drift
+        // Solution: Calculate where deck A will be AFTER the monitoring delay, then seek B accordingly
         
-        if (abs(currentPos - targetPos) > 100) {
-            Log.e(TAG, "  → Seeking Standby from $currentPos to $targetPos...")
-            pB.seekTo(targetPos)
-        } else {
-             Log.e(TAG, "  → Standby already at $currentPos (Target $targetPos). SKIPPING SEEK to avoid buffer.")
-        }
+        val monitoringDelayMs = 50L // Estimated time for seek completion check + loop startup
+        val predictedPosA = pA.currentPosition + monitoringDelayMs
+        val predictedTimeA = predictedPosA / 1000.0
+        val predictedBeatA = TransitionMath.getBeatForTimestamp(plan.gridA, predictedTimeA)
+        val predictedElapsedBeats = predictedBeatA - plan.anchorBeatA
+        val predictedTargetBeatB = plan.anchorBeatB + predictedElapsedBeats
+        val predictedTargetTimeB = TransitionMath.getTimestampForBeat(plan.gridB, predictedTargetBeatB)
+        val targetPos = (predictedTargetTimeB * 1000).toLong()
+        
+        Log.e(TAG, "  ═══════════════════════════════════════════════════════════")
+        Log.e(TAG, "  🔍 DIAGNOSTIC: Pre-Seek State")
+        Log.e(TAG, "  ═══════════════════════════════════════════════════════════")
+        Log.e(TAG, "  → Current Position A: ${pA.currentPosition}ms")
+        Log.e(TAG, "  → Predicted Position A (after ${monitoringDelayMs}ms): ${predictedPosA}ms")
+        Log.e(TAG, "  → Predicted Beat A: $predictedBeatA")
+        Log.e(TAG, "  → Predicted Target Beat B: $predictedTargetBeatB")
+        Log.e(TAG, "  → Current Position B: ${pB.currentPosition}ms")
+        Log.e(TAG, "  → Target Position B: ${targetPos}ms")
+        Log.e(TAG, "  → Position Delta: ${targetPos - pB.currentPosition}ms")
+        Log.e(TAG, "  → Playback State B: ${when(pB.playbackState) {
+            Player.STATE_IDLE -> "IDLE"
+            Player.STATE_BUFFERING -> "BUFFERING"
+            Player.STATE_READY -> "READY"
+            Player.STATE_ENDED -> "ENDED"
+            else -> "UNKNOWN(${pB.playbackState})"
+        }}")
+        Log.e(TAG, "  → Is Playing B: ${pB.isPlaying}")
+        Log.e(TAG, "  → PlayWhenReady B: ${pB.playWhenReady}")
+        
+        val seekStartTime = System.currentTimeMillis()
+        pB.seekTo(targetPos)
+        Log.e(TAG, "  → Seek command issued to predicted position")
         
         pB.setPlaybackSpeed(plan.initialSpeedB.toFloat())
         _standbyDeckSpeed.value = plan.initialSpeedB.toFloat()
@@ -239,15 +262,83 @@ class DeckManager(
         pB.play()
 
         Log.e(TAG, "  → Called pB.play() - Standby should now be PLAYING")
-        Log.e(TAG, "  → Standby State After Play: playing=${pB.isPlaying}, playWhenReady=${pB.playWhenReady}")
 
         _isCrossfading.value = true
         Log.e(TAG, "  → Set isCrossfading = true")
 
         fadeJob = mixerScope.launch {
-            delay(50)
-            Log.e(TAG, "  → PLL Loop Starting (after 50ms delay)")
-            Log.e(TAG, "  → Final check - Standby playing=${pB.isPlaying}, pos=${pB.currentPosition}")
+            // Minimal monitoring - just verify seek completed, then start PLL immediately
+            delay(30) // Short delay for seek to register
+            
+            val seekDuration = System.currentTimeMillis() - seekStartTime
+            val finalPos = pB.currentPosition
+            val seekAccuracy = abs(finalPos - targetPos)
+            
+            Log.e(TAG, "  ═══════════════════════════════════════════════════════════")
+            Log.e(TAG, "  🔍 DIAGNOSTIC: Post-Seek State")
+            Log.e(TAG, "  ═══════════════════════════════════════════════════════════")
+            Log.e(TAG, "  → Seek Duration: ${seekDuration}ms")
+            Log.e(TAG, "  → Final Position B: ${finalPos}ms")
+            Log.e(TAG, "  → Seek Accuracy: ${seekAccuracy}ms (${if (seekAccuracy < 100) "GOOD" else "POOR"})")
+            Log.e(TAG, "  → Final State B: ${when(pB.playbackState) {
+                Player.STATE_IDLE -> "IDLE"
+                Player.STATE_BUFFERING -> "BUFFERING"
+                Player.STATE_READY -> "READY"
+                Player.STATE_ENDED -> "ENDED"
+                else -> "UNKNOWN"
+            }}")
+            
+            if (seekAccuracy > 150) {
+                Log.e(TAG, "  ⚠️ WARNING: Seek accuracy is poor! This suggests COLD START buffering delay")
+            }
+            
+            if (pB.playbackState != Player.STATE_READY) {
+                Log.e(TAG, "  ⚠️ WARNING: Deck not in READY state after seek! State=${pB.playbackState}")
+            }
+            
+            // Check if playback actually started
+            delay(20)
+            val posAfterDelay = pB.currentPosition
+            val advancement = posAfterDelay - finalPos
+            Log.e(TAG, "  → Position 20ms later: ${posAfterDelay}ms (advanced ${advancement}ms)")
+            
+            if (advancement < 5) {
+                Log.e(TAG, "  ⚠️ WARNING: Position hasn't advanced much! Playback may be stalled")
+            }
+            
+            Log.e(TAG, "  → Standby State: playing=${pB.isPlaying}, playWhenReady=${pB.playWhenReady}")
+            Log.e(TAG, "  ═══════════════════════════════════════════════════════════")
+            
+            // Calculate initial phase error
+            val posA = pA.currentPosition / 1000.0
+            val posB = pB.currentPosition / 1000.0
+            val currentBeatA = TransitionMath.getBeatForTimestamp(plan.gridA, posA)
+            val currentBeatB = TransitionMath.getBeatForTimestamp(plan.gridB, posB)
+            val elapsedBeatsA = currentBeatA - plan.anchorBeatA
+            val targetBeatB = plan.anchorBeatB + elapsedBeatsA
+            val initialPhaseError = targetBeatB - currentBeatB
+            
+            Log.e(TAG, "  ═══════════════════════════════════════════════════════════")
+            Log.e(TAG, "  🔍 DIAGNOSTIC: Pre-Loop State (T+${seekDuration + 50}ms)")
+            Log.e(TAG, "  ═══════════════════════════════════════════════════════════")
+            Log.e(TAG, "  → Active Deck Position: ${pA.currentPosition}ms")
+            Log.e(TAG, "  → Standby Deck Position: ${pB.currentPosition}ms")
+            Log.e(TAG, "  → Standby playing=${pB.isPlaying}, state=${pB.playbackState}")
+            Log.e(TAG, "  → Initial Beat A: $currentBeatA")
+            Log.e(TAG, "  → Initial Beat B: $currentBeatB")
+            Log.e(TAG, "  → Target Beat B: $targetBeatB")
+            Log.e(TAG, "  → INITIAL PHASE ERROR: $initialPhaseError beats")
+            
+            if (abs(initialPhaseError) > 0.2) {
+                Log.e(TAG, "  ⚠️⚠️⚠️ CRITICAL: Large initial phase error! This is the COLD START problem!")
+            } else if (abs(initialPhaseError) < 0.05) {
+                Log.e(TAG, "  ✓✓✓ EXCELLENT: Small initial phase error! This is a WARM START")
+            } else {
+                Log.e(TAG, "  ⚠️ MODERATE: Initial phase error is acceptable but not perfect")
+            }
+            
+            Log.e(TAG, "  ═══════════════════════════════════════════════════════════")
+            Log.e(TAG, "  → PLL Loop Starting...")
             Log.e(TAG, "████████████████████████████████████████████████████████████")
             runPllLoop(pA, pB, plan, durationMs, config, outMult, inMult, eqOut, eqIn)
         }
@@ -268,6 +359,7 @@ class DeckManager(
 
         val transitionStartBeatA = plan.anchorBeatA
         var currentAppliedSpeed = plan.initialSpeedB.toFloat()
+        var previousPhaseError = 0.0 // For derivative term
 
         val bandsOut = eqOut?.numberOfBands ?: 0.toShort()
         val bandsIn = eqIn?.numberOfBands ?: 0.toShort()
@@ -277,6 +369,7 @@ class DeckManager(
 
         var loopCount = 0
         val startTime = System.currentTimeMillis()
+        var hasEnteredCrossfade = false // Track when we first enter crossfade
 
         while (currentCoroutineContext().isActive) {
             loopCount++
@@ -307,39 +400,109 @@ class DeckManager(
                 Log.d(TAG, "  [Beats] CurA=$currentBeatA, ElapA=$elapsedBeatsA, TgtB=$targetBeatB, CurB=$currentBeatB")
                 Log.d(TAG, "  [Phase] Error=$phaseError")
             }
-
-            // --- 2. Phase Correction (Nudge) ---
-            if (abs(phaseError) > 0.005) {
-                val kp = 0.1f
-                val nudge = (phaseError * kp).coerceIn(-0.1, 0.1)
-                val newSpeed = (plan.initialSpeedB + nudge).toFloat().coerceIn(0.5f, 2.0f)
-
-                if (abs(newSpeed - currentAppliedSpeed) > 0.002f) {
-                    Log.d(TAG, "  [Adjustment] PhaseError=$phaseError -> Nudge=$nudge -> NewSpeed=$newSpeed")
-                    pB.setPlaybackSpeed(newSpeed)
-                    currentAppliedSpeed = newSpeed
-                    _standbyDeckSpeed.value = newSpeed
-
-                    if (loopCount % 25 == 1) {
-                        Log.d(TAG, "  Phase correction: error=$phaseError, newSpeed=$newSpeed")
-                    }
-                }
+            
+            // Initialize previousPhaseError on first loop to prevent huge derivative spike
+            if (loopCount == 1) {
+                previousPhaseError = phaseError
             }
 
-            // --- 3. Mixing ---
+            // --- 2. Mixing Progress Calculation ---
             val progress = if (durationMs > 0)
                 ((pA.currentPosition - (TransitionMath.getTimestampForBeat(plan.gridA, plan.anchorBeatA)*1000)).toFloat() / durationMs).coerceIn(-1f, 2f)
             else 1f
 
+            // --- 3. Phase Correction (Runs in BOTH Preroll and Crossfade) ---
             if (progress < 0f) {
-                // PREROLL
-                pA.volume = 1f * outMult
-                pB.volume = 0f // SILENT
+                // PREROLL PHASE - PD CONTROLLER (Proportional + Derivative)
+                // CRITICAL: NO SEEKS during preroll! Each seek introduces latency and drift.
+                // Use PD controller to prevent oscillation and overshoot.
+                
+                if (abs(phaseError) > 0.005) {
+                    // PD Controller: combines proportional and derivative terms
+                    val kp = 0.35f // Proportional gain (increased for faster convergence)
+                    val kd = 0.08f // Derivative gain (reduced for stability)
+                    
+                    // Derivative term: how fast is the error changing?
+                    val errorDerivative = phaseError - previousPhaseError
+                    
+                    // PD control: nudge = kp * error + kd * derivative
+                    val proportionalTerm = phaseError * kp
+                    val derivativeTerm = errorDerivative * kd
+                    val nudge = (proportionalTerm + derivativeTerm).coerceIn(-0.2, 0.2)
+                    
+                    val newSpeed = (plan.initialSpeedB + nudge).toFloat().coerceIn(0.8f, 1.2f)
 
-                if (loopCount % 25 == 1) {
-                    Log.d(TAG, "  PREROLL: progress=$progress")
+                    if (abs(newSpeed - currentAppliedSpeed) > 0.001f) {
+                        pB.setPlaybackSpeed(newSpeed)
+                        currentAppliedSpeed = newSpeed
+                        _standbyDeckSpeed.value = newSpeed
+                        
+                        if (loopCount % 25 == 1 || loopCount <= 15) {
+                            Log.d(TAG, "  [PREROLL PD] Loop#$loopCount Error=$phaseError, Deriv=$errorDerivative -> P=$proportionalTerm, D=$derivativeTerm -> Speed=$newSpeed")
+                        }
+                    }
+                } else {
+                    // Phase error is tiny - we're well aligned!
+                    if (loopCount % 50 == 1) {
+                        Log.d(TAG, "  [PREROLL] Loop#$loopCount ALIGNED! phaseError=$phaseError")
+                    }
+                }
+                
+                // Update previous error for next iteration
+                previousPhaseError = phaseError
+                
+                // Set volumes (Track B muted during preroll)
+                pA.volume = 1f * outMult
+                pB.volume = 0f
+
+                if (loopCount % 25 == 1 || loopCount <= 10) {
+                    Log.d(TAG, "  [PREROLL] Loop#$loopCount progress=$progress, phaseError=$phaseError")
                 }
             } else if (progress <= 1f) {
+                // CROSSFADE PHASE - GENTLE CORRECTION (Both tracks audible)
+                
+                // Log the moment we enter crossfade for the first time
+                if (!hasEnteredCrossfade) {
+                    hasEnteredCrossfade = true
+                    Log.e(TAG, "  ╔═══════════════════════════════════════════════════════════╗")
+                    Log.e(TAG, "  ║  🎵 CROSSFADE STARTED - TRACK 2 NOW AUDIBLE               ║")
+                    Log.e(TAG, "  ╚═══════════════════════════════════════════════════════════╝")
+                    Log.e(TAG, "  → Loop Count: $loopCount")
+                    Log.e(TAG, "  → Time Since Start: ${System.currentTimeMillis() - startTime}ms")
+                    Log.e(TAG, "  → Progress: $progress")
+                    Log.e(TAG, "  → PHASE ERROR AT UNMUTE: $phaseError beats")
+                    Log.e(TAG, "  → Current Beat A: $currentBeatA")
+                    Log.e(TAG, "  → Current Beat B: $currentBeatB")
+                    Log.e(TAG, "  → Target Beat B: $targetBeatB")
+                    
+                    if (abs(phaseError) > 0.1) {
+                        Log.e(TAG, "  ⚠️⚠️⚠️ POOR ALIGNMENT AT UNMUTE! User will hear misalignment!")
+                    } else if (abs(phaseError) < 0.05) {
+                        Log.e(TAG, "  ✓✓✓ EXCELLENT ALIGNMENT AT UNMUTE! Perfect beatmatch!")
+                    } else {
+                        Log.e(TAG, "  ⚠️ MODERATE ALIGNMENT - Slight drift may be audible")
+                    }
+                    Log.e(TAG, "  ═══════════════════════════════════════════════════════════")
+                }
+                
+                if (abs(phaseError) > 0.005) {
+                    // Use gentler PLL during crossfade to avoid audible artifacts
+                    val kp = 0.1f
+                    val nudge = (phaseError * kp).coerceIn(-0.1, 0.1)
+                    val newSpeed = (plan.initialSpeedB + nudge).toFloat().coerceIn(0.5f, 2.0f)
+
+                    if (abs(newSpeed - currentAppliedSpeed) > 0.002f) {
+                        pB.setPlaybackSpeed(newSpeed)
+                        currentAppliedSpeed = newSpeed
+                        _standbyDeckSpeed.value = newSpeed
+
+                        if (loopCount % 25 == 1) {
+                            Log.d(TAG, "  [CROSSFADE PLL] PhaseError=$phaseError -> Nudge=$nudge -> Speed=$newSpeed")
+                        }
+                    }
+                }
+                
+                // Set volumes based on mixer state
                 // CROSSFADE ACTIVE
                 val stateOut = TransitionMixer.getMixState("A", progress, config.overlapMode, config.eqMode, config.effectMode)
                 val stateIn = TransitionMixer.getMixState("B", progress, config.overlapMode, config.eqMode, config.effectMode)

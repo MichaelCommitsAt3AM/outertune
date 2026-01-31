@@ -117,12 +117,22 @@ class MixPlaybackEngine(
             queueBoard.setCurrQueuePosIndex(nextIndex)
         }
         
+        // Update logical state with new player's metadata
+        val newMetadata = newPlayer.currentMetadata
+        if (newMetadata != null) {
+            val newDuration = currentTransitionCache?.exitPointMs ?: newPlayer.duration
+            localLogicalState = LogicalPlayerState(
+                activeMetadata = newMetadata,
+                currentPositionMs = newPlayer.currentPosition,
+                durationMs = newDuration,
+                isTransitionActive = false
+            )
+            updateLogicalStateCallback(localLogicalState)
+            Log.d(TAG, "Updated logical state: metadata=${newMetadata.title}, pos=${newPlayer.currentPosition}, dur=$newDuration")
+        }
+        
         // Prepare next song (Pre-warm)
         refreshTransition(newPlayer.currentMediaItem?.mediaId)
-
-        // Reset logical state for transition
-         localLogicalState = localLogicalState.copy(isTransitionActive = false)
-         updateLogicalStateCallback(localLogicalState)
     }
     
     // --- Logic Moved from MusicService ---
