@@ -158,7 +158,7 @@ Java_com_dd3boh_outertune_utils_analysis_AudioAnalyzer_analyzeBpm(
     jsize length = env->GetArrayLength(pcmData);
     LOGD("[BTrack] Input: %d samples @ %d Hz (%.2f seconds)", length, sampleRate, (double)length / sampleRate);
 
-    BTrack beatTracker(HOP_SIZE, FRAME_SIZE);
+    BTrack beatTracker(HOP_SIZE, FRAME_SIZE, (double) sampleRate);
 
     // Optimizing for modern electronic/pop structures
     // beatTracker.setFixTempo(false);

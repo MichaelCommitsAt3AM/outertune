@@ -75,6 +75,9 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.surfaceColorAtElevation
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.repeatOnLifecycle
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
@@ -152,6 +155,9 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 import kotlin.math.max
 
+/** How often the full player refreshes the seek bar while playing. */
+private const val POSITION_POLL_MS = 250L
+
 @SuppressLint("UnusedBoxWithConstraintsScope")
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
@@ -223,16 +229,21 @@ fun BottomSheetPlayer(
 
     val showLyrics by rememberPreference(ShowLyricsKey, defaultValue = false)
 
-//    var position by rememberSaveable(playbackState) {
-//        mutableLongStateOf(playerConnection.player.currentPosition)
-//    }
-//    var duration by rememberSaveable(playbackState) {
-//        mutableLongStateOf(playerConnection.player.duration)
-//    }
-
-
-    val position = logicalState.currentPositionMs
-    val duration = logicalState.durationMs
+    // The service doesn't push position; read it while this sheet is composed. Restarting on
+    // logicalState refreshes it right after seeks, song changes and the transition midpoint.
+    var position by remember { mutableLongStateOf(playerConnection.logicalPositionMs()) }
+    var duration by remember { mutableLongStateOf(playerConnection.logicalDurationMs()) }
+    // Only while the app is on screen: the sheet stays composed in the background.
+    val lifecycleOwner = LocalLifecycleOwner.current
+    LaunchedEffect(isPlaying, logicalState, lifecycleOwner) {
+        lifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            do {
+                position = playerConnection.logicalPositionMs()
+                duration = playerConnection.logicalDurationMs()
+                if (isPlaying) delay(POSITION_POLL_MS)
+            } while (isPlaying)
+        }
+    }
 
     var sliderPosition by remember {
         mutableStateOf<Long?>(null)

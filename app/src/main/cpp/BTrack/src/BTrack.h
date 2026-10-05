@@ -50,6 +50,14 @@ public:
      * @param frameSize the frame size in audio samples
      */
     BTrack (int hopSize, int frameSize);
+
+    /** Constructor taking hopSize, frameSize and the input sample rate
+     * (OuterTune: upstream BTrack assumed 44100 Hz throughout).
+     * @param hopSize the hop size in audio samples
+     * @param frameSize the frame size in audio samples
+     * @param sampleRate the sample rate of the input audio in Hz
+     */
+    BTrack (int hopSize, int frameSize, double sampleRate);
     
     /** Destructor */
     ~BTrack();
@@ -202,6 +210,7 @@ private:
     int timeToNextPrediction;               /**< indicates when the next point to predict the next beat is */
     int timeToNextBeat;                     /**< keeps track of when the next beat is - will be zero when the beat is due, and is set elsewhere in the algorithm to be positive once a beat prediction is made */
     int hopSize;                            /**< the hop size being used by the algorithm */
+    double sampleRate = 44100.0;            /**< sample rate of the input audio (OuterTune patch) */
     int onsetDFBufferSize;                  /**< the onset detection function buffer size */
     bool tempoFixed;                        /**< indicates whether the tempo should be fixed or not */
     bool beatDueInFrame;                    /**< indicates whether a beat is due in the current frame */

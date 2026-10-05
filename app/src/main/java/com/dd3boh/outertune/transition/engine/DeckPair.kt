@@ -46,6 +46,9 @@ class DeckPair(private val factory: DeckFactory) {
      */
     var linked = false
 
+    /** Called when either deck starts or stops playing. */
+    var onIsPlayingChanged: (() -> Unit)? = null
+
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private var prepareJob: Job? = null
     private var speedJob: Job? = null
@@ -61,6 +64,10 @@ class DeckPair(private val factory: DeckFactory) {
                     val other = standby
                     if (other.playWhenReady != playWhenReady) other.playWhenReady = playWhenReady
                 }
+            }
+
+            override fun onIsPlayingChanged(isPlaying: Boolean) {
+                onIsPlayingChanged?.invoke()
             }
         })
     }

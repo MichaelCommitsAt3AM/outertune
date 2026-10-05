@@ -22,6 +22,10 @@ class SimplePlaybackEngine(
         player.release()
     }
 
+    override fun logicalPositionMs(): Long = player.currentPosition
+
+    override fun logicalDurationMs(): Long = player.duration
+
     override fun seekTo(positionMs: Long) {
         player.seekTo(positionMs)
     }

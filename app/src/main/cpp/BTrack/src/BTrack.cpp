@@ -51,6 +51,14 @@ BTrack::BTrack (int hop, int frame)
 }
 
 //=======================================================================
+BTrack::BTrack (int hop, int frame, double rate)
+ : odf (hop, frame, ComplexSpectralDifferenceHWR, HanningWindow)
+{
+    sampleRate = rate;
+    initialise (hop);
+}
+
+//=======================================================================
 BTrack::~BTrack()
 {
 #ifdef USE_FFTW
@@ -154,7 +162,7 @@ void BTrack::setHopSize (int hop)
 {	
 	hopSize = hop;
 	onsetDFBufferSize = (512 * 512) / hopSize;		// calculate df buffer size
-	beatPeriod = round (60 / ((((double) hopSize) / 44100) * 120.));
+	beatPeriod = round (60 / ((((double) hopSize) / sampleRate) * 120.));
 
     // set size of onset detection function buffer
     onsetDF.resize (onsetDFBufferSize);
@@ -277,7 +285,7 @@ void BTrack::setTempo (double tempo)
 	/////////// CUMULATIVE SCORE ARTIFICAL TEMPO UPDATE //////////////////
 	
 	// calculate new beat period
-	int newBeatPeriod = (int) round (60 / ((((double) hopSize) / 44100) * tempo));
+	int newBeatPeriod = (int) round (60 / ((((double) hopSize) / sampleRate) * tempo));
 	
 	int k = 1;
     
@@ -399,7 +407,7 @@ void BTrack::resampleOnsetDetectionFunction()
 //=======================================================================
 void BTrack::calculateTempo()
 {
-    double tempoToLagFactor = 60. * 44100. / 512.;
+    double tempoToLagFactor = 60. * sampleRate / (double) hopSize;
     
 	// adaptive threshold on input
 	adaptiveThreshold (resampledOnsetDF);
@@ -459,10 +467,10 @@ void BTrack::calculateTempo()
 		prevDelta[j] = delta[j];
 	}
 	
-	beatPeriod = round ((60.0 * 44100.0) / (((2 * maxIndex) + 80) * ((double) hopSize)));
+	beatPeriod = round ((60.0 * sampleRate) / (((2 * maxIndex) + 80) * ((double) hopSize)));
 	
 	if (beatPeriod > 0)
-        estimatedTempo = 60.0 / ((((double) hopSize) / 44100.0) * beatPeriod);
+        estimatedTempo = 60.0 / ((((double) hopSize) / sampleRate) * beatPeriod);
 }
 
 //=======================================================================

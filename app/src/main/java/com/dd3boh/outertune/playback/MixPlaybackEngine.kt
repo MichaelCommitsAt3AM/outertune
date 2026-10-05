@@ -20,13 +20,14 @@ import com.dd3boh.outertune.transition.model.TransitionConfig
 import com.dd3boh.outertune.transition.model.TransitionPlan
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.math.min
 import com.dd3boh.outertune.utils.DebugLog as Log
 
@@ -99,6 +100,7 @@ class MixPlaybackEngine(
 
     override fun start() {
         Log.i(TAG, "Starting MixPlaybackEngine Poller")
+        decks.onIsPlayingChanged = ::wakePoller
         startMixPoller()
     }
 
@@ -152,7 +154,6 @@ class MixPlaybackEngine(
         crossfadeFromQueuePos = null
         switchedToNext = false
         phase = MixPhase.IDLE
-        lastMixCheckTime = 0L
     }
 
     // --- Crossfade ---
@@ -180,6 +181,10 @@ class MixPlaybackEngine(
                 diagnosticsLabel = "playlist",
             ) { frame ->
                 crossfadeProgress = frame.progress
+                val target = crossfadeTarget
+                if (!switchedToNext && target != null && frame.progress >= MixTuning.UI_SWITCH_PROGRESS) {
+                    switchLogicalToNext(target)
+                }
             }
             Log.d(TAG, "Transition ended: $result")
             // Whatever ended it, B is already playing; hand over to it.
@@ -273,54 +278,98 @@ class MixPlaybackEngine(
 
     // --- State machine ---
 
+    /** Nudges the poller to re-evaluate now (state changed, seek, play/pause). */
+    private val wake = Channel<Unit>(Channel.CONFLATED)
+
+    private fun wakePoller() {
+        wake.trySend(Unit)
+    }
+
+    /**
+     * Runs the state machine only when something can happen: at the arm point, at the start of
+     * the preroll, or when [wakePoller] signals a change. In between (most of every song) it
+     * sleeps.
+     */
     private fun startMixPoller() {
         pollerJob = scope.launch {
             while (isActive) {
+                val sleepMs = nextCheckDelayMs()
+                if (sleepMs == null) wake.receive() else withTimeoutOrNull(sleepMs) { wake.receive() }
                 if (decks.active.isPlaying) {
                     updateLogicalState()
                     checkMixStatus()
                 }
-                delay(50)
             }
         }
     }
 
+    /** Time until the state machine next has something to do, or null to wait for a signal. */
+    private fun nextCheckDelayMs(): Long? {
+        val player = decks.active
+        if (!player.isPlaying) return null
+        val transition = currentTransitionCache ?: return null
+        val target = when (phase) {
+            MixPhase.PREFETCH -> transition.exitPointMs - MixTuning.ARM_LEAD_MS
+            MixPhase.ARMED -> transition.exitPointMs - prerollLeadMs
+            // The renderer drives a running transition; IDLE waits for a transition to load.
+            MixPhase.IDLE, MixPhase.CROSSFADING -> return null
+        }
+        val speed = player.playbackParameters.speed.coerceAtLeast(0.1f)
+        return ((target - player.currentPosition) / speed).toLong().coerceIn(MixTuning.POLLER_MIN_WAKE_MS, MixTuning.POLLER_MAX_SLEEP_MS)
+    }
+
+    /**
+     * Publishes the logical state when something the UI shows changes (song, duration, the
+     * midpoint switch). Position is not pushed; the UI reads [logicalPositionMs] while visible.
+     */
     private fun updateLogicalState() {
         val player = decks.active
         val currentMeta = player.currentMetadata ?: return
 
-        if (phase == MixPhase.CROSSFADING) {
+        if (phase == MixPhase.CROSSFADING && !switchedToNext) {
             val target = crossfadeTarget
-            if (!switchedToNext && target != null && crossfadeProgress >= MixTuning.UI_SWITCH_PROGRESS) {
+            if (target != null && crossfadeProgress >= MixTuning.UI_SWITCH_PROGRESS) {
                 switchLogicalToNext(target)
                 return
             }
-            if (switchedToNext) {
-                // Show the incoming deck's real position.
-                val standby = decks.standby
-                localLogicalState = localLogicalState.copy(
-                    currentPositionMs = standby.currentPosition,
-                    durationMs = standby.duration.takeIf { it > 0 } ?: localLogicalState.durationMs,
-                )
-                updateLogicalStateCallback(localLogicalState)
-                return
-            }
+        }
+        if (phase == MixPhase.CROSSFADING && switchedToNext) {
+            publish(localLogicalState.copy(durationMs = logicalDurationMs()))
+            return
         }
 
-        // The outgoing song's logical end is the exit point.
-        val logicalDuration = currentTransitionCache?.exitPointMs ?: player.duration
-        localLogicalState = LogicalPlayerState(
-            activeMetadata = currentMeta,
-            currentPositionMs = min(player.currentPosition, logicalDuration),
-            durationMs = logicalDuration,
-            isTransitionActive = false,
+        publish(
+            LogicalPlayerState(
+                activeMetadata = currentMeta,
+                currentPositionMs = logicalPositionMs(),
+                durationMs = logicalDurationMs(),
+                isTransitionActive = false,
+            )
         )
-        updateLogicalStateCallback(localLogicalState)
     }
 
-    private var lastMixCheckTime = 0L
+    /** Sends [state] on if it differs from the last one in anything but position. */
+    private fun publish(state: LogicalPlayerState) {
+        val changed = state.copy(currentPositionMs = 0) != localLogicalState.copy(currentPositionMs = 0)
+        localLogicalState = state
+        if (changed) updateLogicalStateCallback(state)
+    }
 
-    /** Runs every ~50ms while the active deck is playing and advances the state machine. */
+    override fun logicalPositionMs(): Long {
+        if (phase == MixPhase.CROSSFADING && switchedToNext) return decks.standby.currentPosition
+        val position = decks.active.currentPosition
+        val exit = currentTransitionCache?.exitPointMs ?: return position
+        return min(position, exit)
+    }
+
+    override fun logicalDurationMs(): Long {
+        if (phase == MixPhase.CROSSFADING && switchedToNext) {
+            return decks.standby.duration.takeIf { it > 0 } ?: localLogicalState.durationMs
+        }
+        return currentTransitionCache?.exitPointMs ?: decks.active.duration
+    }
+
+    /** Advances the state machine; called by the poller when something may be due. */
     private suspend fun checkMixStatus() {
         // Once the crossfade is running the renderer drives the audio until it completes.
         if (phase == MixPhase.CROSSFADING) return
@@ -336,12 +385,6 @@ class MixPlaybackEngine(
 
         val transition = currentTransitionCache ?: return
         val currentPosition = player.currentPosition
-        val now = System.currentTimeMillis()
-
-        // Adaptive cadence: tighten as we approach the exit point.
-        val interval = if (transition.exitPointMs - currentPosition < 10_000) 20L else 500L
-        if (now - lastMixCheckTime < interval) return
-        lastMixCheckTime = now
 
         // Don't transition if the exit point is effectively the end of the file.
         val realDuration = player.duration
@@ -420,6 +463,7 @@ class MixPlaybackEngine(
         )
         incomingGain = gain
         phase = MixPhase.ARMED
+        wakePoller()
         Log.d(TAG, "Transition armed (planVersion=${transition.planVersion}).")
     }
 
@@ -460,6 +504,7 @@ class MixPlaybackEngine(
 
             currentTransitionCache = transition
             phase = MixPhase.PREFETCH
+            wakePoller()
         }
     }
 }
