@@ -340,19 +340,15 @@ class MusicService : MediaLibraryService(),
             }
             Log.i(TAG, "MusicService: initQueue (bg) took ${System.currentTimeMillis() - t3}ms")
 
-            combine(
-                playerVolume,
-                normalizeFactor,
-                engineFlow.filterNotNull().flatMapLatest { it.isCrossfading },
-                activePlayer,
-            ) { playerVolume, normalizeFactor, isCrossing, _ ->
-                Triple(playerVolume, normalizeFactor, isCrossing)
-            }.collectLatest(scope) { (playerVolume, normalizeFactor, isCrossing) ->
+            // Normal playback only: the mix engine sets its decks' volumes itself (user volume ×
+            // each song's normalization), so it is never fought over here.
+            combine(playerVolume, normalizeFactor, engineFlow, activePlayer) { playerVolume, normalizeFactor, engine, _ ->
+                Triple(playerVolume, normalizeFactor, engine)
+            }.collectLatest(scope) { (playerVolume, normalizeFactor, engine) ->
                 withContext(Dispatchers.Main) {
                     val (songId, factor) = normalizeFactor
-                    // During a crossfade the mix engine owns both decks' volumes. Right after a
-                    // song change the factor may still be the previous song's; wait for its own.
-                    if (!isCrossing && songId == player.currentMediaItem?.mediaId) {
+                    // Right after a song change the factor may still be the previous song's.
+                    if (engine is SimplePlaybackEngine && songId == player.currentMediaItem?.mediaId) {
                         player.volume = playerVolume * factor
                     }
                 }
@@ -487,7 +483,8 @@ class MusicService : MediaLibraryService(),
                 transitionDao = transitionDao,
                 queueBoard = queueBoard,
                 beatGrids = beatGridRepository,
-                targetGainFor = ::targetGainFor,
+                normalizationFor = ::normalizationFor,
+                userVolume = playerVolume,
             ) { state -> _logicalState.value = state }
         } else {
             SimplePlaybackEngine(createExoPlayer())
@@ -520,13 +517,12 @@ class MusicService : MediaLibraryService(),
         }
     }
 
-    /** Volume a song should play at once it's the active one: normalization × user volume. */
-    private suspend fun targetGainFor(songId: String): Float {
+    /** Loudness-normalization gain for a song, honouring the user's preference. */
+    private suspend fun normalizationFor(songId: String): Float {
         val normalize = dataStore.data.map { it[AudioNormalizationKey] ?: true }.first()
         val format = database.format(songId).first()
         val isLocal = database.song(songId).first()?.song?.isLocal == true
-        return LoudnessNormalization.factor(normalize, format != null, format?.loudnessDb, isLocal) *
-                playerVolume.value
+        return LoudnessNormalization.factor(normalize, format != null, format?.loudnessDb, isLocal)
     }
 
     private suspend fun recoverSong(mediaId: String, playbackData: YTPlayerUtils.PlaybackData? = null) {

@@ -112,7 +112,7 @@ class PreviewSession(
                 }
 
                 pair.linked = true
-                renderer.run(a, b, plan, config, gainA, gainB, "preview") { frame ->
+                renderer.run(a, b, plan, config, { gainA }, { gainB }, "preview") { frame ->
                     _state.value = State(isPlaying = true, beatA = frame.beatA, phaseErrorBeats = frame.phaseErrorBeats)
                 }
             } finally {

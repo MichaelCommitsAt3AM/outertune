@@ -35,7 +35,8 @@ class TransitionRenderer(private val effects: DeckEffects) {
      * song and is prepared.
      *
      * @param config read every tick, so edits apply live (editor preview)
-     * @param outgoingGain, incomingGain final volumes (loudness normalization × user volume)
+     * @param outgoingGain, incomingGain each deck's player volume (loudness normalization × user
+     *  volume), read every tick so a volume change during the transition applies to both
      * @param onFrame every tick's decisions, for UI and logical state
      */
     suspend fun run(
@@ -43,8 +44,8 @@ class TransitionRenderer(private val effects: DeckEffects) {
         incoming: ExoPlayer,
         plan: TransitionPlan,
         config: () -> TransitionConfig,
-        outgoingGain: Float,
-        incomingGain: Float,
+        outgoingGain: () -> Float,
+        incomingGain: () -> Float,
         diagnosticsLabel: String,
         onFrame: (MixController.Frame) -> Unit = {},
     ): Result {
@@ -63,7 +64,7 @@ class TransitionRenderer(private val effects: DeckEffects) {
         var installedConfig = config()
         effects.setAutomation(outgoing, DeckAutomation(plan, installedConfig, Deck.A))
         effects.setAutomation(incoming, DeckAutomation(plan, installedConfig, Deck.B))
-        outgoing.volume = outgoingGain
+        outgoing.volume = outgoingGain()
 
         val startMediaId = outgoing.currentMediaItem?.mediaId
         // Counts only time A is actually playing, so pausing mid-transition is fine.
@@ -102,7 +103,7 @@ class TransitionRenderer(private val effects: DeckEffects) {
 
                 if (frame.stage == MixController.Stage.DONE) {
                     outgoing.volume = 0f
-                    incoming.volume = incomingGain
+                    incoming.volume = incomingGain()
                     return Result.COMPLETED.also { diagnostics.finish(it.name) }
                 }
 
@@ -120,12 +121,13 @@ class TransitionRenderer(private val effects: DeckEffects) {
                     if (!unmuted) {
                         unmuted = true
                         diagnostics.onUnmute(frame.phaseErrorBeats)
-                        // The automation already silences B before the zone; the player volume
-                        // stays at 0 until here as well, in case the processor is bypassed.
-                        incoming.volume = incomingGain
                     }
                     diagnostics.onCrossfadeSample(frame.phaseErrorBeats)
                 }
+                // The automation already silences B before the zone; its player volume stays at
+                // 0 until then as well, in case the processor is bypassed.
+                setVolume(outgoing, outgoingGain())
+                setVolume(incoming, if (unmuted) incomingGain() else 0f)
 
                 delay(MixTuning.TICK_MS)
             }
@@ -134,6 +136,10 @@ class TransitionRenderer(private val effects: DeckEffects) {
             effects.setAutomation(outgoing, null)
             effects.setAutomation(incoming, null)
         }
+    }
+
+    private fun setVolume(player: ExoPlayer, volume: Float) {
+        if (player.volume != volume) player.volume = volume
     }
 
     private companion object {
