@@ -224,7 +224,7 @@ class MusicService : MediaLibraryService(),
     // Player vars
     val currentMediaMetadata = MutableStateFlow<MediaMetadata?>(null)
 
-    // --- NEW: Logical State for Gapless UI ---
+    /** What the player UI shows: in mix mode the incoming song can be shown before the decks swap. */
     private val _logicalState = MutableStateFlow(LogicalPlayerState())
     val logicalState = _logicalState.asStateFlow()
 
@@ -426,7 +426,6 @@ class MusicService : MediaLibraryService(),
                 }
             }
         }
-        // startMixPoller() // Removed
     }
 
 
@@ -1221,22 +1220,11 @@ class MusicService : MediaLibraryService(),
             }
         }
 
-        // --- NEW: Refresh Transition Cache ---
-        mediaItem?.mediaId?.let { currentId ->
-            // Note: Use playbackEngine to refresh!
-            if (playbackEngine is MixPlaybackEngine) {
-                 (playbackEngine as MixPlaybackEngine).refreshTransition(currentId)
-            } else {
-                 // Nothing to do for Simple Engine transition monitoring
-            }
-        }
+        // Mix mode: arm the transition for the new (current -> next) pair.
+        (playbackEngine as? MixPlaybackEngine)?.refreshTransition(mediaItem?.mediaId)
 
         updateNotification() // also updates when queue changes
     }
-
-    // --- Transition Monitoring ---
-    // Moved to MixPlaybackEngine
-
 
     override fun onPlaybackStateChanged(@Player.State playbackState: Int) {
         // IGNORE events from standby deck

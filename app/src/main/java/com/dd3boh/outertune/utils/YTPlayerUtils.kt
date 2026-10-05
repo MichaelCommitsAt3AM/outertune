@@ -72,6 +72,10 @@ object YTPlayerUtils {
      */
     private val MAIN_CLIENT: YouTubeClient = ANDROID_VR_NO_AUTH
 
+    /** The client whose stream last validated; tried first next time. */
+    @Volatile
+    private var lastWorkingClient: YouTubeClient? = null
+
     /**
      * Clients used for fallback streams in case the streams of the main client do not work.
      */
@@ -153,23 +157,24 @@ object YTPlayerUtils {
         var streamExpiresInSeconds: Int? = null
 
         var streamPlayerResponse: PlayerResponse? = null
-        for (clientIndex in (-1 until STREAM_FALLBACK_CLIENTS.size)) {
+        // The main client first (its response is already here), then the fallbacks; but if a
+        // fallback produced the last working stream, try it before anything else. Each try costs
+        // a validation round trip, so this saves several on every song once one client works.
+        val preferred = lastWorkingClient
+        val candidates = (listOf(MAIN_CLIENT) + STREAM_FALLBACK_CLIENTS)
+            .sortedByDescending { it === preferred }
+        for (client in candidates) {
             // reset for each client
             format = null
             streamUrl = null
             streamExpiresInSeconds = null
 
-            // decide which client to use for streams and load its player response
-            val client: YouTubeClient
-            if (clientIndex == -1) {
+            // load the client's player response
+            if (client === MAIN_CLIENT) {
                 Log.d(TAG, "Trying client: ${MAIN_CLIENT.clientName}")
-                // try with streams from main client first
-                client = MAIN_CLIENT
                 streamPlayerResponse = mainPlayerResponse
             } else {
-                Log.d(TAG, "Trying fallback client: ${STREAM_FALLBACK_CLIENTS[clientIndex].clientName}")
-                // after main client use fallback clients
-                client = STREAM_FALLBACK_CLIENTS[clientIndex]
+                Log.d(TAG, "Trying fallback client: ${client.clientName}")
 
                 if (client.loginRequired && !isLoggedIn) {
                     // skip client if it requires login but user is not logged in
@@ -209,9 +214,11 @@ object YTPlayerUtils {
                 if (validateStatus(streamUrl)) {
                     // working stream found
                     Log.i(TAG, "[$videoId] [${client.clientName}] found working stream")
+                    lastWorkingClient = client
                     break
                 } else {
                     Log.w(TAG, "[$videoId] [${client.clientName}] got bad http status code")
+                    if (client === lastWorkingClient) lastWorkingClient = null
                     format = null
                     streamUrl = null
                     streamExpiresInSeconds = null

@@ -11,7 +11,6 @@ import com.dd3boh.outertune.db.entities.TransitionEntity
 import com.dd3boh.outertune.transition.editor.EditorArtifacts
 import com.dd3boh.outertune.transition.editor.PreviewSession
 import com.dd3boh.outertune.transition.editor.TransitionEditorEngine
-import com.dd3boh.outertune.transition.engine.BeatGridRepository
 import com.dd3boh.outertune.transition.math.TransitionMath
 import com.dd3boh.outertune.transition.model.EffectMode
 import com.dd3boh.outertune.transition.model.EqMode
@@ -37,11 +36,10 @@ import javax.inject.Inject
 @HiltViewModel
 class TransitionEditorViewModel @Inject constructor(
     private val database: MusicDatabase,
-    beatGridRepository: BeatGridRepository,
+    private val editorEngine: TransitionEditorEngine,
     @ApplicationContext private val context: Context
 ) : ViewModel() {
 
-    private val editorEngine = TransitionEditorEngine(database, beatGridRepository)
     private val preview = PreviewSession(context, viewModelScope)
 
     // --- UI State ---

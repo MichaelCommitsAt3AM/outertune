@@ -5,24 +5,25 @@ import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.spring
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
-import androidx.compose.runtime.*
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
 import com.dd3boh.outertune.transition.editor.BeatSample
 import kotlinx.coroutines.launch
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
-// NOTE: BeatGridMarker is now defined in EditorModels.kt or imported from there.
-// If it was previously defined here, we should remove the definition and import it.
-// Assuming it's shared, we use the one from the package.
-// For now, I will assume BeatGridMarker is defined in `com.dd3boh.outertune.ui.component`
-// as per your Phase 1 snippet (although Phase 1 put it in `EditorModels.kt` referencing `ui.component`).
-// Let's define it here if it's strictly a UI helper, or import it.
-
-// Re-using the class structure from your provided code, but ensuring imports match Phase 4.
 data class BeatGridMarker(
     val beatIndex: Float,
     val isDownbeat: Boolean,
@@ -33,13 +34,18 @@ enum class BeatMarkerPosition {
     TOP, BOTTOM
 }
 
+/**
+ * A horizontally draggable beat-domain waveform. Dragging scrolls it; on release it snaps the
+ * nearest beat to the centre line and reports the new offset through [onOffsetChanged].
+ *
+ * Both [waveformData] and [beatMarkers] must be sorted by beat index: only the visible slice is
+ * found (by binary search) and drawn, as one path.
+ */
 @Composable
 fun WaveformView(
     waveformData: List<BeatSample>,
     beatMarkers: List<BeatGridMarker>,
     markerPosition: BeatMarkerPosition,
-    // songDurationSeconds is not strictly needed for drawing if we trust waveformData indices,
-    // but useful for boundary checks if needed.
     modifier: Modifier = Modifier,
     pixelsPerBeat: Float = 48f,
     beatOffsetBeats: Float = 0f,
@@ -47,55 +53,39 @@ fun WaveformView(
     onOffsetChanged: (Float) -> Unit = {}
 ) {
     val scope = rememberCoroutineScope()
-    val horizontalOffset = remember { Animatable(initialOffset) }
+    var offset by remember { mutableFloatStateOf(initialOffset) }
+    val snapAnimation = remember { Animatable(initialOffset) }
+    val currentOnOffsetChanged by rememberUpdatedState(onOffsetChanged)
+    val currentMarkers by rememberUpdatedState(beatMarkers)
+    val waveformPath = remember { Path() }
 
-    // Sync external changes to internal state (if initialOffset changes significantly)
+    // Follow external changes (e.g. a restored transition) unless we're mid-snap.
     LaunchedEffect(initialOffset) {
-        if (abs(horizontalOffset.value - initialOffset) > 1f && !horizontalOffset.isRunning) {
-            horizontalOffset.snapTo(initialOffset)
-        }
+        if (abs(offset - initialOffset) > 1f && !snapAnimation.isRunning) offset = initialOffset
     }
 
     Canvas(
-        modifier = modifier.pointerInput(Unit) {
+        modifier = modifier.pointerInput(pixelsPerBeat, beatOffsetBeats) {
             detectHorizontalDragGestures(
+                onDragStart = { scope.launch { snapAnimation.stop() } },
                 onDragEnd = {
-                    // Snap to nearest beat logic
-                    val viewCenter = size.width.toFloat() / 2f
-                    val currentScroll = horizontalOffset.value
+                    val viewCenter = size.width / 2f
                     val shiftPixels = beatOffsetBeats * pixelsPerBeat
-
-                    // Calculate where the center currently is in "Beat Space"
-                    // visual_center_x = (beat_index * ppb) + scroll + shift
-                    // beat_index = (visual_center - scroll - shift) / ppb
-                    val exactBeatAtCenter = (viewCenter - currentScroll - shiftPixels) / pixelsPerBeat
-                    
-                    // Snap to nearest beat marker
-                    val nearestBeatIndex = if (beatMarkers.isNotEmpty()) {
-                        beatMarkers.minByOrNull { abs(it.beatIndex - exactBeatAtCenter) }?.beatIndex
-                            ?: exactBeatAtCenter.roundToInt().toFloat()
-                    } else {
-                        exactBeatAtCenter.roundToInt().toFloat()
-                    }
-
-                    // Calculate target scroll to put that beat exactly in center
-                    val targetScroll = viewCenter - (nearestBeatIndex * pixelsPerBeat) - shiftPixels
+                    val beatAtCenter = (viewCenter - offset - shiftPixels) / pixelsPerBeat
+                    val nearestBeat = nearestMarkerBeat(currentMarkers, beatAtCenter)
+                    val target = viewCenter - nearestBeat * pixelsPerBeat - shiftPixels
 
                     scope.launch {
-                        horizontalOffset.animateTo(
-                            targetValue = targetScroll,
-                            animationSpec = spring(stiffness = Spring.StiffnessMediumLow)
-                        )
-                        onOffsetChanged(targetScroll)
+                        snapAnimation.snapTo(offset)
+                        snapAnimation.animateTo(target, spring(stiffness = Spring.StiffnessMediumLow)) {
+                            offset = value
+                        }
+                        currentOnOffsetChanged(target)
                     }
                 }
             ) { change, dragAmount ->
                 change.consume()
-                scope.launch {
-                    val newOffset = horizontalOffset.value + dragAmount
-                    horizontalOffset.snapTo(newOffset)
-                    onOffsetChanged(newOffset)
-                }
+                offset += dragAmount
             }
         }
     ) {
@@ -103,76 +93,43 @@ fun WaveformView(
         val height = size.height
         val centerY = height / 2f
         val maxAmplitude = height / 2f
+        val totalShift = offset + beatOffsetBeats * pixelsPerBeat
 
-        val currentOffset = horizontalOffset.value
-        val totalShift = currentOffset + (beatOffsetBeats * pixelsPerBeat)
+        // Visible beat range, with a beat of margin either side
+        val startVisibleBeat = -totalShift / pixelsPerBeat - 1f
+        val endVisibleBeat = (width - totalShift) / pixelsPerBeat + 1f
 
-        // Center reference line
-        drawLine(
-            color = Color.White.copy(alpha = 0.5f),
-            start = Offset(width / 2f, 0f),
-            end = Offset(width / 2f, height),
-            strokeWidth = 2f
-        )
+        // Waveform: one vertical stroke per sample, all in a single path
+        waveformPath.rewind()
+        val first = lowerBound(waveformData.size) { waveformData[it].beatIndex >= startVisibleBeat }
+        for (i in first until waveformData.size) {
+            val sample = waveformData[i]
+            if (sample.beatIndex > endVisibleBeat) break
+            val x = sample.beatIndex * pixelsPerBeat + totalShift
+            val amplitude = sample.amplitude.coerceIn(0f, 1f) * maxAmplitude
+            waveformPath.moveTo(x, centerY - amplitude)
+            waveformPath.lineTo(x, centerY + amplitude)
+        }
+        drawPath(waveformPath, Color.LightGray, style = Stroke(width = 2f))
 
-        if (waveformData.isNotEmpty()) {
-            // Optimization: Only iterate visible samples
-            // sample.x = (index * ppb) + totalShift
-            // visible if 0 < x < width
-            // index * ppb > -totalShift  -> index > -totalShift/ppb
-            val startVisibleBeat = (-totalShift / pixelsPerBeat) - 2f
-            val endVisibleBeat = ((-totalShift + width) / pixelsPerBeat) + 2f
-
-            // Draw Waveform
-            waveformData.forEach { sample ->
-                if (sample.beatIndex >= startVisibleBeat && sample.beatIndex <= endVisibleBeat) {
-                    val x = (sample.beatIndex * pixelsPerBeat) + totalShift
-                    val normalizedAmp = sample.amplitude.coerceIn(0f, 1f)
-                    val scaledAmplitude = normalizedAmp * maxAmplitude
-
-                    drawLine(
-                        color = Color.LightGray,
-                        start = Offset(x, centerY - scaledAmplitude),
-                        end = Offset(x, centerY + scaledAmplitude),
-                        strokeWidth = 2f
-                    )
-                }
+        // Beat markers
+        val firstMarker = lowerBound(beatMarkers.size) { beatMarkers[it].beatIndex >= startVisibleBeat }
+        for (i in firstMarker until beatMarkers.size) {
+            val marker = beatMarkers[i]
+            if (marker.beatIndex > endVisibleBeat) break
+            val x = marker.beatIndex * pixelsPerBeat + totalShift
+            val color = when {
+                marker.isDownbeat -> Color(0xFF4CAF50)
+                marker.isGhost -> Color.DarkGray
+                else -> Color.Gray.copy(alpha = 0.5f)
             }
-
-            // Draw Markers
-            beatMarkers.forEach { marker ->
-                if (marker.beatIndex >= startVisibleBeat && marker.beatIndex <= endVisibleBeat) {
-                    val x = (marker.beatIndex * pixelsPerBeat) + totalShift
-
-                    val color = when {
-                        marker.isDownbeat -> Color(0xFF4CAF50) // Green
-                        marker.isGhost -> Color.DarkGray
-                        else -> Color.Gray.copy(alpha = 0.5f)
-                    }
-
-                    val strokeWidth = if (marker.isDownbeat) 4f else 2f
-                    val lineLength = if (marker.isDownbeat) 30f else 20f
-
-                    if (markerPosition == BeatMarkerPosition.BOTTOM) {
-                        drawLine(
-                            color = color,
-                            start = Offset(x, height),
-                            end = Offset(x, height - lineLength),
-                            strokeWidth = strokeWidth
-                        )
-                    } else {
-                        drawLine(
-                            color = color,
-                            start = Offset(x, 0f),
-                            end = Offset(x, lineLength),
-                            strokeWidth = strokeWidth
-                        )
-                    }
-                }
-            }
+            val strokeWidth = if (marker.isDownbeat) 4f else 2f
+            val lineLength = if (marker.isDownbeat) 30f else 20f
+            val (y0, y1) = if (markerPosition == BeatMarkerPosition.BOTTOM) height to height - lineLength else 0f to lineLength
+            drawLine(color = color, start = Offset(x, y0), end = Offset(x, y1), strokeWidth = strokeWidth)
         }
 
-        // Playhead indicator (Static Red Line)
+        // Centre line / playhead reference
         drawLine(
             color = Color.Red,
             start = Offset(width / 2f, 0f),
@@ -180,4 +137,28 @@ fun WaveformView(
             strokeWidth = 3f
         )
     }
+}
+
+private fun nearestMarkerBeat(markers: List<BeatGridMarker>, beat: Float): Float {
+    if (markers.isEmpty()) return beat.roundToInt().toFloat()
+    val i = lowerBound(markers.size) { markers[it].beatIndex >= beat }
+    val after = markers.getOrNull(i)?.beatIndex
+    val before = markers.getOrNull(i - 1)?.beatIndex
+    return when {
+        after == null -> before!!
+        before == null -> after
+        abs(after - beat) < abs(beat - before) -> after
+        else -> before
+    }
+}
+
+/** First index in [0, size) for which [isAtOrAfter] holds (it must be monotonic), else size. */
+private inline fun lowerBound(size: Int, isAtOrAfter: (Int) -> Boolean): Int {
+    var lo = 0
+    var hi = size
+    while (lo < hi) {
+        val mid = (lo + hi) ushr 1
+        if (isAtOrAfter(mid)) hi = mid else lo = mid + 1
+    }
+    return lo
 }

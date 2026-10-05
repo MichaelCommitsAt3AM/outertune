@@ -2,7 +2,6 @@ package com.dd3boh.outertune.utils.analysis
 
 import kotlin.math.abs
 import kotlin.math.roundToInt
-import kotlin.math.roundToLong
 
 object BeatGridNormalizer {
 
@@ -181,23 +180,6 @@ object BeatGridNormalizer {
         return alignedBeat
     }
 
-    fun normalizeWithMedianInterval(
-        detectedGrid: List<Float>,
-        durationSec: Float
-    ): List<Float> {
-        if (detectedGrid.size < 3 || durationSec <= 0f) return detectedGrid
-
-        // Calculate median interval
-        val intervals = detectedGrid.zipWithNext { a, b -> b - a }
-        val sorted = intervals.sorted()
-        val medianInterval = sorted[sorted.size / 2]
-
-        val bpm = 60f / medianInterval
-
-        // Use our smart normalize with the calculated median BPM
-        return normalize(detectedGrid, bpm, durationSec)
-    }
-
     fun promoteGrid(
         originalGrid: List<Float>,
         analysisBpm: Float,
@@ -241,35 +223,16 @@ object BeatGridNormalizer {
         return promoted
     }
 
-    data class DualGrid(
-        val visual: List<Float>,
-        val sync: List<Float>
-    )
+    /** The grid used for beat sync: normalized at the analysed tempo, then promoted to the display tempo. */
+    data class DualGrid(val sync: List<Float>)
 
     fun resolveDjGrids(
         detectedGrid: List<Float>,
         analysisBpm: Float,
         displayBpm: Float,
         durationSec: Float,
-        promoteVisual: Boolean = false
     ): DualGrid {
-        // Use the smart normalize function
         val baseSyncGrid = normalize(detectedGrid, analysisBpm, durationSec)
-        val finalSyncGrid = promoteGrid(baseSyncGrid, analysisBpm, displayBpm)
-
-        val finalVisualGrid = if (promoteVisual) {
-            promoteGrid(detectedGrid, analysisBpm, displayBpm)
-        } else {
-            detectedGrid
-        }
-
-        return DualGrid(
-            visual = finalVisualGrid,
-            sync = finalSyncGrid
-        )
+        return DualGrid(sync = promoteGrid(baseSyncGrid, analysisBpm, displayBpm))
     }
-}
-
-fun List<Float>.toMilliseconds(): LongArray {
-    return this.map { (it * 1000f).roundToLong() }.toLongArray()
 }
