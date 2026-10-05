@@ -7,7 +7,7 @@ import androidx.media3.datasource.DefaultDataSource
 import com.dd3boh.outertune.R
 import com.dd3boh.outertune.transition.engine.DeckFactory
 import com.dd3boh.outertune.transition.engine.DeckPair
-import com.dd3boh.outertune.transition.engine.EqualizerDeckEffects
+import com.dd3boh.outertune.transition.engine.ProcessorDeckEffects
 import com.dd3boh.outertune.transition.engine.MixTuning
 import com.dd3boh.outertune.transition.engine.TransitionRenderer
 import com.dd3boh.outertune.transition.math.TransitionMath
@@ -41,8 +41,7 @@ class PreviewSession(
     )
 
     private val factory = DeckFactory(context, { DefaultDataSource.Factory(context) })
-    private val effects = EqualizerDeckEffects()
-    private val renderer = TransitionRenderer(effects)
+    private val renderer = TransitionRenderer(ProcessorDeckEffects(factory))
     private var decks: DeckPair? = null
 
     private val _ready = MutableStateFlow(false)
@@ -134,7 +133,6 @@ class PreviewSession(
     fun release() {
         stop()
         loadJob?.cancel()
-        effects.releaseAll()
         decks?.release()
         decks = null
     }

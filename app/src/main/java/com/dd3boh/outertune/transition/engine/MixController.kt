@@ -1,14 +1,12 @@
 package com.dd3boh.outertune.transition.engine
 
 import com.dd3boh.outertune.transition.math.TransitionMath
-import com.dd3boh.outertune.transition.model.Deck
-import com.dd3boh.outertune.transition.model.TransitionConfig
 import com.dd3boh.outertune.transition.model.TransitionPlan
 
 /**
- * Decides, tick by tick, what both decks should do during a transition: B's speed (phase lock),
- * each deck's volume and EQ state. Pure Kotlin: positions in, decisions out. The editor preview
- * and playlist playback both drive their decks from this, so they play a transition identically.
+ * Decides, tick by tick, how Track B is kept in phase with Track A during a transition (its
+ * speed, and re-seeks during the preroll), and where the transition is. Pure Kotlin: positions
+ * in, decisions out. The sound itself is shaped by [DeckAutomation] inside each deck's pipeline.
  *
  * Beat positions: Track B's target beat is `anchorB + elapsedBeatsA / gridScalar`, which also
  * covers interval-matched pairs (e.g. 70 vs 140 BPM, where one B beat spans two A beats).
@@ -22,7 +20,7 @@ class MixController(
 ) {
     enum class Stage { PREROLL, CROSSFADE, DONE }
 
-    /** What to do on this tick. Volumes are relative (0..1), before loudness gain. */
+    /** What to do on this tick. */
     data class Frame(
         val stage: Stage,
         /** < 0 in preroll, 0..1 across the zone. */
@@ -35,10 +33,6 @@ class MixController(
         val speedB: Double?,
         /** Seek B here (ms) and set its speed to [MixController.appliedSpeed], or null. */
         val reseekBMs: Long?,
-        val volumeA: Float,
-        val volumeB: Float,
-        val stateA: DeckState,
-        val stateB: DeckState,
     )
 
     private val gridScalar = plan.gridScalarB.takeIf { it > 0.0 } ?: 1.0
@@ -66,7 +60,7 @@ class MixController(
      * @param positionBMs B's current position
      * @param incomingPlaying whether B is actually playing (re-seeks only make sense then)
      */
-    fun step(nowMs: Long, positionAMs: Long, positionBMs: Long, incomingPlaying: Boolean, config: TransitionConfig): Frame {
+    fun step(nowMs: Long, positionAMs: Long, positionBMs: Long, incomingPlaying: Boolean): Frame {
         val posA = positionAMs / 1000.0
         val posB = positionBMs / 1000.0
         val beatA = TransitionMath.getBeatForTimestamp(plan.gridA, posA)
@@ -94,12 +88,6 @@ class MixController(
             Stage.DONE -> Unit
         }
 
-        val (stateA, stateB) = when (stage) {
-            Stage.PREROLL -> DeckState.NEUTRAL to DeckState(volume = 0f)
-            Stage.DONE -> DeckState(volume = 0f) to DeckState.NEUTRAL
-            Stage.CROSSFADE -> mixState(Deck.A, progress, posA, posB, config) to mixState(Deck.B, progress, posA, posB, config)
-        }
-
         return Frame(
             stage = stage,
             progress = progress,
@@ -108,16 +96,6 @@ class MixController(
             phaseErrorBeats = if (stage == Stage.PREROLL) rawError else PhaseController.wrapToNearestBeat(rawError),
             speedB = speed,
             reseekBMs = reseek,
-            volumeA = stateA.volume,
-            volumeB = stateB.volume,
-            stateA = stateA,
-            stateB = stateB,
         )
     }
-
-    private fun mixState(deck: Deck, progress: Float, posA: Double, posB: Double, config: TransitionConfig) =
-        TransitionMixer.getMixState(
-            deck, progress, config.overlapMode, config.eqMode, config.effectMode,
-            positionA = posA, positionB = posB, beatGridA = plan.gridA, beatGridB = plan.gridB
-        )
 }
