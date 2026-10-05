@@ -316,6 +316,8 @@ dependencies {
 
     // Unit tests (pure-Kotlin logic: transition math, beat-grid normalizer, mixer curves)
     testImplementation(libs.junit)
+    testImplementation(libs.robolectric)
+    testImplementation(libs.androidx.test.core)
 }
 
 afterEvaluate {

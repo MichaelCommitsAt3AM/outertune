@@ -50,14 +50,14 @@ class PlayerConnection(
 
     val service = binder.getService()!!
 
-    
-    // Use a getter so we always get the *current* active player from the service
-    val player: Player
-        get() = service.player
 
-    // Keep track of the player we are currently listening to
-    private var internalPlayer: Player? = null
-    
+    /**
+     * The player as the user experiences it (the service's [MixSessionPlayer]): stable across
+     * engine switches and deck swaps, and already on the incoming song from a mix transition's
+     * midpoint.
+     */
+    val player: Player = service.sessionPlayer
+
     val scope = binder.viewModelScope
 
     val playbackState = MutableStateFlow(player.playbackState)
@@ -67,7 +67,8 @@ class PlayerConnection(
     }.stateIn(scope, SharingStarted.Lazily, player.playWhenReady && player.playbackState != STATE_ENDED)
     val waitingForNetworkConnection: StateFlow<Boolean> = service.waitingForNetworkConnection.asStateFlow()
 
-    val logicalState = service.logicalState
+    /** Bumped on every seek, so position readers can refresh at once. */
+    val seekEvents = MutableStateFlow(0)
 
     val mediaMetadata = MutableStateFlow(player.currentMetadata)
     val currentSong = mediaMetadata.flatMapLatest {
@@ -96,34 +97,12 @@ class PlayerConnection(
     val error = MutableStateFlow<PlaybackException?>(null)
 
     init {
-        // Observe the active player from MusicService
-        scope.launch {
-            service.activePlayer.collect { newPlayer ->
-                if (newPlayer != null && newPlayer != internalPlayer) {
-                    internalPlayer?.removeListener(this@PlayerConnection)
-                    internalPlayer = newPlayer
-                    newPlayer.addListener(this@PlayerConnection)
-                    
-                    Log.d(TAG, "PlayerConnection switched to new player: $newPlayer")
+        player.addListener(this)
+        updateCanSkipPreviousAndNext()
+        queueWindows.value = player.getQueueWindows()
+        currentWindowIndex.value = player.getCurrentQueueIndex()
+        error.value = player.playerError
 
-                    // Sync state immediately
-                    playbackState.value = newPlayer.playbackState
-                    playWhenReady.value = newPlayer.playWhenReady
-                    shuffleModeEnabled.value = newPlayer.shuffleModeEnabled
-                    repeatMode.value = newPlayer.repeatMode
-                    mediaMetadata.value = newPlayer.currentMetadata
-                    
-                    updateCanSkipPreviousAndNext()
-                    
-                    // Queue info
-                    queueWindows.value = newPlayer.getQueueWindows()
-                    currentWindowIndex.value = newPlayer.getCurrentQueueIndex()
-                    
-                    error.value = newPlayer.playerError
-                }
-            }
-        }
-    
         // Initial sync 
          queuePlaylistId.value = service.queuePlaylistId
     }
@@ -146,18 +125,10 @@ class PlayerConnection(
         )
     }
 
-    fun seekToLogical(positionMs: Long) {
-        service.seekToLogical(positionMs)
+    /** Seeks by [deltaMs] within the current song. */
+    fun seekBy(deltaMs: Long) {
+        player.seekTo((player.currentPosition + deltaMs).coerceAtLeast(0))
     }
-
-    fun seekByLogical(deltaMs: Long) {
-        service.seekByLogical(deltaMs)
-    }
-
-    /** Position in the song the user sees. Cheap; poll it while the player UI is visible. */
-    fun logicalPositionMs(): Long = service.logicalPositionMs()
-
-    fun logicalDurationMs(): Long = service.logicalDurationMs()
 
     /**
      * Add item to queue, right after current playing item
@@ -250,6 +221,10 @@ class PlayerConnection(
             canSkipPrevious.value = false
             canSkipNext.value = false
         }
+    }
+
+    override fun onPositionDiscontinuity(oldPosition: Player.PositionInfo, newPosition: Player.PositionInfo, reason: Int) {
+        seekEvents.value++
     }
 
     fun dispose() {

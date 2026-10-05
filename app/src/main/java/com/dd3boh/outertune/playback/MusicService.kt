@@ -104,7 +104,6 @@ import com.dd3boh.outertune.extensions.findNextMediaItemById
 import com.dd3boh.outertune.extensions.metadata
 import com.dd3boh.outertune.extensions.setOffloadEnabled
 import com.dd3boh.outertune.lyrics.LyricsHelper
-import com.dd3boh.outertune.models.LogicalPlayerState
 import com.dd3boh.outertune.models.HybridCacheDataSinkFactory
 import com.dd3boh.outertune.models.MediaMetadata
 import com.dd3boh.outertune.models.MultiQueueObject
@@ -224,9 +223,12 @@ class MusicService : MediaLibraryService(),
     // Player vars
     val currentMediaMetadata = MutableStateFlow<MediaMetadata?>(null)
 
-    /** What the player UI shows: in mix mode the incoming song can be shown before the decks swap. */
-    private val _logicalState = MutableStateFlow(LogicalPlayerState())
-    val logicalState = _logicalState.asStateFlow()
+    /**
+     * The player the media session and the UI use. It follows the active engine and deck, and in
+     * mix mode shows the incoming song from a transition's midpoint.
+     */
+    lateinit var sessionPlayer: MixSessionPlayer
+        private set
 
     private val _activePlayer = MutableStateFlow<ExoPlayer?>(null)
     val activePlayer = _activePlayer.asStateFlow()
@@ -269,6 +271,22 @@ class MusicService : MediaLibraryService(),
         _activePlayer.value = fakePlayer
         sleepTimer = SleepTimer(scope, fakePlayer!!)
 
+        sessionPlayer = MixSessionPlayer(
+            userVolume = { playerVolume.value },
+            onUserVolumeChange = { playerVolume.value = it.coerceIn(0f, 1f) },
+        )
+        sessionPlayer.bind(playbackEngine!!, fakePlayer!!)
+        // What the service treats as "the current song" (likes, library, notification) is what
+        // the user hears and sees, which mid-transition is ahead of the active deck.
+        sessionPlayer.addListener(object : Player.Listener {
+            override fun onEvents(player: Player, events: Player.Events) {
+                if (events.containsAny(EVENT_TIMELINE_CHANGED, EVENT_POSITION_DISCONTINUITY, Player.EVENT_MEDIA_ITEM_TRANSITION)) {
+                    currentMediaMetadata.value = player.currentMetadata
+                }
+            }
+        })
+        playerVolume.collect(scope) { sessionPlayer.refresh() }
+
         // Everything bound to "the player the user hears" follows the active player, whether it
         // changes because the engine was switched or because the mix engine swapped decks.
         scope.launch {
@@ -280,7 +298,7 @@ class MusicService : MediaLibraryService(),
                     val previous = _activePlayer.value
                     val isDeckSwap = engine === lastEngine && previous != null && previous !== newPlayer
                     lastEngine = engine
-                    onActivePlayerChanged(previous, newPlayer, isDeckSwap)
+                    onActivePlayerChanged(engine, previous, newPlayer, isDeckSwap)
                 }
         }
 
@@ -292,7 +310,7 @@ class MusicService : MediaLibraryService(),
         }
 
         val t2 = System.currentTimeMillis()
-        mediaSession = MediaLibrarySession.Builder(this, player, mediaLibrarySessionCallback)
+        mediaSession = MediaLibrarySession.Builder(this, sessionPlayer, mediaLibrarySessionCallback)
             .setSessionActivity(
                 PendingIntent.getActivity(
                     this,
@@ -446,12 +464,9 @@ class MusicService : MediaLibraryService(),
      * Rebinds everything that follows the player the user hears. [isDeckSwap] is true when the
      * mix engine handed over to its other deck at the end of a transition.
      */
-    private fun onActivePlayerChanged(previous: ExoPlayer?, newPlayer: ExoPlayer, isDeckSwap: Boolean) {
+    private fun onActivePlayerChanged(engine: PlaybackEngine, previous: ExoPlayer?, newPlayer: ExoPlayer, isDeckSwap: Boolean) {
         _activePlayer.value = newPlayer
-        if (::mediaSession.isInitialized && mediaSession.player !== newPlayer) {
-            mediaSession.player = newPlayer
-        }
-        currentMediaMetadata.value = newPlayer.currentMetadata
+        sessionPlayer.bind(engine, newPlayer)
         newPlayer.skipSilenceEnabled = skipSilenceEnabled
         if (previous != null && previous !== newPlayer) {
             newPlayer.repeatMode = previous.repeatMode
@@ -485,14 +500,14 @@ class MusicService : MediaLibraryService(),
                 beatGrids = beatGridRepository,
                 normalizationFor = ::normalizationFor,
                 userVolume = playerVolume,
-            ) { state -> _logicalState.value = state }
+            )
         } else {
             SimplePlaybackEngine(createExoPlayer())
         }
 
         val newPlayer = newEngine.activePlayer.value
         oldPlayer?.let { newPlayer.repeatMode = it.repeatMode }
-        onActivePlayerChanged(oldPlayer, newPlayer, isDeckSwap = false)
+        onActivePlayerChanged(newEngine, oldPlayer, newPlayer, isDeckSwap = false)
         engineFlow.value = newEngine
         newEngine.start()
 
@@ -500,20 +515,6 @@ class MusicService : MediaLibraryService(),
             old?.destroy()
         } catch (e: Exception) {
             reportException(e)
-        }
-    }
-
-    /** Logical state for normal playback, where it simply mirrors the player. */
-    private fun publishSimpleLogicalState() {
-        if (playbackEngine is MixPlaybackEngine) return
-        val p = player
-        p.currentMetadata?.let { metadata ->
-            _logicalState.value = LogicalPlayerState(
-                activeMetadata = metadata,
-                currentPositionMs = p.currentPosition,
-                durationMs = p.duration,
-                isTransitionActive = false
-            )
         }
     }
 
@@ -1175,20 +1176,6 @@ class MusicService : MediaLibraryService(),
 
         queueBoard.setCurrQueuePosIndex(player.currentMediaItemIndex)
         
-        // Update logical state for Mix mode when user manually changes songs
-        if (playbackEngine is MixPlaybackEngine && 
-            (reason == MEDIA_ITEM_TRANSITION_REASON_SEEK || reason == MEDIA_ITEM_TRANSITION_REASON_AUTO)) {
-            player.currentMetadata?.let { metadata ->
-                _logicalState.value = LogicalPlayerState(
-                    activeMetadata = metadata,
-                    currentPositionMs = player.currentPosition,
-                    durationMs = player.duration,
-                    isTransitionActive = false
-                )
-                Log.d(TAG, "Updated logical state for manual song change: ${metadata.title}")
-            }
-        }
-
         // reshuffle queue when shuffle AND repeat all are enabled
         // no, when repeat mode is on, player does not "STATE_ENDED"
         if (player.currentMediaItemIndex == player.mediaItemCount - 1 &&
@@ -1232,11 +1219,6 @@ class MusicService : MediaLibraryService(),
                     waitingForNetworkConnection.value = false
                 }
             }
-        }
-        if (events.containsAny(EVENT_TIMELINE_CHANGED, EVENT_POSITION_DISCONTINUITY)) {
-            currentMediaMetadata.value = player.currentMetadata
-            // Mix mode publishes its own logical state.
-            publishSimpleLogicalState()
         }
     }
 
@@ -1288,20 +1270,6 @@ class MusicService : MediaLibraryService(),
             }
         }
     }
-
-    fun seekToLogical(newPositionMs: Long) {
-        playbackEngine?.seekTo(newPositionMs)
-    }
-
-    /** Seeks relative to the position the user sees (which, mid-transition, may be the incoming song). */
-    fun seekByLogical(deltaMs: Long) {
-        seekToLogical((logicalPositionMs() + deltaMs).coerceAtLeast(0))
-    }
-
-    /** Position in the song the user sees; read by the UI on demand while it's visible. */
-    fun logicalPositionMs(): Long = playbackEngine?.logicalPositionMs() ?: player.currentPosition
-
-    fun logicalDurationMs(): Long = playbackEngine?.logicalDurationMs() ?: player.duration
 
     override fun onRepeatModeChanged(repeatMode: Int) {
         updateNotification()

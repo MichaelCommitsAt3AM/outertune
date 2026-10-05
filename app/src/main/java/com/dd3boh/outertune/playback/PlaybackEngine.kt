@@ -42,8 +42,17 @@ interface PlaybackEngine {
     fun logicalDurationMs(): Long
 
     /**
-     * Seek to a position.
-     * Engines may override this to handle logic (like canceling transitions).
+     * Added to the active player's current index to get the song the user is on. 1 while a mix
+     * transition shows the incoming song before the decks swap; otherwise 0.
      */
+    val logicalIndexOffset: Int
+
+    /** Called when something [MixSessionPlayer] reports changed without a player event. */
+    var onLogicalStateChanged: (() -> Unit)?
+
+    /** Seeks within the song the user is on. */
     fun seekTo(positionMs: Long)
+
+    /** Seeks to [positionMs] (or the default position for C.TIME_UNSET) of the song at [index]. */
+    fun seekToItem(index: Int, positionMs: Long)
 }

@@ -26,7 +26,15 @@ class SimplePlaybackEngine(
 
     override fun logicalDurationMs(): Long = player.duration
 
+    override val logicalIndexOffset: Int = 0
+
+    override var onLogicalStateChanged: (() -> Unit)? = null
+
     override fun seekTo(positionMs: Long) {
         player.seekTo(positionMs)
+    }
+
+    override fun seekToItem(index: Int, positionMs: Long) {
+        player.seekTo(index, positionMs)
     }
 }

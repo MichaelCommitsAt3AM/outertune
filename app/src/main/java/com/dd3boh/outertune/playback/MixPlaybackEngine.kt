@@ -1,5 +1,6 @@
 package com.dd3boh.outertune.playback
 
+import androidx.media3.common.C
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
 import com.dd3boh.outertune.db.MusicDatabase
@@ -7,7 +8,6 @@ import com.dd3boh.outertune.db.daos.TransitionDao
 import com.dd3boh.outertune.db.entities.TransitionEntity
 import com.dd3boh.outertune.extensions.currentMetadata
 import com.dd3boh.outertune.extensions.toMediaItem
-import com.dd3boh.outertune.models.LogicalPlayerState
 import com.dd3boh.outertune.models.MediaMetadata
 import com.dd3boh.outertune.transition.engine.BeatGridRepository
 import com.dd3boh.outertune.utils.LoudnessNormalization
@@ -51,7 +51,6 @@ class MixPlaybackEngine(
     private val normalizationFor: suspend (songId: String) -> Float,
     /** The user's volume; each deck plays at this × its song's normalization. */
     private val userVolume: StateFlow<Float>,
-    private val updateLogicalStateCallback: (LogicalPlayerState) -> Unit,
 ) : PlaybackEngine {
 
     private val TAG = "MixPlaybackEngine"
@@ -92,15 +91,22 @@ class MixPlaybackEngine(
     private var armedIncomingNorm = 1f
     private var crossfadeProgress = 0f
 
-    /** The song being brought in, and the queue position it was brought in from. */
-    private var crossfadeTarget: MediaMetadata? = null
+    /** The queue position the running transition started from. */
     private var crossfadeFromQueuePos: Int? = null
-    /** Whether the UI already shows [crossfadeTarget]. */
+    /** Whether the transition is past its midpoint, so the next song is shown as current. */
     private var switchedToNext = false
 
     private val prerollLeadMs = (MixTuning.PREROLL_SECONDS * 1000).toLong()
 
-    private var localLogicalState = LogicalPlayerState()
+    override var onLogicalStateChanged: (() -> Unit)? = null
+
+    /** 1 from a transition's midpoint until the swap: the user hears and sees the next song. */
+    override val logicalIndexOffset: Int
+        get() = if (phase == MixPhase.CROSSFADING && switchedToNext) 1 else 0
+
+    private fun notifyLogicalState() {
+        onLogicalStateChanged?.invoke()
+    }
 
     override fun start() {
         Log.i(TAG, "Starting MixPlaybackEngine Poller")
@@ -126,23 +132,20 @@ class MixPlaybackEngine(
             val player = decks.active
             val duration = player.duration.takeIf { it > 0 }
             player.seekTo(if (duration != null) positionMs.coerceIn(0L, duration) else positionMs)
-            publishLogicalState(player)
             return
         }
 
-        val state = localLogicalState
-        val clampedPosition = if (state.durationMs > 0) positionMs.coerceIn(0L, state.durationMs) else positionMs
+        val logicalDuration = logicalDurationMs()
+        val clampedPosition = if (logicalDuration > 0) positionMs.coerceIn(0L, logicalDuration) else positionMs
 
         // A seek invalidates any armed / in-flight transition. Tear it down before moving.
         resetMixState()
 
         decks.active.seekTo(clampedPosition)
 
-        localLogicalState = state.copy(currentPositionMs = clampedPosition, isTransitionActive = false)
-        updateLogicalStateCallback(localLogicalState)
-
         // Re-arm for wherever we landed.
         refreshTransition(decks.active.currentMediaItem?.mediaId)
+        wakePoller()
     }
 
     /**
@@ -156,10 +159,23 @@ class MixPlaybackEngine(
         currentTransitionCache = null
         currentTransitionPlan = null
         currentTransitionConfig = null
-        crossfadeTarget = null
         crossfadeFromQueuePos = null
         switchedToNext = false
         phase = MixPhase.IDLE
+        notifyLogicalState()
+    }
+
+    override fun seekToItem(index: Int, positionMs: Long) {
+        val active = decks.active
+        if (index == active.currentMediaItemIndex + logicalIndexOffset) {
+            seekTo(if (positionMs == C.TIME_UNSET) 0 else positionMs)
+            return
+        }
+        // Another song: a running transition is either finished (if it already shows the next
+        // song, so the queue position stays consistent) or abandoned.
+        if (phase == MixPhase.CROSSFADING && switchedToNext) finishCrossfade() else resetMixState()
+        decks.active.seekTo(index, positionMs)
+        wakePoller()
     }
 
     // --- Crossfade ---
@@ -170,7 +186,6 @@ class MixPlaybackEngine(
         val outgoingNorm = normalizationOf(outgoing)
         val incomingNorm = normalization[nextSong.id] ?: armedIncomingNorm
         crossfadeProgress = 0f
-        crossfadeTarget = nextSong
         crossfadeFromQueuePos = queueBoard.getCurrentQueue()?.getQueuePosShuffled()
         switchedToNext = false
         phase = MixPhase.CROSSFADING
@@ -188,10 +203,7 @@ class MixPlaybackEngine(
                 diagnosticsLabel = "playlist",
             ) { frame ->
                 crossfadeProgress = frame.progress
-                val target = crossfadeTarget
-                if (!switchedToNext && target != null && frame.progress >= MixTuning.UI_SWITCH_PROGRESS) {
-                    switchLogicalToNext(target)
-                }
+                if (!switchedToNext && frame.progress >= MixTuning.UI_SWITCH_PROGRESS) switchLogicalToNext()
             }
             Log.d(TAG, "Transition ended: $result")
             // Whatever ended it, B is already playing; hand over to it.
@@ -259,16 +271,9 @@ class MixPlaybackEngine(
         return id?.let { normalization[it] } ?: (player.volume / userVolume.value.coerceAtLeast(0.001f))
     }
 
-    private fun switchLogicalToNext(nextSong: MediaMetadata) {
+    private fun switchLogicalToNext() {
         switchedToNext = true
-        val standby = decks.standby
-        localLogicalState = LogicalPlayerState(
-            activeMetadata = nextSong,
-            currentPositionMs = standby.currentPosition,
-            durationMs = standby.duration.takeIf { it > 0 } ?: (nextSong.duration * 1000L),
-            isTransitionActive = true,
-        )
-        updateLogicalStateCallback(localLogicalState)
+        notifyLogicalState()
     }
 
     /** After a deck swap: advance the queue and arm the next pair. */
@@ -296,22 +301,10 @@ class MixPlaybackEngine(
             queueBoard.setCurrQueue()
         }
 
-        publishLogicalState(newPlayer)
+        notifyLogicalState()
 
         // Pre-warm the transition for the new (current -> next) pair.
         refreshTransition(newPlayer.currentMediaItem?.mediaId)
-    }
-
-    private fun publishLogicalState(player: ExoPlayer) {
-        player.currentMetadata?.let { metadata ->
-            localLogicalState = LogicalPlayerState(
-                activeMetadata = metadata,
-                currentPositionMs = player.currentPosition,
-                durationMs = player.duration,
-                isTransitionActive = false,
-            )
-            updateLogicalStateCallback(localLogicalState)
-        }
     }
 
     // --- State machine ---
@@ -333,10 +326,7 @@ class MixPlaybackEngine(
             while (isActive) {
                 val sleepMs = nextCheckDelayMs()
                 if (sleepMs == null) wake.receive() else withTimeoutOrNull(sleepMs) { wake.receive() }
-                if (decks.active.isPlaying) {
-                    updateLogicalState()
-                    checkMixStatus()
-                }
+                if (decks.active.isPlaying) checkMixStatus()
             }
         }
     }
@@ -356,43 +346,6 @@ class MixPlaybackEngine(
         return ((target - player.currentPosition) / speed).toLong().coerceIn(MixTuning.POLLER_MIN_WAKE_MS, MixTuning.POLLER_MAX_SLEEP_MS)
     }
 
-    /**
-     * Publishes the logical state when something the UI shows changes (song, duration, the
-     * midpoint switch). Position is not pushed; the UI reads [logicalPositionMs] while visible.
-     */
-    private fun updateLogicalState() {
-        val player = decks.active
-        val currentMeta = player.currentMetadata ?: return
-
-        if (phase == MixPhase.CROSSFADING && !switchedToNext) {
-            val target = crossfadeTarget
-            if (target != null && crossfadeProgress >= MixTuning.UI_SWITCH_PROGRESS) {
-                switchLogicalToNext(target)
-                return
-            }
-        }
-        if (phase == MixPhase.CROSSFADING && switchedToNext) {
-            publish(localLogicalState.copy(durationMs = logicalDurationMs()))
-            return
-        }
-
-        publish(
-            LogicalPlayerState(
-                activeMetadata = currentMeta,
-                currentPositionMs = logicalPositionMs(),
-                durationMs = logicalDurationMs(),
-                isTransitionActive = false,
-            )
-        )
-    }
-
-    /** Sends [state] on if it differs from the last one in anything but position. */
-    private fun publish(state: LogicalPlayerState) {
-        val changed = state.copy(currentPositionMs = 0) != localLogicalState.copy(currentPositionMs = 0)
-        localLogicalState = state
-        if (changed) updateLogicalStateCallback(state)
-    }
-
     override fun logicalPositionMs(): Long {
         if (phase == MixPhase.CROSSFADING && switchedToNext) return decks.standby.currentPosition
         val position = decks.active.currentPosition
@@ -402,7 +355,7 @@ class MixPlaybackEngine(
 
     override fun logicalDurationMs(): Long {
         if (phase == MixPhase.CROSSFADING && switchedToNext) {
-            return decks.standby.duration.takeIf { it > 0 } ?: localLogicalState.durationMs
+            return decks.standby.duration
         }
         return currentTransitionCache?.exitPointMs ?: decks.active.duration
     }
@@ -543,6 +496,8 @@ class MixPlaybackEngine(
             currentTransitionCache = transition
             phase = MixPhase.PREFETCH
             wakePoller()
+            // The song's logical end is now its exit point.
+            notifyLogicalState()
         }
     }
 }
