@@ -40,6 +40,20 @@ object YTPlayerUtils {
      *  entry just gets re-resolved rather than served past expiry. */
     private const val YTDLP_STREAM_EXPIRES_IN_SECONDS = 3600
 
+    /** Safety margin so a cached URL is re-resolved before googlevideo actually rejects it. */
+    private const val STREAM_EXPIRY_MARGIN_SECONDS = 60
+
+    /**
+     * Seconds until a googlevideo URL expires, from its `expire=` (epoch seconds) query
+     * parameter, minus a safety margin. Null when the URL has no usable expiry.
+     */
+    private fun expiresInSecondsFromUrl(url: String): Int? {
+        val expireEpoch = runCatching { android.net.Uri.parse(url).getQueryParameter("expire") }
+            .getOrNull()?.toLongOrNull() ?: return null
+        val remaining = expireEpoch - System.currentTimeMillis() / 1000 - STREAM_EXPIRY_MARGIN_SECONDS
+        return remaining.takeIf { it > 0 }?.coerceAtMost(Int.MAX_VALUE.toLong())?.toInt()
+    }
+
     private val httpClient = OkHttpClient.Builder()
         .proxy(YouTube.proxy)
         .build()
@@ -237,7 +251,7 @@ object YTPlayerUtils {
                         signatureCipher = null, // url is already resolved, no cipher to decode
                     ),
                     ytdlp.url,
-                    YTDLP_STREAM_EXPIRES_IN_SECONDS,
+                    expiresInSecondsFromUrl(ytdlp.url) ?: YTDLP_STREAM_EXPIRES_IN_SECONDS,
                     ytdlp.headers,
                 )
             }

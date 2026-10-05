@@ -28,20 +28,6 @@ class TransitionEditorViewModel @Inject constructor(
 
     private val editorEngine = TransitionEditorEngine(context, database)
     private val playbackEngine = TransitionPlaybackEngine(context)
-    
-    init {
-        // Monitor state changes for debugging
-        viewModelScope.launch {
-            playbackEngine.decksReady.collect { ready ->
-                android.util.Log.d(TAG, "playbackEngine.decksReady changed to: $ready")
-            }
-        }
-        viewModelScope.launch {
-            playbackEngine.loadingError.collect { error ->
-                android.util.Log.d(TAG, "playbackEngine.loadingError changed to: $error")
-            }
-        }
-    }
 
     // --- UI State ---
     private val _editorArtifacts = MutableStateFlow<EditorArtifacts?>(null)
@@ -65,13 +51,12 @@ class TransitionEditorViewModel @Inject constructor(
 
     // Expose Decks Ready state to UI (optional, can be used to disable Play button)
     val areDecksReady = playbackEngine.decksReady
-        .onEach { android.util.Log.d(TAG, "areDecksReady flow emitting: $it") }
-        .stateIn(viewModelScope, SharingStarted.Eagerly, false)
 
-    // Expose loading error
-    val loadingError = playbackEngine.loadingError
-        .onEach { android.util.Log.d(TAG, "loadingError flow emitting: $it") }
-        .stateIn(viewModelScope, SharingStarted.Eagerly, null)
+    /** Deck warm-up failures, or a reason the editor can't work with these songs. */
+    private val _editorError = MutableStateFlow<String?>(null)
+    val loadingError = combine(playbackEngine.loadingError, _editorError) { deckError, editorError ->
+        editorError ?: deckError
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, null)
 
     private val _config = MutableStateFlow(TransitionConfig())
     val barsCount = _config.map { it.barsCount }.stateIn(viewModelScope, SharingStarted.Lazily, 4)
@@ -87,8 +72,8 @@ class TransitionEditorViewModel @Inject constructor(
         val offsetB: Double
     )
 
-    private var originalState: TransitionState? = null
-    
+    /** The saved state, to detect unsaved edits. A flow so [hasChanges] updates after a save. */
+    private val originalState = MutableStateFlow<TransitionState?>(null)
 
 
     private val _isSaving = MutableStateFlow(false)
@@ -100,9 +85,8 @@ class TransitionEditorViewModel @Inject constructor(
     private val _track2OffsetBeats = MutableStateFlow(0.0)
     val track2OffsetBeats = _track2OffsetBeats.map { it.toFloat() }.stateIn(viewModelScope, SharingStarted.Lazily, 0f)
 
-    private val _hasChanges = combine(_config, _track1OffsetBeats, _track2OffsetBeats) { config, offA, offB ->
-        val current = TransitionState(config, offA.toDouble(), offB.toDouble())
-        originalState?.let { it != current } ?: false
+    private val _hasChanges = combine(_config, _track1OffsetBeats, _track2OffsetBeats, originalState) { config, offA, offB, original ->
+        original != null && original != TransitionState(config, offA, offB)
     }
     val hasChanges = _hasChanges.stateIn(viewModelScope, SharingStarted.Lazily, false)
 
@@ -154,7 +138,7 @@ class TransitionEditorViewModel @Inject constructor(
                 }
 
                 // Capture Baseline State
-                originalState = TransitionState(
+                originalState.value = TransitionState(
                     config = _config.value,
                     offsetA = _track1OffsetBeats.value,
                     offsetB = _track2OffsetBeats.value
@@ -164,15 +148,14 @@ class TransitionEditorViewModel @Inject constructor(
                 val pathB = artifacts.track2.song.localPath
 
                 if (pathA != null && pathB != null) {
-                    android.util.Log.d("TransitionEditorViewModel", "Calling prewarmDecks with paths: A=$pathA, B=$pathB")
                     playbackEngine.prewarmDecks(pathA, pathB)
                 } else {
-                    android.util.Log.e("TransitionEditorViewModel", "Cannot prewarm decks - paths are null: A=$pathA, B=$pathB")
+                    _editorError.value = "Both songs must be downloaded to preview the transition"
                 }
 
                 recalculateZoom()
             } else {
-                android.util.Log.e("TransitionEditorViewModel", "loadArtifacts returned null")
+                _editorError.value = "Couldn't load these songs. Make sure both are downloaded and analysed."
             }
         }
     }
@@ -220,12 +203,10 @@ class TransitionEditorViewModel @Inject constructor(
     fun saveTransition(onComplete: () -> Unit) {
         _isSaving.value = true
         viewModelScope.launch(Dispatchers.IO) {
-            val plan = calculateCurrentPlan() ?: run {
-                _isSaving.value = false
-                return@launch
-            }
-            val artifacts = _editorArtifacts.value ?: run {
-                _isSaving.value = false
+            val plan = calculateCurrentPlan()
+            val artifacts = _editorArtifacts.value
+            if (plan == null || artifacts == null) {
+                withContext(Dispatchers.Main) { _isSaving.value = false }
                 return@launch
             }
 
@@ -251,18 +232,14 @@ class TransitionEditorViewModel @Inject constructor(
             )
 
             database.transitionDao().insert(transition)
-            
-            // Update baseline after successful save
-            originalState = TransitionState(
-                config = _config.value,
-                offsetA = _track1OffsetBeats.value,
-                offsetB = _track2OffsetBeats.value
-            )
-            
-            // Artificial delay to let user see the spinner (optional, but good for UX if save is too fast)
-            kotlinx.coroutines.delay(500)
 
             withContext(Dispatchers.Main) {
+                // Update baseline after successful save
+                originalState.value = TransitionState(
+                    config = _config.value,
+                    offsetA = _track1OffsetBeats.value,
+                    offsetB = _track2OffsetBeats.value
+                )
                 _isSaving.value = false
                 onComplete()
             }
@@ -288,12 +265,14 @@ class TransitionEditorViewModel @Inject constructor(
 
     private fun calculateCurrentPlan(): TransitionPlan? {
         val artifacts = _editorArtifacts.value ?: return null
+        val bpmA = artifacts.track1.song.displayBpm ?: return null
+        val bpmB = artifacts.track2.song.displayBpm ?: return null
 
         return TransitionMath.calculatePlan(
             gridA = artifacts.rawGrid1,
             gridB = artifacts.rawGrid2,
-            bpmA = artifacts.track1.song.displayBpm!!,
-            bpmB = artifacts.track2.song.displayBpm!!,
+            bpmA = bpmA,
+            bpmB = bpmB,
             offsetBeatsA = _track1OffsetBeats.value,
             offsetBeatsB = _track2OffsetBeats.value,
             config = _config.value

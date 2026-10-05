@@ -35,10 +35,11 @@ class SilenceAudioProcessor : BaseAudioProcessor() {
         val buffer = replaceOutputBuffer(remaining)
 
         if (isEnabled) {
-            // Write zeros
-            val zeroBuffer = ByteBuffer.allocate(remaining) // Allocates 0s by default
-            buffer.put(zeroBuffer)
-            
+            // Write zeros in place (no per-buffer allocation on the audio thread)
+            var i = 0
+            while (i + 8 <= remaining) { buffer.putLong(0L); i += 8 }
+            while (i < remaining) { buffer.put(0); i++ }
+
             // Consume the input by advancing its position
             inputBuffer.position(inputBuffer.position() + remaining)
         } else {

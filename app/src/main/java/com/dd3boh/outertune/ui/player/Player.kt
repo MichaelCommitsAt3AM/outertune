@@ -600,7 +600,7 @@ fun BottomSheetPlayer(
                                 color = onBackgroundColor,
                                 enabled = playerConnection.player.currentMediaItem != null,
                                 onClick = {
-                                    playerConnection.player.seekTo(playerConnection.player.currentPosition - seekIncrement.millisec)
+                                    playerConnection.seekByLogical(-seekIncrement.millisec.toLong())
                                 }
                             )
                         }
@@ -652,7 +652,7 @@ fun BottomSheetPlayer(
                                 onClick = {
                                     //ExoPlayer seek increment can only be set in builder
                                     //playerConnection.player.seekForward()
-                                    playerConnection.player.seekTo(playerConnection.player.currentPosition + seekIncrement.millisec)
+                                    playerConnection.seekByLogical(seekIncrement.millisec.toLong())
                                 }
                             )
                         }

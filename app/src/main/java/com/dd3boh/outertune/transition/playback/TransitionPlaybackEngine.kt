@@ -246,7 +246,8 @@ class TransitionPlaybackEngine(
             val timeAnchorB = TransitionMath.getTimestampForBeat(plan.gridB, plan.anchorBeatB)
 
             val seekA = (timeAnchorA - PREROLL_SECONDS).coerceAtLeast(0.0)
-            val prerollB = if (plan.gridScalarB == 1.0) PREROLL_SECONDS else PREROLL_SECONDS * plan.initialSpeedB
+            // B covers PREROLL_SECONDS of A's time at its own speed.
+            val prerollB = PREROLL_SECONDS * plan.initialSpeedB
             val seekB = (timeAnchorB - prerollB).coerceAtLeast(0.0)
 
             // --- 2. Setup Players ---
@@ -344,20 +345,21 @@ class TransitionPlaybackEngine(
     ) {
         val transitionStartBeatA = plan.anchorBeatA
         val unmuteBeatA = TransitionMath.getBeatForTimestamp(plan.gridA, seekTimeA + 0.5)
+        val gridScalar = plan.gridScalarB.takeIf { it > 0.0 } ?: 1.0
 
-        var currentAppliedSpeed = plan.initialSpeedB.toFloat()
-        var isAligned = false
+        val controller = PhaseController(plan.initialSpeedB)
+        val diagnostics = MixDiagnostics(TAG, "preview")
         var firstTick = true
-        var loopTicks = 0
+        var unmuted = false
         var transitionComplete = false
 
         delay(33) // Allow seek to register
 
         while (currentCoroutineContext().isActive) {
-            loopTicks++
             if (!_playbackState.value.isPlaying) break
 
             val currentConfig = activeConfig ?: break
+            val now = System.currentTimeMillis()
 
             if (firstTick) {
                 deckAState = DeckWarmState.ACTIVE
@@ -372,55 +374,46 @@ class TransitionPlaybackEngine(
             if (!transitionComplete && pA.playbackState == Player.STATE_READY && !pA.isPlaying) pA.play()
             if (pB.playbackState == Player.STATE_READY && !pB.isPlaying) pB.play()
 
-            // 2. Current Position in Beats
-            val currentBeatA = if (!transitionComplete) {
-                val posA = pA.currentPosition / 1000.0
-                TransitionMath.getBeatForTimestamp(plan.gridA, posA)
-            } else 0.0
-
+            // 2. Positions in beats; B's target follows A, scaled for interval-matched pairs
+            val posA = pA.currentPosition / 1000.0
             val posB = pB.currentPosition / 1000.0
+            val currentBeatA = if (!transitionComplete) TransitionMath.getBeatForTimestamp(plan.gridA, posA) else 0.0
             val currentBeatB = TransitionMath.getBeatForTimestamp(plan.gridB, posB)
+            val elapsedBeatsA = currentBeatA - transitionStartBeatA
+            val targetBeatB = plan.anchorBeatB + elapsedBeatsA / gridScalar
+            val rawPhaseError = if (!transitionComplete) targetBeatB - currentBeatB else 0.0
 
-            val phaseErrorBeats = if (!transitionComplete) {
-                val elapsedBeatsA = currentBeatA - transitionStartBeatA
-                val targetBeatB = plan.anchorBeatB + elapsedBeatsA
-
-                // Phase Error Calculation
-                var pe = targetBeatB - currentBeatB
-                val isInPreroll = currentBeatA < transitionStartBeatA
-
-                // Preroll Correction
-                if (isInPreroll) {
-                    if (!isAligned && abs(pe) > 0.2) {
-                        val correctedTimeB = TransitionMath.getTimestampForBeat(plan.gridB, targetBeatB)
-                        pB.seekTo((correctedTimeB * 1000).toLong())
-
-                        currentAppliedSpeed = plan.initialSpeedB.toFloat()
-                        pB.setPlaybackSpeed(currentAppliedSpeed)
-                        // delay(50) // removed to avoid blocking logic, will correct next tick
-                        // continue causes issues with scope variables, let's just accept the seek
-                    } else if (!isAligned && abs(pe) < 0.05) {
-                        isAligned = true
-                    }
-                } else {
-                    while (pe > 0.5) pe -= 1.0
-                    while (pe < -0.5) pe += 1.0
-                }
-               pe
-            } else 0.0
+            val progress = if (transitionComplete) 2f else if (plan.transitionDurationBeats > 0)
+                (elapsedBeatsA / plan.transitionDurationBeats).toFloat()
+            else 0f
+            val stage = if (progress < 0f) PhaseController.Stage.PREROLL else PhaseController.Stage.CROSSFADE
 
             _playbackState.value = PlaybackState(
                 true,
                 currentBeatA.toFloat(),
                 currentBeatB.toFloat(),
-                phaseErrorBeats.toFloat()
+                (if (stage == PhaseController.Stage.CROSSFADE) PhaseController.wrapToNearestBeat(rawPhaseError)
+                else rawPhaseError).toFloat()
             )
 
-            // 5. Mixer Logic
-            val progress = if (transitionComplete) 2f else if (plan.transitionDurationBeats > 0)
-                ((currentBeatA - transitionStartBeatA) / plan.transitionDurationBeats).toFloat()
-            else 0f
+            // 3. Phase lock (same control law as playlist playback)
+            if (!transitionComplete) {
+                if (stage == PhaseController.Stage.PREROLL &&
+                    controller.shouldReseek(rawPhaseError, -elapsedBeatsA, now)
+                ) {
+                    diagnostics.onReseek()
+                    val correctedTimeB = TransitionMath.getTimestampForBeat(plan.gridB, targetBeatB)
+                    pB.seekTo((correctedTimeB * 1000).toLong())
+                    pB.setPlaybackSpeed(controller.appliedSpeed.toFloat())
+                } else {
+                    controller.speedFor(stage, rawPhaseError, now)?.let { speed ->
+                        pB.setPlaybackSpeed(speed.toFloat())
+                        diagnostics.onSpeedChange()
+                    }
+                }
+            }
 
+            // 4. Mixer Logic
             var volA: Float
             var volB: Float
 
@@ -440,42 +433,33 @@ class TransitionPlaybackEngine(
                     }
                 }
             } else if (progress <= 1f) {
-                // Calculate Current Audio Timestamps (Seconds)
-                // Note: pA.currentPosition is unreliable during Seek/Speed changes, so we use our calculated beat time converted back to seconds?
-                // No, sidechain needs high precision. Use currentPosition / 1000.0
-                val tsA = pA.currentPosition / 1000.0
-                val tsB = pB.currentPosition / 1000.0
+                if (!unmuted) {
+                    unmuted = true
+                    diagnostics.onUnmute(rawPhaseError)
+                }
+                diagnostics.onCrossfadeSample(PhaseController.wrapToNearestBeat(rawPhaseError))
 
                 val stateA = TransitionMixer.getMixState(
-                    "A", 
-                    progress, 
-                    currentConfig.overlapMode, 
-                    currentConfig.eqMode, 
-                    currentConfig.effectMode,
-                    currentTimestamp = tsA,
-                    beatGridA = plan.gridA,
-                    beatGridB = plan.gridB
+                    "A", progress,
+                    currentConfig.overlapMode, currentConfig.eqMode, currentConfig.effectMode,
+                    positionA = posA, positionB = posB,
+                    beatGridA = plan.gridA, beatGridB = plan.gridB
                 )
-                
                 val stateB = TransitionMixer.getMixState(
-                    "B", 
-                    progress, 
-                    currentConfig.overlapMode, 
-                    currentConfig.eqMode, 
-                    currentConfig.effectMode,
-                    currentTimestamp = tsB,
-                    beatGridA = plan.gridA,
-                    beatGridB = plan.gridB
+                    "B", progress,
+                    currentConfig.overlapMode, currentConfig.eqMode, currentConfig.effectMode,
+                    positionA = posA, positionB = posB,
+                    beatGridA = plan.gridA, beatGridB = plan.gridB
                 )
                 volA = stateA.volume
                 volB = stateB.volume
-                
+
                 if (abs(stateA.bass - lastBassA) > 0.01f || abs(stateA.filterHigh - lastFilterA) > 0.01f) {
                     applyDeckStateToEQ(eqA, stateA, minEQ, (eqA?.numberOfBands ?: 0).toShort(), currentConfig.effectMode)
                     lastBassA = stateA.bass
                     lastFilterA = stateA.filterHigh
                 }
-                
+
                 if (abs(stateB.bass - lastBassB) > 0.01f || abs(stateB.filterHigh - lastFilterB) > 0.01f) {
                     applyDeckStateToEQ(eqB, stateB, minEQ, (eqB?.numberOfBands ?: 0).toShort(), currentConfig.effectMode)
                     lastBassB = stateB.bass
@@ -485,46 +469,17 @@ class TransitionPlaybackEngine(
                 volA = 0f
                 volB = 1f
                 if (!transitionComplete) {
-                     resetEQ(eqB) // Optimization not strictly necessary here as it only happens once at end, but good for consistency
-                     lastBassB = 1f; lastFilterB = 1f
-                     transitionComplete = true
-                     
-                     // Freeze A
-                     pA.volume = 0f
-                     // We could resetEQ(eqA) here if we wanted clean state
+                    resetEQ(eqB)
+                    lastBassB = 1f; lastFilterB = 1f
+                    transitionComplete = true
+                    diagnostics.finish("completed")
+                    // Freeze A
+                    pA.volume = 0f
                 }
             }
 
-            // Apply mixing volumes
-            // Note: We used to coerceAtLeast(0.001f). Now we can go to true 0 because 
-            // the pipeline is alive, BUT only if we trust Android not to kill a 0-volume track.
-            // With SilenceProcessor disabled, we are relying on normal playback.
-            // When playing active audio, we DON'T want 0.001 bleed if it should be silent.
-            // But we do want to avoid suspension.
-            // Since decks are ACTIVE, let's stick to true volume logic.
-            // If the user wants to be super safe, we can keep 0.001 but that defeats the purpose of "Silence" processor? 
-            // No, Silence processor is for the IDLE state.
-            // In ACTIVE state, if volume is 0, we genuinely want 0.
             pA.volume = volA
             pB.volume = volB
-
-            // 6. PLL Control Law
-            // Optimization: Relax PLL cadence to ~165ms when aligned to reduce Sonic overhead
-            if (!transitionComplete && (!isAligned || loopTicks % 5 == 0)) {
-                val mixConfidence = volB.coerceIn(0f, 1f)
-                val kp = 0.04f + (0.50f * (1f - mixConfidence))
-
-                val correction = if (abs(phaseErrorBeats) > 0.005) {
-                    (phaseErrorBeats.toFloat() * kp).coerceIn(-0.1f, 0.1f)
-                } else 0f
-
-                val targetSpeed = (plan.initialSpeedB.toFloat() + correction).coerceIn(0.5f, 2.0f)
-
-                if (abs(targetSpeed - currentAppliedSpeed) > 0.002f) {
-                    pB.setPlaybackSpeed(targetSpeed)
-                    currentAppliedSpeed = targetSpeed
-                }
-            }
 
             delay(16)
         }
@@ -602,8 +557,8 @@ class TransitionPlaybackEngine(
             eq.setBandLevel(0.toShort(), bassCut)
             if (bands > 1) eq.setBandLevel(1.toShort(), (bassCut * 0.8).toInt().toShort())
 
-            val isLPF = effectMode.contains("Low pass", true)
-            val isHPF = effectMode.contains("High Pass", true)
+            val isLPF = TransitionMixer.isLowPass(effectMode)
+            val isHPF = TransitionMixer.isHighPass(effectMode)
             val filterLevel = state.filterHigh
 
             if (isLPF) {
