@@ -219,7 +219,7 @@ class LocalPlaylistViewModel @Inject constructor(
                         TransitionState.Auto
                     } else {
                         TransitionState.Custom(
-                            durationMs = entity.durationMs,
+                            bars = entity.bars,
                             overlapMode = entity.overlapMode,
                             eqMode = entity.eqMode,
                             effectMode = entity.effectMode,

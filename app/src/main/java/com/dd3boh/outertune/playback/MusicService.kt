@@ -94,7 +94,6 @@ import com.dd3boh.outertune.db.daos.TransitionDao
 import com.dd3boh.outertune.db.entities.Event
 import com.dd3boh.outertune.db.entities.FormatEntity
 import com.dd3boh.outertune.db.entities.RelatedSongMap
-import com.dd3boh.outertune.db.entities.TransitionEntity
 import com.dd3boh.outertune.di.AppModule.PlayerCache
 import com.dd3boh.outertune.di.DownloadCache
 import com.dd3boh.outertune.extensions.SilentHandler
@@ -115,6 +114,8 @@ import com.dd3boh.outertune.playback.queues.Queue
 import com.dd3boh.outertune.playback.queues.YouTubeQueue
 import com.dd3boh.outertune.utils.CoilBitmapLoader
 import com.dd3boh.outertune.utils.LoudnessNormalization
+import com.dd3boh.outertune.transition.engine.BeatGridRepository
+import com.dd3boh.outertune.transition.engine.DeckFactory
 import com.dd3boh.outertune.utils.NetworkConnectivityObserver
 import com.dd3boh.outertune.utils.SyncUtils
 import com.dd3boh.outertune.utils.YTPlayerUtils
@@ -197,7 +198,6 @@ class MusicService : MediaLibraryService(),
     @DownloadCache
     lateinit var downloadCache: SimpleCache
 
-    // lateinit var deckManager: DeckManager // Removed
     // Helper property to keep existing code working (points to currently hearing player)
     val player: ExoPlayer
         get() = playbackEngine?.activePlayer?.value ?: fakePlayer!! // Fallback during init
@@ -211,6 +211,9 @@ class MusicService : MediaLibraryService(),
 
     @Inject
     lateinit var transitionDao: TransitionDao
+
+    @Inject
+    lateinit var beatGridRepository: BeatGridRepository
 
     lateinit var connectivityObserver: NetworkConnectivityObserver
     val waitingForNetworkConnection = MutableStateFlow(false)
@@ -486,22 +489,20 @@ class MusicService : MediaLibraryService(),
         val oldPlayer = old?.activePlayer?.value
 
         val newEngine: PlaybackEngine = if (mix) {
-            var mixEngine: MixPlaybackEngine? = null
-            val deckManager = DeckManager(
-                context = this,
-                dataSourceFactoryProvider = ::createDataSourceFactory,
-                extensionRendererMode = audioDecoder,
-                onPlayerCreated = ::configurePlayer,
-                onActiveDeckChanged = { player -> mixEngine?.onActiveDeckChanged(player) },
-            )
             MixPlaybackEngine(
-                deckManager,
-                scope,
-                database,
-                transitionDao,
-                queueBoard,
+                deckFactory = DeckFactory(
+                    context = this,
+                    dataSourceFactory = ::createDataSourceFactory,
+                    extensionRendererMode = audioDecoder,
+                    onPlayerCreated = ::configurePlayer,
+                ),
+                scope = scope,
+                database = database,
+                transitionDao = transitionDao,
+                queueBoard = queueBoard,
+                beatGrids = beatGridRepository,
                 targetGainFor = ::targetGainFor,
-            ) { state -> _logicalState.value = state }.also { mixEngine = it }
+            ) { state -> _logicalState.value = state }
         } else {
             SimplePlaybackEngine(createExoPlayer())
         }

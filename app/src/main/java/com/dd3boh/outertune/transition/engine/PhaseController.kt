@@ -1,4 +1,4 @@
-package com.dd3boh.outertune.transition.playback
+package com.dd3boh.outertune.transition.engine
 
 import kotlin.math.abs
 import kotlin.math.floor
@@ -70,25 +70,18 @@ class PhaseController(private val baseSpeed: Double) {
     }
 
     companion object {
-        /** Proportional gain in fractional speed per beat of error. */
-        const val PREROLL_KP = 0.5
-        const val CROSSFADE_KP = 0.3
-
-        /** Largest relative speed deviation from [baseSpeed]. B is muted in preroll. */
-        const val PREROLL_MAX_NUDGE = 0.2
-        const val CROSSFADE_MAX_NUDGE = 0.04
-
-        const val MIN_SPEED = 0.5
-        const val MAX_SPEED = 2.0
-
-        /** Errors below this (about 5 ms at 120 BPM) are left alone. */
-        const val DEAD_BAND_BEATS = 0.01
-        const val MIN_SPEED_STEP = 0.002
-        const val MIN_UPDATE_INTERVAL_MS = 100L
-
-        const val RESEEK_THRESHOLD_BEATS = 0.35
-        const val RESEEK_MIN_BEATS_BEFORE_UNMUTE = 2.0
-        const val MAX_RESEEKS = 2
+        const val PREROLL_KP = MixTuning.PREROLL_KP
+        const val CROSSFADE_KP = MixTuning.CROSSFADE_KP
+        const val PREROLL_MAX_NUDGE = MixTuning.PREROLL_MAX_NUDGE
+        const val CROSSFADE_MAX_NUDGE = MixTuning.CROSSFADE_MAX_NUDGE
+        const val MIN_SPEED = MixTuning.MIN_SPEED
+        const val MAX_SPEED = MixTuning.MAX_SPEED
+        const val DEAD_BAND_BEATS = MixTuning.DEAD_BAND_BEATS
+        const val MIN_SPEED_STEP = MixTuning.MIN_SPEED_STEP
+        const val MIN_UPDATE_INTERVAL_MS = MixTuning.MIN_SPEED_UPDATE_INTERVAL_MS
+        const val RESEEK_THRESHOLD_BEATS = MixTuning.RESEEK_THRESHOLD_BEATS
+        const val RESEEK_MIN_BEATS_BEFORE_UNMUTE = MixTuning.RESEEK_MIN_BEATS_BEFORE_UNMUTE
+        const val MAX_RESEEKS = MixTuning.MAX_RESEEKS
 
         /** Maps an error to the nearest beat, in [-0.5, 0.5). */
         fun wrapToNearestBeat(error: Double): Double = error - floor(error + 0.5)

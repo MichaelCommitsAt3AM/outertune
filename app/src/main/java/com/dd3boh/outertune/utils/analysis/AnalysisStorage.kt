@@ -17,9 +17,16 @@ object AnalysisStorage {
     private const val DIR = "analysis_data"
 
     enum class Kind(internal val suffix: String) {
+        /** Raw analysed beat times, milliseconds, comma-separated text. */
         BEAT_GRID("_beats_sync.dat"),
+        /** Waveform envelope, comma-separated text (legacy; see [WAVEFORM_BIN]). */
         WAVEFORM("_waveform.dat"),
+        /** Exact duration in seconds, as text. */
         METADATA("_metadata.dat"),
+        /** The canonical beat grid used for mixing (see BeatGridRepository). */
+        CANONICAL_GRID("_grid.bin"),
+        /** Waveform envelope, binary. */
+        WAVEFORM_BIN("_waveform.bin"),
     }
 
     fun dir(context: Context): File = File(context.filesDir, DIR).apply { mkdirs() }

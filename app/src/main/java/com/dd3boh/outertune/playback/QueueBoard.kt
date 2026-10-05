@@ -931,7 +931,7 @@ class QueueBoard(
 
     /**
      * Look ahead to see what the next song is without changing the current position.
-     * Used by DeckManager to pre-load Deck B for mixing.
+     * Used by MixPlaybackEngine to pre-load the standby deck for mixing.
      */
     @Synchronized
     fun peekNext(): MediaMetadata? {

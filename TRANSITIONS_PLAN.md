@@ -2,6 +2,22 @@
 
 2026-10-05 · Companion to [TRANSITIONS_AUDIT.md](TRANSITIONS_AUDIT.md). Issue IDs (P/C/D/G) refer to that document.
 
+## Status
+
+| Phase | State | Branch |
+| --- | --- | --- |
+| 0, 1 | Done; needs the manual test matrix on a device | `fix/phase-0-1-playback` |
+| 2 | Done except 2.8 (on-device parity check); needs the manual test matrix | `feature/unified-mix-engine` |
+| 3, 4 | Not started | |
+
+Where Phase 2 as built differs from the steps below:
+
+- Grids stay `List<Double>` rather than `DoubleArray` (P11's boxing cost is small at ~500 beats; left for Phase 3).
+- The editor preview plays local files only (`DefaultDataSource`), as before; streaming in the editor would need the service's data source.
+- No "re-check this transition" flag yet when a song's BPM changes; the grid is rebuilt automatically, but saved transitions on it are not marked.
+- Waveforms moved to binary as part of 2.2 (P9).
+- Tick work stays on the main looper (decision 2); `MixDiagnostics` lines will show whether that's enough.
+
 ## Goal
 
 When this plan is done, a transition plays the same in the editor as in a playlist, because both run **the same engine on the same beat grid**. Normal (non-mix) playback is back to its pre-refactor behaviour, and the codebase has one implementation of each concept instead of two.
