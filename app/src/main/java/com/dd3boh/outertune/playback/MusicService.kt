@@ -38,6 +38,7 @@ import androidx.media3.common.Player.STATE_IDLE
 import androidx.media3.common.Timeline
 import androidx.media3.common.audio.SonicAudioProcessor
 import androidx.media3.datasource.DataSource
+import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.ResolvingDataSource
 import androidx.media3.datasource.cache.CacheDataSource
@@ -801,8 +802,12 @@ class MusicService : MediaLibraryService(),
             .setFlags(FLAG_IGNORE_CACHE_ON_ERROR)
     }
 
+    /** A resolved stream URL plus how long it's valid and any headers it must be requested with
+     *  (non-empty only for a yt-dlp-sourced stream — see YtDlpStreamResolver). */
+    private data class CachedStreamUrl(val url: String, val expiresAt: Long, val headers: Map<String, String>)
+
     fun createDataSourceFactory(): DataSource.Factory {
-        val songUrlCache = HashMap<String, Pair<String, Long>>()
+        val songUrlCache = HashMap<String, CachedStreamUrl>()
         return ResolvingDataSource.Factory(createCacheDataSource()) { dataSpec ->
             val mediaId = dataSpec.key ?: error("No media id")
             Log.d(TAG, "PLAYING: song id = $mediaId")
@@ -843,10 +848,10 @@ class MusicService : MediaLibraryService(),
                 return@Factory dataSpec
             }
 
-            songUrlCache[mediaId]?.takeIf { it.second > System.currentTimeMillis() }?.let {
+            songUrlCache[mediaId]?.takeIf { it.expiresAt > System.currentTimeMillis() }?.let { cached ->
                 Log.d(TAG, "PLAYING: remote song (temp cache)")
                 offloadScope.launch { recoverSong(mediaId) }
-                return@Factory dataSpec.withUri(it.first.toUri())
+                return@Factory dataSpec.withStream(cached.url, cached.headers)
             }
 
             Log.d(TAG, "PLAYING: remote song (online fetch)")
@@ -906,11 +911,25 @@ class MusicService : MediaLibraryService(),
 
             val streamUrl = playbackData.streamUrl
 
-            songUrlCache[mediaId] =
-                streamUrl to System.currentTimeMillis() + (playbackData.streamExpiresInSeconds * 1000L)
-            dataSpec.withUri(streamUrl.toUri()).subrange(dataSpec.uriPositionOffset, CHUNK_LENGTH)
+            songUrlCache[mediaId] = CachedStreamUrl(
+                streamUrl,
+                System.currentTimeMillis() + (playbackData.streamExpiresInSeconds * 1000L),
+                playbackData.streamHeaders,
+            )
+            dataSpec.withStream(streamUrl, playbackData.streamHeaders)
+                .subrange(dataSpec.uriPositionOffset, CHUNK_LENGTH)
         }
     }
+
+    /** [DataSpec.withUri] plus, when non-empty, the extra headers a yt-dlp-sourced stream URL
+     *  requires (see YtDlpStreamResolver / PlaybackData.streamHeaders) — omitting them for such
+     *  a URL reproduces the exact 403s that resolver exists to route around. */
+    private fun DataSpec.withStream(url: String, headers: Map<String, String>): DataSpec =
+        if (headers.isEmpty()) {
+            withUri(url.toUri())
+        } else {
+            buildUpon().setUri(url.toUri()).setHttpRequestHeaders(headers).build()
+        }
 
     private fun createRenderersFactory(gaplessOffloadAllowed: Boolean): DefaultRenderersFactory {
         if (ENABLE_FFMETADATAEX) {

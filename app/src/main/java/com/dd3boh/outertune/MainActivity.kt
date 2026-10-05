@@ -792,29 +792,6 @@ class MainActivity : ComponentActivity() {
                                         SetupWizard(navController)
                                     }
 
-                                    composable(
-                                        route = "transition_editor/{songAId}/{songBId}",
-                                        arguments = listOf(
-                                            navArgument("songAId") { type = NavType.StringType },
-                                            navArgument("songBId") { type = NavType.StringType }
-                                        )
-                                    ) { backStackEntry ->
-                                        val songAId = backStackEntry.arguments?.getString("songAId") ?: return@composable
-                                        val songBId = backStackEntry.arguments?.getString("songBId") ?: return@composable
-
-                                        // Import the screen appropriately
-                                        com.dd3boh.outertune.ui.screens.TransitionEditorScreen(
-                                            songAId = songAId,
-                                            songBId = songBId,
-                                            onCancel = { navController.popBackStack() },
-                                            onSave = {
-                                                // Save logic to be implemented in Phase 3
-                                                navController.popBackStack()
-                                            }
-                                        )
-                                    }
-
-
                                 }
                             }
 

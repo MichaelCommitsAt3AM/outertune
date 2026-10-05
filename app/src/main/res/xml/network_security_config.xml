@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- Self-hosted ytmusic-api download backend (LAN, plain HTTP). See DownloadUtil.YTMUSIC_API_BASE_URL. -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">192.168.100.14</domain>
+    </domain-config>
+</network-security-config>

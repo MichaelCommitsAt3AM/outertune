@@ -76,7 +76,7 @@ class MusicDatabase(
     fun close() = delegate.close()
 
     companion object {
-        const val MUSIC_DATABASE_VERSION = 26
+        const val MUSIC_DATABASE_VERSION = 27
     }
 }
 
@@ -154,6 +154,7 @@ abstract class InternalDatabase : RoomDatabase() {
                     .addMigrations(MIGRATION_23_24)
                     .addMigrations(MIGRATION_24_25) // New Bar Detection Migration
                     .addMigrations(MIGRATION_25_26)
+                    .addMigrations(MIGRATION_26_27) // Persist TransitionPlan, drop redundant index, filesDir move
                     .build()
             )
 
@@ -170,6 +171,7 @@ abstract class InternalDatabase : RoomDatabase() {
                     .addMigrations(MIGRATION_23_24)
                     .addMigrations(MIGRATION_24_25) // New Bar Detection Migration
                     .addMigrations(MIGRATION_25_26)
+                    .addMigrations(MIGRATION_26_27) // Persist TransitionPlan, drop redundant index, filesDir move
                     .build()
             )
     }
@@ -193,6 +195,36 @@ val MIGRATION_25_26 = object : Migration(25, 26) {
         db.execSQL("ALTER TABLE transitions ADD COLUMN overlapMode TEXT NOT NULL DEFAULT 'Overlap'")
         db.execSQL("ALTER TABLE transitions ADD COLUMN eqMode TEXT NOT NULL DEFAULT 'None'")
         db.execSQL("ALTER TABLE transitions ADD COLUMN effectMode TEXT NOT NULL DEFAULT 'None'")
+    }
+}
+
+/**
+ * Transitions Phase 1:
+ *  - Persist the editor's TransitionPlan alongside the row so playback stops re-deriving it.
+ *  - Drop the redundant unique index (the composite primary key already covers it).
+ *  - Re-point analysis artifacts that moved from cacheDir to filesDir (see AnalysisStorage).
+ */
+val MIGRATION_26_27 = object : Migration(26, 27) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("DROP INDEX IF EXISTS `index_transitions_fromSongId_toSongId`")
+
+        db.execSQL("ALTER TABLE transitions ADD COLUMN planVersion INTEGER")
+        db.execSQL("ALTER TABLE transitions ADD COLUMN initialSpeedB REAL")
+        db.execSQL("ALTER TABLE transitions ADD COLUMN gridScalarB REAL")
+        db.execSQL("ALTER TABLE transitions ADD COLUMN transitionDurationBeats REAL")
+        db.execSQL("ALTER TABLE transitions ADD COLUMN offsetBeatsA REAL")
+        db.execSQL("ALTER TABLE transitions ADD COLUMN offsetBeatsB REAL")
+
+        // Analysis artifacts moved from <data>/cache/analysis_data to <data>/files/analysis_data.
+        // The two directories are siblings under the app data dir, so the path rewrite is deterministic.
+        db.execSQL(
+            "UPDATE song SET beat_grid_path = REPLACE(beat_grid_path, '/cache/analysis_data/', '/files/analysis_data/') " +
+                "WHERE beat_grid_path LIKE '%/cache/analysis_data/%'"
+        )
+        db.execSQL(
+            "UPDATE song SET waveform_path = REPLACE(waveform_path, '/cache/analysis_data/', '/files/analysis_data/') " +
+                "WHERE waveform_path LIKE '%/cache/analysis_data/%'"
+        )
     }
 }
 

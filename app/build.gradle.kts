@@ -103,6 +103,16 @@ android {
         buildConfig = true
     }
 
+    packaging {
+        // youtubedl-android hides its bundled Python payload as a fake native lib
+        // (lib/<abi>/libpython.zip.so) and needs it extracted to the filesystem at install time
+        // (paired with android:extractNativeLibs="true" in the manifest) rather than left
+        // compressed/page-aligned inside the APK, which is AGP's modern default.
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
+
 // build variants and stuff
     splits {
         abi {
@@ -182,7 +192,10 @@ android {
             // Define the strict mode, will fail if the project uses licenses not allowed
             strictMode = com.mikepenz.aboutlibraries.plugin.StrictMode.FAIL
             // Allowed set of licenses, this project will be able to use without build failure
-            allowedLicenses.addAll("Apache-2.0", "BSD-3-Clause", "GNU LESSER GENERAL PUBLIC LICENSE, Version 2.1", "GPL-3.0-only", "EPL-2.0", "MIT", "MPL-2.0", "Public Domain")
+            allowedLicenses.addAll("Apache-2.0", "BSD-3-Clause", "GNU LESSER GENERAL PUBLIC LICENSE, Version 2.1", "GPL-3.0-only", "GNU GENERAL PUBLIC LICENSE, Version 3", "EPL-2.0", "MIT", "MPL-2.0", "Public Domain",
+                // NewPipeExtractor v0.26.5 and youtubedl-android declare GPL-3.0 under spelling
+                // variants not covered above (project is itself GPL-3.0 — same license family).
+                "GPL-3.0-or-later", "GNU General Public License v3.0 or later", "GPL-3.0 license")
 
             // Full license text for license IDs mentioned here will be included, even if no detected dependency uses them.
              additionalLicenses.addAll("apache_2_0", "gpl_2_1") // taglib, ffMpeg in ffMetadataEx
@@ -292,12 +305,18 @@ dependencies {
     implementation(libs.amplituda)
     implementation(libs.androidx.work.runtime.ktx)
 
+    // Last-resort YouTube stream-URL resolver (see YtDlpStreamResolver)
+    implementation(libs.youtubedl.android)
+
     // misc
     implementation(libs.aboutlibraries.compose.m3)
 
     // sdk24 support
     // Support for N is officially unsupported even it the app should still work. Leave this outside of the version catalog.
     implementation("androidx.webkit:webkit:1.14.0")
+
+    // Unit tests (pure-Kotlin logic: transition math, beat-grid normalizer, mixer curves)
+    testImplementation(libs.junit)
 }
 
 afterEvaluate {

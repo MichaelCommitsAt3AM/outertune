@@ -150,7 +150,6 @@ import kotlinx.coroutines.launch
 import sh.calvin.reorderable.ReorderableItem
 import sh.calvin.reorderable.rememberReorderableLazyListState
 import kotlin.math.roundToInt
-import com.dd3boh.outertune.ui.dialog.MixEditorDialog // Ensure you created this in Phase 5
 
 
 @OptIn(ExperimentalMaterial3Api::class, FlowPreview::class)
@@ -193,9 +192,6 @@ fun LocalPlaylistScreen(
         inSelectMode = false
         selection.clear()
     }
-
-    // Track which songs we are editing
-    var showMixEditor by remember { mutableStateOf<Pair<String, String>?>(null) }
 
     var showAnalysisDialog by remember { mutableStateOf(false) }
 
@@ -768,14 +764,6 @@ fun LocalPlaylistScreen(
                 .align(Alignment.BottomCenter)
         )
 
-        // NEW: Show Dialog when state is set
-        if (showMixEditor != null) {
-            MixEditorDialog(
-                songAId = showMixEditor!!.first,
-                songBId = showMixEditor!!.second,
-                onDismiss = { showMixEditor = null }
-            )
-        }
     }
 }
 

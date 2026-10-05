@@ -181,23 +181,6 @@ object BeatGridNormalizer {
         return alignedBeat
     }
 
-    // NOTE: For normalizeWithMedianInterval, you should also apply the consensus logic
-    // if you want to fix the drift there, but 'normalize' is the primary one used by loadData.
-
-    fun normalizeWithSections(detectedGrid: List<Float>, durationSec: Float, threshold: Float = 2.0f): List<Float> {
-        // ... (Existing implementation is okay for sections as it resets per section)
-        // Just ensure backfill logic handles negative check like above.
-        return normalize(detectedGrid, calculateBpmFor(detectedGrid), durationSec) // Fallback to our smart normalizer
-    }
-
-    private fun calculateBpmFor(section: List<Float>): Float {
-        if (section.size < 2) return 120f
-        val duration = section.last() - section.first()
-        val intervals = section.size - 1
-        val avgInterval = duration / intervals
-        return if (avgInterval > 0f) 60f / avgInterval else 120f
-    }
-
     fun normalizeWithMedianInterval(
         detectedGrid: List<Float>,
         durationSec: Float
@@ -262,17 +245,6 @@ object BeatGridNormalizer {
         val visual: List<Float>,
         val sync: List<Float>
     )
-
-    fun createDualGrid(
-        detectedGrid: List<Float>,
-        bpm: Float,
-        durationSec: Float
-    ): DualGrid {
-        return DualGrid(
-            visual = detectedGrid,
-            sync = normalize(detectedGrid, bpm, durationSec)
-        )
-    }
 
     fun resolveDjGrids(
         detectedGrid: List<Float>,

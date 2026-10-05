@@ -27,11 +27,18 @@ import com.zionhuang.innertube.models.YouTubeClient.Companion.TVHTML5
 import com.zionhuang.innertube.models.YouTubeClient.Companion.TVHTML5_SIMPLY_EMBEDDED_PLAYER
 import com.zionhuang.innertube.models.YouTubeClient.Companion.WEB_REMIX
 import com.zionhuang.innertube.models.response.PlayerResponse
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 
 object YTPlayerUtils {
 
     private const val TAG = "YTPlayerUtils"
+
+    /** Conservative default cache lifetime for yt-dlp-sourced URLs (no expiry field is exposed
+     *  the way InnerTube's streamingData.expiresInSeconds is) — short enough that a stale cached
+     *  entry just gets re-resolved rather than served past expiry. */
+    private const val YTDLP_STREAM_EXPIRES_IN_SECONDS = 3600
 
     private val httpClient = OkHttpClient.Builder()
         .proxy(YouTube.proxy)
@@ -55,12 +62,14 @@ object YTPlayerUtils {
      * Clients used for fallback streams in case the streams of the main client do not work.
      */
     private val STREAM_FALLBACK_CLIENTS: Array<YouTubeClient> = arrayOf(
-        // Could not parse deobfuscation function
-//        WEB_REMIX,
-//        ANDROID,
-//        TVHTML5,
-//        TVHTML5_SIMPLY_EMBEDDED_PLAYER,
-        IOS, // recent api changes produce error 403 after 30 seconds
+        // WEB_REMIX carries a po_token (see PoTokenGenerator, already generated unconditionally
+        // above) and is the client most likely to pass YouTube's bot check. Re-enabled after
+        // bumping NewPipeExtractor past the "could not parse deobfuscation function" issue that
+        // used to block it; if that error reappears in logs, NewPipe still can't handle its cipher.
+        WEB_REMIX,
+        ANDROID,
+        IOS, // known to sometimes 403 real fetches ~30s in; kept as a fallback, not first choice
+        TVHTML5_SIMPLY_EMBEDDED_PLAYER, // requires login; skipped automatically when signed out
     )
 
 
@@ -71,6 +80,11 @@ object YTPlayerUtils {
         val format: PlayerResponse.StreamingData.Format,
         val streamUrl: String,
         val streamExpiresInSeconds: Int,
+        /** Extra HTTP headers [streamUrl] must be requested with. Empty for InnerTube-sourced
+         *  streams; non-empty when [streamUrl] came from the yt-dlp fallback (see
+         *  [YtDlpStreamResolver]) — omitting them is exactly the class of bug that made this
+         *  fallback necessary in the first place, so callers MUST send them verbatim. */
+        val streamHeaders: Map<String, String> = emptyMap(),
     )
 
     /**
@@ -174,17 +188,58 @@ object YTPlayerUtils {
                     streamUrl += "&pot=$webStreamingPot";
                 }
 
-                if (clientIndex == STREAM_FALLBACK_CLIENTS.size - 1) {
-                    /** skip [validateStatus] for last client */
-                    break
-                }
+                // Always validate, including the last candidate: an unvalidated URL here is
+                // exactly what silently reaches DownloadUtil/MusicService and 403s later. If
+                // nothing validates we fall out of the loop with streamUrl == null and throw
+                // a clear error below instead of handing back a URL that's likely dead.
                 if (validateStatus(streamUrl)) {
                     // working stream found
                     Log.i(TAG, "[$videoId] [${client.clientName}] found working stream")
                     break
                 } else {
                     Log.w(TAG, "[$videoId] [${client.clientName}] got bad http status code")
+                    format = null
+                    streamUrl = null
+                    streamExpiresInSeconds = null
                 }
+            }
+        }
+
+        // Every InnerTube client failed (or none validated). Last resort: yt-dlp, whose
+        // signature/n-param solving is more current than NewPipeExtractor's. Only reached here —
+        // never the default path — because it's meaningfully slower (spins up a bundled Python).
+        if (streamUrl == null) {
+            Log.w(TAG, "[$videoId] No InnerTube client produced a working stream; trying yt-dlp")
+            val ytdlp = withContext(Dispatchers.IO) { YtDlpStreamResolver.resolveAudioStream(videoId) }
+            if (ytdlp != null) {
+                return@runCatching PlaybackData(
+                    audioConfig,
+                    videoDetails,
+                    playbackTracking,
+                    PlayerResponse.StreamingData.Format(
+                        itag = ytdlp.itag ?: -1,
+                        url = ytdlp.url,
+                        mimeType = ytdlp.mimeType,
+                        bitrate = ytdlp.bitrateKbps * 1000,
+                        width = null,
+                        height = null,
+                        contentLength = ytdlp.contentLength,
+                        quality = "AUDIO_QUALITY_UNKNOWN",
+                        fps = null,
+                        qualityLabel = null,
+                        averageBitrate = null,
+                        audioQuality = null,
+                        approxDurationMs = null,
+                        audioSampleRate = ytdlp.sampleRateHz,
+                        audioChannels = null,
+                        loudnessDb = null, // no InnerTube-equivalent from yt-dlp; normalization no-ops
+                        lastModified = null,
+                        signatureCipher = null, // url is already resolved, no cipher to decode
+                    ),
+                    ytdlp.url,
+                    YTDLP_STREAM_EXPIRES_IN_SECONDS,
+                    ytdlp.headers,
+                )
             }
         }
 
@@ -249,14 +304,18 @@ object YTPlayerUtils {
      * Checks if the stream url returns a successful status.
      * If this returns true the url is likely to work.
      * If this returns false the url might cause an error during playback.
+     *
+     * Uses a tiny ranged GET rather than HEAD: googlevideo's abuse checks appear to key off the
+     * actual media-fetch path, so a HEAD can pass while the real GET a download performs 403s.
      */
     private fun validateStatus(url: String): Boolean {
         try {
             val requestBuilder = okhttp3.Request.Builder()
-                .head()
+                .header("Range", "bytes=0-1")
                 .url(url)
-            val response = httpClient.newCall(requestBuilder.build()).execute()
-            return response.isSuccessful
+            httpClient.newCall(requestBuilder.build()).execute().use { response ->
+                return response.isSuccessful
+            }
         } catch (e: Exception) {
             reportException(e)
         }

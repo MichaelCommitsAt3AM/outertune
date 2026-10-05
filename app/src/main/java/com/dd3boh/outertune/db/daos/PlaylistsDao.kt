@@ -94,6 +94,10 @@ interface PlaylistsDao {
     """)
     fun playlistIdBySongs(songs: List<String>): Flow<List<String>>
 
+    // @Transaction is required: Playlist has a @Relation (songThumbnails), so the parent and
+    // relation reads must be atomic. Without it a concurrent library sync inserting a playlist
+    // between the two reads crashes with "Key <id> is missing in the map".
+    @Transaction
     @RawQuery(observedEntities = [PlaylistEntity::class])
     fun _getPlaylists(query: SupportSQLiteQuery): Flow<List<Playlist>>
 

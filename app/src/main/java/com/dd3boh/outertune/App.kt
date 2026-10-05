@@ -46,6 +46,7 @@ import com.dd3boh.outertune.constants.VisitorDataKey
 import com.dd3boh.outertune.extensions.toEnum
 import com.dd3boh.outertune.extensions.toInetSocketAddress
 import com.dd3boh.outertune.utils.CoilBitmapLoader
+import com.dd3boh.outertune.utils.analysis.AnalysisStorage
 import com.dd3boh.outertune.utils.LocalArtworkPathKeyer
 import com.dd3boh.outertune.utils.dataStore
 import com.dd3boh.outertune.utils.get
@@ -83,6 +84,31 @@ class App : Application(), SingletonImageLoader.Factory, Configuration.Provider 
         }
 
         instance = this;
+
+        // Move analysis artifacts off the OS-evictable cache dir (idempotent, cheap).
+        Thread { AnalysisStorage.migrateLegacyCache(this) }.start()
+
+        // First-run unpacks a bundled Python + yt-dlp (can take a few seconds); do it off the
+        // main thread. YtDlpStreamResolver treats "not yet initialized" as "unavailable" and
+        // falls through, so callers never have to wait on this.
+        Thread {
+            try {
+                com.yausername.youtubedl_android.YoutubeDL.getInstance().init(this)
+            } catch (e: Exception) {
+                Log.w("App", "youtubedl-android init failed; yt-dlp fallback disabled", e)
+                return@Thread
+            }
+            // The yt-dlp bundled in the AAR goes stale fast against YouTube's changes; pull the
+            // latest stable release (no-op when already current). Failure keeps the bundled one.
+            try {
+                val ytDlp = com.yausername.youtubedl_android.YoutubeDL.getInstance()
+                Log.i("App", "yt-dlp version before update: ${ytDlp.version(this)}")
+                val status = ytDlp.updateYoutubeDL(this)
+                Log.i("App", "yt-dlp update: $status, now ${ytDlp.version(this)}")
+            } catch (e: Exception) {
+                Log.w("App", "yt-dlp update failed; using bundled version", e)
+            }
+        }.start()
 
         val locale = Locale.getDefault()
         val languageTag = locale.toLanguageTag().replace("-Hant", "") // replace zh-Hant-* to zh-*

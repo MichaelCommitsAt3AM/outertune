@@ -5,12 +5,12 @@ import android.util.Log
 import com.dd3boh.outertune.db.MusicDatabase
 import com.dd3boh.outertune.db.entities.Song
 import com.dd3boh.outertune.ui.component.BeatGridMarker
+import com.dd3boh.outertune.utils.analysis.AnalysisStorage
 import com.dd3boh.outertune.utils.analysis.AudioDecoder
 import com.dd3boh.outertune.utils.analysis.BeatGridNormalizer
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.withContext
-import java.io.File
 import kotlin.math.abs
 
 /**
@@ -218,29 +218,19 @@ class TransitionEditorEngine(
     // --- Helpers for Disk Access ---
 
     private fun loadExactDuration(id: String): Double? {
-        val file = File(context.cacheDir, "analysis_data/${id}_metadata.dat")
-        return if (file.exists()) file.readText().toDoubleOrNull() else null
+        val file = AnalysisStorage.resolve(context, null, id, AnalysisStorage.Kind.METADATA) ?: return null
+        return file.readText().toDoubleOrNull()
     }
 
     private fun loadBeatGridDouble(path: String?, id: String): List<Double> {
-        val file = if (path != null) File(path) else File("${context.cacheDir}/analysis_data/${id}_beats_sync.dat")
-        return file.takeIf { it.exists() }?.readText()?.split(",")?.mapNotNull { it.toDoubleOrNull() }?.map { it / 1000.0 } ?: emptyList()
+        val file = AnalysisStorage.resolve(context, path, id, AnalysisStorage.Kind.BEAT_GRID) ?: return emptyList()
+        return file.readText().split(",").mapNotNull { it.toDoubleOrNull() }.map { it / 1000.0 }
     }
 
     private fun loadWaveform(path: String?, id: String): FloatArray {
-        // First try the passed path, then cache
-        val primaryFile = path?.let { File(it) }
-        val cacheFile = File("${context.cacheDir}/analysis_data/${id}_waveform.dat")
-
-        val fileToLoad = if (primaryFile != null && primaryFile.exists()) primaryFile else cacheFile
-
-        if (!fileToLoad.exists()) {
-            // If strictly required, we could trigger AudioDecoder here, but usually it's pre-analyzed.
-            // For now, return empty to avoid stalling UI.
-            return FloatArray(0)
-        }
-
-        return fileToLoad.readText().split(",").mapNotNull { it.toFloatOrNull() }.toFloatArray()
+        // Usually pre-analysed; return empty rather than stalling the UI if the artifact is missing.
+        val file = AnalysisStorage.resolve(context, path, id, AnalysisStorage.Kind.WAVEFORM) ?: return FloatArray(0)
+        return file.readText().split(",").mapNotNull { it.toFloatOrNull() }.toFloatArray()
     }
 
     private fun alignGridToWaveform(

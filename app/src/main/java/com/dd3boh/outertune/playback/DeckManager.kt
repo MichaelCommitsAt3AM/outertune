@@ -2,7 +2,7 @@ package com.dd3boh.outertune.playback
 
 import android.content.Context
 import android.media.audiofx.Equalizer
-import android.util.Log
+import com.dd3boh.outertune.utils.DebugLog as Log
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer

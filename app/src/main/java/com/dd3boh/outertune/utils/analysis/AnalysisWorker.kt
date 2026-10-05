@@ -128,20 +128,21 @@ class AnalysisWorker @AssistedInject constructor(
             // Use the PCM data you already decoded at the start of doWork
             val normalizedWaveform = generateWaveformFromPcm(pcmData, sampleRate, targetPointsPerSecond = 100)
 
-            val cacheDir = File(applicationContext.cacheDir, "analysis_data")
-            cacheDir.mkdirs()
+            val metadataFile = AnalysisStorage.file(applicationContext, songId, AnalysisStorage.Kind.METADATA)
+            val waveformFile = AnalysisStorage.file(applicationContext, songId, AnalysisStorage.Kind.WAVEFORM)
+            val beatGridFile = AnalysisStorage.file(applicationContext, songId, AnalysisStorage.Kind.BEAT_GRID)
 
             // Save Exact Duration as String representation of Double to avoid Float precision loss
             val preciseDurationString = exactDurationSeconds.toString()
 
-            File(cacheDir, "${songId}_metadata.dat").writeText(preciseDurationString)
-            File(cacheDir, "${songId}_waveform.dat").writeText(normalizedWaveform.joinToString(","))
-            File(cacheDir, "${songId}_beats_sync.dat").writeText(snappedGrid.joinToString(","))
+            metadataFile.writeText(preciseDurationString)
+            waveformFile.writeText(normalizedWaveform.joinToString(","))
+            beatGridFile.writeText(snappedGrid.joinToString(","))
 
             // 8. Update DB
             val updated = song.copy(
-                waveformPath = File(cacheDir, "${songId}_waveform.dat").absolutePath,
-                beatGridPath = File(cacheDir, "${songId}_beats_sync.dat").absolutePath,
+                waveformPath = waveformFile.absolutePath,
+                beatGridPath = beatGridFile.absolutePath,
                 bpm = correctedBpm,
                 displayBpm = correctedBpm,
                 firstBeatMs = if (snappedGrid.isNotEmpty()) snappedGrid[0] else 0L,

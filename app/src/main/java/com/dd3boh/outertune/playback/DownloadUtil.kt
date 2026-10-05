@@ -36,7 +36,9 @@ import com.dd3boh.outertune.playback.DownloadUtil.Companion.STATE_INVALID
 import com.dd3boh.outertune.playback.downloadManager.DownloadDirectoryManagerOt
 import com.dd3boh.outertune.playback.downloadManager.DownloadEvent
 import com.dd3boh.outertune.playback.downloadManager.DownloadManagerOt
+import com.dd3boh.outertune.playback.downloadManager.StreamSource
 import com.dd3boh.outertune.utils.YTPlayerUtils
+import com.dd3boh.outertune.utils.YtDlpStreamResolver
 import com.dd3boh.outertune.utils.dataStore
 import com.dd3boh.outertune.utils.dlCoroutine
 import com.dd3boh.outertune.utils.enumPreference
@@ -58,6 +60,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -114,6 +117,10 @@ class DownloadUtil @Inject constructor(
 
     val downloads = MutableStateFlow<Map<String, LocalDateTime>>(emptyMap())
 
+    /** Media IDs already retried once via the yt-dlp fallback (see the DownloadEvent.Failure
+     *  handler below) — caps it to a single retry per song so a persistent block doesn't loop. */
+    private val ytDlpRetried = java.util.Collections.synchronizedSet(mutableSetOf<String>())
+
     private fun getDefaultDownloadPath(): Uri {
         val file = context.getExternalFilesDir(Environment.DIRECTORY_MUSIC)
         val uri = file?.toUri() ?: Uri.EMPTY
@@ -147,17 +154,18 @@ class DownloadUtil @Inject constructor(
             .writeTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
             .retryOnConnectionFailure(true)
             .addInterceptor { chain ->
-                val request = chain.request().newBuilder()
-                    .header("User-Agent", "com.google.android.youtube/19.02.39 (Linux; U; Android 13) gzip")
-                    .header("Accept", "*/*")
-                    .header("Accept-Encoding", "identity")
-                    .header("Range", "bytes=0-")
-                    .build()
+                // Only fill in defaults: DownloadManagerOt sets its own Range per chunk, and a
+                // yt-dlp URL must be fetched with the exact User-Agent it was minted for.
+                val original = chain.request()
+                val request = original.newBuilder().apply {
+                    if (original.header("Accept") == null) header("Accept", "*/*")
+                    if (original.header("Accept-Encoding") == null) header("Accept-Encoding", "identity")
+                }.build()
                 chain.proceed(request)
             }
             .build()
 
-        downloadMgr = DownloadManagerOt(localMgr, downloadHttpClient)
+        downloadMgr = DownloadManagerOt(localMgr, downloadHttpClient, refreshUrl = ::resolveFreshStream)
 
         Log.i(TAG, "Download managers initialized")
 
@@ -231,6 +239,28 @@ class DownloadUtil @Inject constructor(
                         Log.e(TAG, "Error type: ${event.error?.javaClass?.simpleName}")
                         event.error?.printStackTrace()
 
+                        // yt-dlp retry on 403 (disabled: only applies to the previous on-device
+                        // googlevideo download path; the backend reports its own errors).
+//                      // A 403 here means the InnerTube-sourced URL passed YTPlayerUtils'
+//                      // validation but got blocked on the real (larger/bulkier) fetch anyway —
+//                      // that block doesn't reliably show up on a cheap validation probe. Retry
+//                      // once via yt-dlp, whose signature/n-param solving is more current, before
+//                      // giving up. Capped to one retry per song via ytDlpRetried.
+//                      val looksBlocked = event.error?.message?.contains("403") == true ||
+//                          event.error?.message?.contains("Forbidden", ignoreCase = true) == true
+//                      if (looksBlocked && ytDlpRetried.add(event.mediaId)) {
+//                          Log.w(TAG, "Download blocked (403); retrying ${event.mediaId} via yt-dlp fallback")
+//                          val ytdlp = withContext(Dispatchers.IO) {
+//                              YtDlpStreamResolver.resolveAudioStream(event.mediaId)
+//                          }
+//                          if (ytdlp != null) {
+//                              val title = database.song(event.mediaId).first()?.title
+//                              downloadMgr.enqueue(event.mediaId, ytdlp.url, title, headers = ytdlp.headers)
+//                              return@collect // let the retry's own Success/Failure event land
+//                          }
+//                          Log.w(TAG, "yt-dlp fallback could not resolve ${event.mediaId} either")
+//                      }
+
                         database.updateDownloadStatus(event.mediaId, null)
                         downloads.update { map ->
                             map.toMutableMap().apply { remove(event.mediaId) }
@@ -283,6 +313,22 @@ class DownloadUtil @Inject constructor(
         Log.i(TAG, "=== DownloadUtil INIT COMPLETE ===")
     }
 
+    /** Fresh stream URL for a download that got 403'd mid-way: alternates InnerTube (odd
+     *  attempts) and yt-dlp (even attempts), falling back to the other if one comes up empty. */
+    private suspend fun resolveFreshStream(mediaId: String, attempt: Int): StreamSource? = withContext(Dispatchers.IO) {
+        val innerTube: suspend () -> StreamSource? = {
+            YTPlayerUtils.playerResponseForPlayback(
+                mediaId,
+                audioQuality = audioQuality,
+                connectivityManager = connectivityManager,
+            ).getOrNull()?.let { StreamSource(it.streamUrl, it.streamHeaders) }
+        }
+        val ytDlp: suspend () -> StreamSource? = {
+            YtDlpStreamResolver.resolveAudioStream(mediaId)?.let { StreamSource(it.url, it.headers) }
+        }
+        if (attempt % 2 == 1) innerTube() ?: ytDlp() else ytDlp() ?: innerTube()
+    }
+
     fun getDownload(songId: String): Flow<LocalDateTime?> = downloads.map { it[songId] }
 
     fun download(songs: List<MediaMetadata>) {
@@ -315,42 +361,57 @@ class DownloadUtil @Inject constructor(
                 Log.d(TAG, "Updating download state to DOWNLOADING")
                 downloads.update { it + (id to STATE_DOWNLOADING) }
 
-                Log.d(TAG, "Fetching playback data...")
-                Log.d(TAG, "Audio quality: $audioQuality")
-                Log.d(TAG, "Network connected: ${connectivityManager.activeNetwork != null}")
+                // Downloads now go through the self-hosted ytmusic-api backend (yt-dlp on the home
+                // server), which returns the finished audio file. The on-device path below
+                // (InnerTube/yt-dlp URL resolution + chunked googlevideo fetch) is kept for reference.
+                val backendUrl = YTMUSIC_API_BASE_URL.toHttpUrl().newBuilder()
+                    .addPathSegment("download")
+                    .addQueryParameter("url", id)
+                    .addQueryParameter("format", YTMUSIC_API_FORMAT)
+                    .build()
+                    .toString()
+                Log.i(TAG, "Enqueueing backend download: $backendUrl")
+                downloadMgr.enqueue(id, backendUrl, title, chunked = false)
 
-                val playbackData = YTPlayerUtils.playerResponseForPlayback(
-                    id,
-                    audioQuality = audioQuality,
-                    connectivityManager = connectivityManager,
-                ).getOrThrow()
+                // --- Previous on-device download path (disabled) ---
+//              Log.d(TAG, "Fetching playback data...")
+//              Log.d(TAG, "Audio quality: $audioQuality")
+//              Log.d(TAG, "Network connected: ${connectivityManager.activeNetwork != null}")
+//
+//              val playbackData = YTPlayerUtils.playerResponseForPlayback(
+//                  id,
+//                  audioQuality = audioQuality,
+//                  connectivityManager = connectivityManager,
+//              ).getOrThrow()
+//
+//              Log.i(TAG, "Playback data obtained successfully")
+//              Log.d(TAG, "Stream URL length: ${playbackData.streamUrl.length}")
+//              Log.d(TAG, "Format itag: ${playbackData.format.itag}")
+//              Log.d(TAG, "Format bitrate: ${playbackData.format.bitrate}")
+//
+//              val format = playbackData.format
+//              Log.d(TAG, "Upserting format entity to database")
+//              database.query {
+//                  upsert(
+//                      FormatEntity(
+//                          id = id,
+//                          itag = format.itag,
+//                          mimeType = format.mimeType.split(";")[0],
+//                          codecs = format.mimeType.split("codecs=")[1].removeSurrounding("\""),
+//                          bitrate = format.bitrate,
+//                          sampleRate = format.audioSampleRate,
+//                          contentLength = format.contentLength!!,
+//                          loudnessDb = playbackData.audioConfig?.loudnessDb,
+//                          playbackTrackingUrl = playbackData.playbackTracking?.videostatsPlaybackUrl?.baseUrl
+//                      )
+//                  )
+//              }
+//              Log.d(TAG, "Format entity upserted")
+//
+//              Log.i(TAG, "Enqueueing download to DownloadManagerOt")
+//              downloadMgr.enqueue(id, playbackData.streamUrl, title, headers = playbackData.streamHeaders)
+                // --- end previous path ---
 
-                Log.i(TAG, "Playback data obtained successfully")
-                Log.d(TAG, "Stream URL length: ${playbackData.streamUrl.length}")
-                Log.d(TAG, "Format itag: ${playbackData.format.itag}")
-                Log.d(TAG, "Format bitrate: ${playbackData.format.bitrate}")
-
-                val format = playbackData.format
-                Log.d(TAG, "Upserting format entity to database")
-                database.query {
-                    upsert(
-                        FormatEntity(
-                            id = id,
-                            itag = format.itag,
-                            mimeType = format.mimeType.split(";")[0],
-                            codecs = format.mimeType.split("codecs=")[1].removeSurrounding("\""),
-                            bitrate = format.bitrate,
-                            sampleRate = format.audioSampleRate,
-                            contentLength = format.contentLength!!,
-                            loudnessDb = playbackData.audioConfig?.loudnessDb,
-                            playbackTrackingUrl = playbackData.playbackTracking?.videostatsPlaybackUrl?.baseUrl
-                        )
-                    )
-                }
-                Log.d(TAG, "Format entity upserted")
-
-                Log.i(TAG, "Enqueueing download to DownloadManagerOt")
-                downloadMgr.enqueue(id, playbackData.streamUrl, title)
                 Log.i(TAG, "Download enqueued successfully")
 
             } catch (e: Exception) {
@@ -371,11 +432,17 @@ class DownloadUtil @Inject constructor(
 
     fun resumeDownloadsOnStart() {
         Log.d(TAG, "Resuming downloads on start")
-        DownloadService.sendResumeDownloads(
-            context,
-            ExoDownloadService::class.java,
-            false
-        )
+        try {
+            DownloadService.sendResumeDownloads(
+                context,
+                ExoDownloadService::class.java,
+                false
+            )
+        } catch (e: IllegalStateException) {
+            // BackgroundServiceStartNotAllowedException: started while the app isn't foreground
+            // (e.g. launched with the screen locked) — skip rather than crash the app.
+            Log.w(TAG, "Could not resume downloads from background", e)
+        }
     }
 
     fun delete(song: PlaylistSong) = deleteSong(song.song.id)
@@ -594,6 +661,11 @@ class DownloadUtil @Inject constructor(
 
 
     companion object {
+        /** Self-hosted ytmusic-api (yt-dlp) backend that serves downloads. LAN only. */
+        const val YTMUSIC_API_BASE_URL = "http://192.168.100.14:8095"
+        /** m4a is the backend's fastest format (no re-encode). */
+        const val YTMUSIC_API_FORMAT = "m4a"
+
         val STATE_DOWNLOADING: LocalDateTime = Instant.ofEpochMilli(1).atZone(ZoneOffset.UTC).toLocalDateTime()
         val STATE_INVALID: LocalDateTime = Instant.ofEpochMilli(0).atZone(ZoneOffset.UTC).toLocalDateTime()
     }
