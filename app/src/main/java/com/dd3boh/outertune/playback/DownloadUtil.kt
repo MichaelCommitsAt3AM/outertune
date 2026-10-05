@@ -273,6 +273,19 @@ class DownloadUtil @Inject constructor(
                         Log.e(TAG, "=== DOWNLOAD FAILED END ===")
                     }
 
+                    is DownloadEvent.Retrying -> {
+                        val seconds = (event.delayMs + 999) / 1000
+                        Log.w(TAG, "Download blocked (403): ${event.mediaId}; retrying in ${seconds}s (attempt ${event.attempt}/${event.maxAttempts})")
+                        val title = database.song(event.mediaId).first()?.title ?: event.mediaId
+                        withContext(Dispatchers.Main) {
+                            Toast.makeText(
+                                context,
+                                "Download blocked (403): $title. Retrying in ${seconds}s (${event.attempt}/${event.maxAttempts})",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        }
+                    }
+
 //                    is DownloadEvent.Progress -> {
 //                        Log.v(TAG, "Download progress: ${event.mediaId} - ${event.progress}%")
 //                    }
