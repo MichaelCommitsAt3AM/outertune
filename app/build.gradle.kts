@@ -95,6 +95,8 @@ android {
 //            isDebuggable = true
             isProfileable = true
             matchingFallbacks += listOf("release")
+            // Without a release keystore, sign with the debug key so local builds still install.
+            if (keystoreProperties.isEmpty) signingConfig = signingConfigs.getByName("debug")
         }
     }
 
