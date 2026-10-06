@@ -1,6 +1,6 @@
 package com.dd3boh.outertune.utils.analysis
 
-import android.util.Log
+import com.dd3boh.outertune.utils.DebugLog as Log
 
 data class AudioAnalysisResult(
     val bpm: Float,

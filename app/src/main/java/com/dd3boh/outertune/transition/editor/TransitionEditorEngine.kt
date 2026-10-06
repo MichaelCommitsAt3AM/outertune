@@ -7,6 +7,7 @@ import com.dd3boh.outertune.ui.component.BeatGridMarker
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.withContext
+import javax.inject.Inject
 import kotlin.math.abs
 import com.dd3boh.outertune.utils.DebugLog as Log
 
@@ -15,7 +16,7 @@ import com.dd3boh.outertune.utils.DebugLog as Log
  * [BeatGridRepository], the same grids playlist playback uses) and their waveforms converted to
  * the beat domain.
  */
-class TransitionEditorEngine(
+class TransitionEditorEngine @Inject constructor(
     private val database: MusicDatabase,
     private val beatGrids: BeatGridRepository,
 ) {

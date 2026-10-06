@@ -301,8 +301,7 @@ dependencies {
     implementation(project(":material-color-utilities"))
     implementation(project(":taglib"))
 
-    // Audio Analysis & Waveforms
-    implementation(libs.amplituda)
+    // Audio analysis (background work)
     implementation(libs.androidx.work.runtime.ktx)
 
     // Last-resort YouTube stream-URL resolver (see YtDlpStreamResolver)

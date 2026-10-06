@@ -8,7 +8,8 @@
 | --- | --- | --- |
 | 0, 1 | Done; needs the manual test matrix on a device | `fix/phase-0-1-playback` |
 | 2 | Done except 2.8 (on-device parity check); needs the manual test matrix | `feature/unified-mix-engine` |
-| 3, 4 | Not started | |
+| 3 | Done; needs the manual test matrix | `chore/phase-3-cleanup` |
+| 4 | Not started | |
 
 Where Phase 2 as built differs from the steps below:
 
@@ -17,6 +18,12 @@ Where Phase 2 as built differs from the steps below:
 - No "re-check this transition" flag yet when a song's BPM changes; the grid is rebuilt automatically, but saved transitions on it are not marked.
 - Waveforms moved to binary as part of 2.2 (P9).
 - Tick work stays on the main looper (decision 2); `MixDiagnostics` lines will show whether that's enough.
+
+Phase 3 notes:
+
+- Grids are still `List<Double>` (P11 deferred again; small cost, wide API change).
+- Key detection is unfinished: `KeyDetector` and its native code exist, but nothing has ever called them, so `song.key` is never set. Left off because the native path has never run.
+- `DebugLog` warnings and errors now log in release builds too; debug/info stay debug-only.
 
 ## Goal
 

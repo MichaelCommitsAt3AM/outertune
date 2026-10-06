@@ -505,9 +505,7 @@ fun BottomSheetPlayer(
                     },
                     onValueChangeFinished = {
                         sliderPosition?.let { targetMs ->
-                            // --- NEW: Use Logical Seek ---
                             playerConnection.seekToLogical(targetMs)
-                            // -----------------------------
                         }
                         sliderPosition = null
                         haptic.performHapticFeedback(HapticFeedbackType.Confirm)

@@ -7,6 +7,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import okhttp3.OkHttpClient
@@ -14,6 +15,8 @@ import okhttp3.Request
 import okhttp3.Response
 import java.io.IOException
 import java.io.InputStream
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.random.Random
 
 
 data class StreamSource(val url: String, val headers: Map<String, String> = emptyMap())
@@ -22,6 +25,8 @@ sealed class DownloadEvent {
     data class Progress(val mediaId: String, val bytesRead: Long, val contentLength: Long) : DownloadEvent()
     data class Success(val mediaId: String, val file: Uri) : DownloadEvent()
     data class Failure(val mediaId: String, val error: Throwable) : DownloadEvent()
+    /** Got a 403; waiting [delayMs] before retry [attempt] of [maxAttempts]. */
+    data class Retrying(val mediaId: String, val delayMs: Long, val attempt: Int, val maxAttempts: Int) : DownloadEvent()
 }
 
 class DownloadManagerOt(
@@ -36,8 +41,16 @@ class DownloadManagerOt(
     private val _events = MutableSharedFlow<DownloadEvent>(extraBufferCapacity = 100)
     val events = _events.asSharedFlow()
 
-    // One download at a time: parallel back-to-back range requests get the client 403'd
-    private val downloadSemaphore = kotlinx.coroutines.sync.Semaphore(1)
+    // Up to 3 downloads in parallel (e.g. a whole playlist); 403s are handled by the shared
+    // backoff below rather than by serializing everything.
+    private val downloadSemaphore = kotlinx.coroutines.sync.Semaphore(MAX_PARALLEL_DOWNLOADS)
+
+    /** Shared across all download slots: a 403 means the server/IP is being blocked, so every
+     *  slot holds off until this time, not just the one that got the 403. */
+    @Volatile
+    private var backoffUntil = 0L
+    /** 403s seen since the last successful download; drives the exponential delay. */
+    private val consecutiveBlocks = AtomicInteger(0)
 
     fun enqueue(
         mediaId: String,
@@ -104,26 +117,62 @@ class DownloadManagerOt(
         }
     }
 
-    /** Single GET of [url], streamed straight to disk. Throws on a non-2xx response. */
-    private fun downloadWhole(mediaId: String, url: String, headers: Map<String, String>, displayName: String?) {
+    /** Single GET of [url], streamed straight to disk. Throws on a non-2xx response. A 403
+     *  (or a backend 502 wrapping one) is retried with exponential backoff, up to
+     *  [MAX_BLOCKED_RETRIES] times. */
+    private suspend fun downloadWhole(mediaId: String, url: String, headers: Map<String, String>, displayName: String?) {
         val request = Request.Builder().url(url).apply {
             headers.forEach { (name, value) -> header(name, value) }
         }.build()
 
-        httpClient.newCall(request).execute().use { resp ->
-            Log.d("DownloadManagerOt", "Response Code: ${resp.code}")
-            if (!resp.isSuccessful) {
-                // The backend explains failures as {"detail": "..."}; surface that.
-                val detail = runCatching { resp.body.string() }.getOrNull()
-                    ?.let { Regex("\"detail\"\\s*:\\s*\"(.*?)\"").find(it)?.groupValues?.get(1) ?: it.take(200) }
-                throw IllegalStateException("HTTP ${resp.code}${detail?.let { ": $it" } ?: ""}")
+        var retries = 0
+        var retryAfterMs: Long? = null
+        while (true) {
+            val wait = backoffUntil - System.currentTimeMillis()
+            if (wait > 0) {
+                Log.d("DownloadManagerOt", "Backing off ${wait}ms before $mediaId")
+                delay(wait)
             }
-            Log.d("DownloadManagerOt", "Content Length: ${resp.body.contentLength()} bytes")
 
-            val saved = local.saveFile(mediaId, resp.body.byteStream(), displayName = displayName)
-                ?: throw IOException("Failed to create file or write stream")
-            Log.i("DownloadManagerOt", "File saved successfully: $saved")
-            _events.tryEmit(DownloadEvent.Success(mediaId, saved))
+            retryAfterMs = null
+            val blocked = httpClient.newCall(request).execute().use { resp ->
+                Log.d("DownloadManagerOt", "Response Code: ${resp.code} for $mediaId")
+                if (!resp.isSuccessful) {
+                    // The backend explains failures as {"detail": "..."}; surface that.
+                    val detail = runCatching { resp.body.string() }.getOrNull()
+                        ?.let { Regex("\"detail\"\\s*:\\s*\"(.*?)\"").find(it)?.groupValues?.get(1) ?: it.take(200) }
+                    // The backend answers a YouTube block with 503 + Retry-After (its own cooldown);
+                    // a raw 403, or a 502 wrapping one, is treated the same way.
+                    retryAfterMs = resp.header("Retry-After")?.trim()?.toLongOrNull()?.times(1000)
+                    val isBlocked = resp.code == 403 || resp.code == 503 || (resp.code == 502 &&
+                        detail != null && (detail.contains("403") || detail.contains("Forbidden", ignoreCase = true)))
+                    if (isBlocked && retries < MAX_BLOCKED_RETRIES) return@use true
+                    val gaveUp = if (isBlocked) " (failed after $retries retries)" else ""
+                    throw IllegalStateException("HTTP ${resp.code}${detail?.let { ": $it" } ?: ""}$gaveUp")
+                }
+                Log.d("DownloadManagerOt", "Content Length: ${resp.body.contentLength()} bytes")
+
+                val saved = local.saveFile(mediaId, resp.body.byteStream(), displayName = displayName)
+                    ?: throw IOException("Failed to create file or write stream")
+                Log.i("DownloadManagerOt", "File saved successfully: $saved")
+                _events.tryEmit(DownloadEvent.Success(mediaId, saved))
+                false
+            }
+            if (!blocked) {
+                consecutiveBlocks.set(0)
+                return
+            }
+
+            retries++
+            val n = consecutiveBlocks.incrementAndGet()
+            // 2s, 4s, 8s, ... capped, plus jitter so the parallel slots don't retry in lockstep
+            // Prefer the server's Retry-After (it knows its cooldown); otherwise 2s, 4s, 8s, ...
+            // capped. Jitter either way so the parallel slots don't retry in lockstep.
+            val backoff = (retryAfterMs ?: (BACKOFF_BASE_MS shl (n - 1).coerceAtMost(10)).coerceAtMost(BACKOFF_MAX_MS)) +
+                Random.nextLong(BACKOFF_JITTER_MS)
+            backoffUntil = maxOf(backoffUntil, System.currentTimeMillis() + backoff)
+            Log.w("DownloadManagerOt", "403 for $mediaId; backing off ${backoff}ms (retry $retries/$MAX_BLOCKED_RETRIES)")
+            _events.tryEmit(DownloadEvent.Retrying(mediaId, backoff, retries, MAX_BLOCKED_RETRIES))
         }
     }
 
@@ -158,6 +207,14 @@ class DownloadManagerOt(
     }
 
     fun getFilePath(mediaId: String): Uri? = local.getFilePathIfExists(mediaId)
+
+    companion object {
+        const val MAX_PARALLEL_DOWNLOADS = 3
+        const val MAX_BLOCKED_RETRIES = 5
+        const val BACKOFF_BASE_MS = 2_000L
+        const val BACKOFF_MAX_MS = 120_000L
+        const val BACKOFF_JITTER_MS = 1_000L
+    }
 }
 
 /**

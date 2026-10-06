@@ -1,7 +1,7 @@
 package com.dd3boh.outertune.utils.analysis
 
 import android.content.Context
-import android.util.Log
+import com.dd3boh.outertune.utils.DebugLog as Log
 import java.io.File
 
 /**
