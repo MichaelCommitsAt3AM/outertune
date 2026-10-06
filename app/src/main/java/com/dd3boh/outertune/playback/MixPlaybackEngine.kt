@@ -10,6 +10,7 @@ import com.dd3boh.outertune.extensions.toMediaItem
 import com.dd3boh.outertune.models.LogicalPlayerState
 import com.dd3boh.outertune.models.MediaMetadata
 import com.dd3boh.outertune.transition.engine.BeatGridRepository
+import com.dd3boh.outertune.utils.LoudnessNormalization
 import com.dd3boh.outertune.transition.engine.DeckFactory
 import com.dd3boh.outertune.transition.engine.DeckPair
 import com.dd3boh.outertune.transition.engine.ProcessorDeckEffects
@@ -46,8 +47,10 @@ class MixPlaybackEngine(
     private val transitionDao: TransitionDao,
     private val queueBoard: QueueBoard,
     private val beatGrids: BeatGridRepository,
-    /** Final volume for a song when it becomes the active one (normalization × user volume). */
-    private val targetGainFor: suspend (songId: String) -> Float,
+    /** Loudness-normalization gain for a song (without the user's volume). */
+    private val normalizationFor: suspend (songId: String) -> Float,
+    /** The user's volume; each deck plays at this × its song's normalization. */
+    private val userVolume: StateFlow<Float>,
     private val updateLogicalStateCallback: (LogicalPlayerState) -> Unit,
 ) : PlaybackEngine {
 
@@ -82,10 +85,11 @@ class MixPlaybackEngine(
     private var currentTransitionCache: TransitionEntity? = null
     private var currentTransitionPlan: TransitionPlan? = null
     private var currentTransitionConfig: TransitionConfig? = null
-    private var incomingGain = 1f
 
-    /** Volume the outgoing deck had when the crossfade started; restored if it's cancelled. */
-    private var outgoingGain = 1f
+    /** Normalization gains of songs seen so far, by song id. */
+    private val normalization = HashMap<String, Float>()
+    /** Normalization of the song the armed transition brings in. */
+    private var armedIncomingNorm = 1f
     private var crossfadeProgress = 0f
 
     /** The song being brought in, and the queue position it was brought in from. */
@@ -101,6 +105,8 @@ class MixPlaybackEngine(
     override fun start() {
         Log.i(TAG, "Starting MixPlaybackEngine Poller")
         decks.onIsPlayingChanged = ::wakePoller
+        decks.onMediaItemTransition = { player -> if (player === decks.active) applyActiveVolume() }
+        scope.launch { userVolume.collect { applyActiveVolume() } }
         startMixPoller()
     }
 
@@ -161,7 +167,8 @@ class MixPlaybackEngine(
     private fun startCrossfade(plan: TransitionPlan, config: TransitionConfig, nextSong: MediaMetadata) {
         val outgoing = decks.active
         val incoming = decks.standby
-        outgoingGain = outgoing.volume
+        val outgoingNorm = normalizationOf(outgoing)
+        val incomingNorm = normalization[nextSong.id] ?: armedIncomingNorm
         crossfadeProgress = 0f
         crossfadeTarget = nextSong
         crossfadeFromQueuePos = queueBoard.getCurrentQueue()?.getQueuePosShuffled()
@@ -176,8 +183,8 @@ class MixPlaybackEngine(
                 incoming = incoming,
                 plan = plan,
                 config = { config },
-                outgoingGain = outgoingGain,
-                incomingGain = incomingGain,
+                outgoingGain = { outgoingNorm * userVolume.value },
+                incomingGain = { incomingNorm * userVolume.value },
                 diagnosticsLabel = "playlist",
             ) { frame ->
                 crossfadeProgress = frame.progress
@@ -201,9 +208,9 @@ class MixPlaybackEngine(
     }
 
     private fun completeCrossfade() {
-        decks.standby.volume = incomingGain
         decks.swap()
         _isCrossfading.value = false
+        applyActiveVolume()
         onActiveDeckChanged(decks.active)
     }
 
@@ -212,13 +219,44 @@ class MixPlaybackEngine(
         crossfadeJob?.cancel()
         crossfadeJob = null
         decks.linked = false
-        decks.active.volume = outgoingGain
         decks.standby.apply {
             volume = 0f
             pause()
             setPlaybackSpeed(1f)
         }
         _isCrossfading.value = false
+        applyActiveVolume()
+    }
+
+    // --- Volume ---
+
+    /**
+     * Sets the active deck's volume to the user's volume × its song's normalization. The engine is
+     * the only thing that sets deck volumes; during a transition the renderer does, through the
+     * same gains.
+     */
+    private fun applyActiveVolume() {
+        if (_isCrossfading.value) return
+        val player = decks.active
+        val songId = player.currentMediaItem?.mediaId ?: return
+        val norm = normalization[songId]
+        if (norm != null) {
+            player.volume = norm * userVolume.value
+        } else {
+            scope.launch {
+                val gain = normalizationFor(songId)
+                if (decks.active.currentMediaItem?.mediaId != songId || _isCrossfading.value) return@launch
+                decks.active.volume = gain * userVolume.value
+                // A pending value (loudness not fetched yet) is re-read next time instead.
+                if (gain != LoudnessNormalization.PENDING_FACTOR) normalization[songId] = gain
+            }
+        }
+    }
+
+    /** The normalization the deck's current song plays at (cached when it became active). */
+    private fun normalizationOf(player: ExoPlayer): Float {
+        val id = player.currentMediaItem?.mediaId
+        return id?.let { normalization[it] } ?: (player.volume / userVolume.value.coerceAtLeast(0.001f))
     }
 
     private fun switchLogicalToNext(nextSong: MediaMetadata) {
@@ -423,7 +461,8 @@ class MixPlaybackEngine(
 
         val gridA = beatGrids.grid(songA)
         val gridB = beatGrids.grid(songB)
-        val gain = targetGainFor(nextId)
+        armedIncomingNorm = normalizationFor(nextId)
+        if (armedIncomingNorm != LoudnessNormalization.PENDING_FACTOR) normalization[nextId] = armedIncomingNorm
 
         // A seek / track change while we were loading invalidates this work.
         if (phase != MixPhase.PREFETCH) return
@@ -461,7 +500,6 @@ class MixPlaybackEngine(
             gridA = gridA,
             gridB = gridB
         )
-        incomingGain = gain
         phase = MixPhase.ARMED
         wakePoller()
         Log.d(TAG, "Transition armed (planVersion=${transition.planVersion}).")

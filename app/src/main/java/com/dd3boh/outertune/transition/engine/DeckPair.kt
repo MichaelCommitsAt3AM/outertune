@@ -49,6 +49,9 @@ class DeckPair(private val factory: DeckFactory) {
     /** Called when either deck starts or stops playing. */
     var onIsPlayingChanged: (() -> Unit)? = null
 
+    /** Called when a deck moves to another item, with that deck. */
+    var onMediaItemTransition: ((ExoPlayer) -> Unit)? = null
+
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private var prepareJob: Job? = null
     private var speedJob: Job? = null
@@ -68,6 +71,10 @@ class DeckPair(private val factory: DeckFactory) {
 
             override fun onIsPlayingChanged(isPlaying: Boolean) {
                 onIsPlayingChanged?.invoke()
+            }
+
+            override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+                onMediaItemTransition?.invoke(player)
             }
         })
     }
