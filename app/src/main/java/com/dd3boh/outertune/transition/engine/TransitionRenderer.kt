@@ -8,6 +8,7 @@ import com.dd3boh.outertune.transition.model.TransitionPlan
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
+import kotlin.math.abs
 
 /**
  * Plays one transition on two players: starts the incoming deck and phase-locks it to the
@@ -55,10 +56,13 @@ class TransitionRenderer(private val effects: DeckEffects) {
         val diagnostics = MixDiagnostics(TAG, diagnosticsLabel)
 
         incoming.volume = 0f
-        incoming.seekTo(controller.targetPositionBMs(outgoing.currentPosition + MixTuning.SEEK_LEAD_MS))
+        // When B enters within the preroll's length of its own start, its target is still before
+        // the song begins: B waits, paused at 0, and starts once A reaches that point.
+        val startPositionAMs = outgoing.currentPosition + MixTuning.SEEK_LEAD_MS
+        var waitingForB = controller.isBeforeStartOfB(startPositionAMs)
+        seekUnlessNear(incoming, if (waitingForB) 0L else controller.targetPositionBMs(startPositionAMs))
         incoming.setPlaybackSpeed(controller.appliedSpeed.toFloat())
-        incoming.playWhenReady = true
-        incoming.play()
+        incoming.playWhenReady = !waitingForB
 
         // Shape both decks from inside their audio pipelines; rebuilt if the config changes.
         var installedConfig = config()
@@ -81,7 +85,11 @@ class TransitionRenderer(private val effects: DeckEffects) {
                 if (outgoing.isPlaying) playingMs += now - lastTick
                 lastTick = now
 
-                if (outgoing.playbackState == Player.STATE_ENDED || outgoing.currentMediaItem?.mediaId != startMediaId) {
+                // A failed deck (IDLE with an error) is neither playing nor ended, so without this
+                // the playing-time budget would never run out.
+                if (outgoing.playbackState == Player.STATE_ENDED || outgoing.playbackState == Player.STATE_IDLE ||
+                    outgoing.playerError != null || outgoing.currentMediaItem?.mediaId != startMediaId
+                ) {
                     return Result.OUTGOING_ENDED.also { diagnostics.finish(it.name) }
                 }
                 if (playingMs > budgetMs) return Result.TIMED_OUT.also { diagnostics.finish(it.name) }
@@ -93,11 +101,23 @@ class TransitionRenderer(private val effects: DeckEffects) {
                     effects.setAutomation(incoming, DeckAutomation(plan, currentConfig, Deck.B))
                 }
 
+                if (waitingForB) {
+                    if (controller.isBeforeStartOfB(outgoing.currentPosition + MixTuning.SEEK_LEAD_MS)) {
+                        // Linking mirrors A's play/pause onto B; hold B until its start.
+                        if (incoming.playWhenReady) incoming.playWhenReady = false
+                    } else {
+                        waitingForB = false
+                        seekUnlessNear(incoming, 0L)
+                        incoming.playWhenReady = outgoing.playWhenReady
+                    }
+                }
+
                 val frame = controller.step(
                     nowMs = now,
                     positionAMs = outgoing.currentPosition,
                     positionBMs = incoming.currentPosition,
                     incomingPlaying = incoming.isPlaying,
+                    incomingStarted = !waitingForB,
                 )
                 onFrame(frame)
 
@@ -117,7 +137,7 @@ class TransitionRenderer(private val effects: DeckEffects) {
                     diagnostics.onSpeedChange()
                 }
 
-                if (frame.stage == MixController.Stage.CROSSFADE) {
+                if (frame.stage == MixController.Stage.CROSSFADE && !waitingForB) {
                     if (!unmuted) {
                         unmuted = true
                         diagnostics.onUnmute(frame.phaseErrorBeats)
@@ -136,6 +156,11 @@ class TransitionRenderer(private val effects: DeckEffects) {
             effects.setAutomation(outgoing, null)
             effects.setAutomation(incoming, null)
         }
+    }
+
+    /** Seeks [player] to [targetMs] unless it is already close: a prepared deck keeps its buffer. */
+    private fun seekUnlessNear(player: ExoPlayer, targetMs: Long) {
+        if (abs(player.currentPosition - targetMs) > MixTuning.START_SEEK_TOLERANCE_MS) player.seekTo(targetMs)
     }
 
     private fun setVolume(player: ExoPlayer, volume: Float) {

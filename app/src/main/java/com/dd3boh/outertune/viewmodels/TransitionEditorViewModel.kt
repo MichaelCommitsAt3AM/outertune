@@ -54,6 +54,8 @@ class TransitionEditorViewModel @Inject constructor(
 
     val beatMarkers = _editorArtifacts.map { it?.beatMarkers ?: emptyList() }
         .stateIn(viewModelScope, SharingStarted.Lazily, emptyList())
+    val beatMarkersB = _editorArtifacts.map { it?.beatMarkersB ?: emptyList() }
+        .stateIn(viewModelScope, SharingStarted.Lazily, emptyList())
 
     val isPlaying = preview.state.map { it.isPlaying }
         .stateIn(viewModelScope, SharingStarted.Eagerly, false)
@@ -71,6 +73,15 @@ class TransitionEditorViewModel @Inject constructor(
     }.stateIn(viewModelScope, SharingStarted.Eagerly, null)
 
     private val _config = MutableStateFlow(TransitionConfig())
+
+    /**
+     * The last beat of Track A that may sit on the centre line: the zone then ends on A's last
+     * beat. Further right, A would end mid-transition (or before a preview reaches the zone).
+     */
+    val maxCenterBeatA = combine(_editorArtifacts, _config) { artifacts, config ->
+        artifacts?.let { (it.rawGrid1.size - 1 - config.barsCount * 2).coerceAtLeast(0).toFloat() }
+            ?: Float.POSITIVE_INFINITY
+    }.stateIn(viewModelScope, SharingStarted.Lazily, Float.POSITIVE_INFINITY)
     val barsCount = _config.map { it.barsCount }.stateIn(viewModelScope, SharingStarted.Lazily, 4)
     val transitionWidthFraction = _config.map { it.widthFraction }.stateIn(viewModelScope, SharingStarted.Lazily, 0.75f)
     val overlapMode = _config.map { it.overlapMode }.stateIn(viewModelScope, SharingStarted.Lazily, OverlapMode.OVERLAP)
@@ -111,7 +122,13 @@ class TransitionEditorViewModel @Inject constructor(
 
     // --- Loading ---
 
+    /** The pair already loaded: the screen asks again after a configuration change. */
+    private var loadedPair: Pair<String, String>? = null
+
     fun loadData(songAId: String, songBId: String) {
+        // Loading again would restore the saved row over unsaved edits and stop the preview.
+        if (loadedPair == songAId to songBId) return
+        loadedPair = songAId to songBId
         viewModelScope.launch {
             val artifacts = editorEngine.loadArtifacts(songAId, songBId)
             _editorArtifacts.value = artifacts
@@ -161,8 +178,14 @@ class TransitionEditorViewModel @Inject constructor(
             val entryBeatB = TransitionMath.getBeatForTimestamp(artifacts.rawGrid2, saved.entryPointMs / 1000.0)
             val widthFraction = _config.value.widthFraction
             val startShiftBeats = saved.transitionDurationBeats * (1f - widthFraction) / (2f * widthFraction)
+            // B's offset is in A's beats; entryBeatB is in B's own (they differ for interval-matched pairs).
+            val bpmA = artifacts.track1.song.displayBpm
+            val bpmB = artifacts.track2.song.displayBpm
+            val scalarB = if (bpmA != null && bpmB != null) {
+                TransitionMath.syncParameters(artifacts.rawGrid1, artifacts.rawGrid2, bpmA, bpmB).gridScalar
+            } else 1.0
             _track1OffsetBeats.value = exitBeatA - startShiftBeats
-            _track2OffsetBeats.value = entryBeatB - startShiftBeats
+            _track2OffsetBeats.value = entryBeatB * scalarB - startShiftBeats
         }
     }
 
@@ -180,14 +203,19 @@ class TransitionEditorViewModel @Inject constructor(
     fun setBarsCount(count: Int) {
         _config.value = _config.value.copy(barsCount = count.coerceAtLeast(1))
         recalculateZoom()
+        restartPreviewIfPlaying()
     }
 
     fun setTrack1Offset(pxOffset: Float, pixelsPerBeat: Float) {
-        if (pixelsPerBeat > 0) _track1OffsetBeats.value = (-pxOffset / pixelsPerBeat).toDouble()
+        if (pixelsPerBeat <= 0) return
+        _track1OffsetBeats.value = (-pxOffset / pixelsPerBeat).toDouble()
+        restartPreviewIfPlaying()
     }
 
     fun setTrack2Offset(pxOffset: Float, pixelsPerBeat: Float) {
-        if (pixelsPerBeat > 0) _track2OffsetBeats.value = (-pxOffset / pixelsPerBeat).toDouble()
+        if (pixelsPerBeat <= 0) return
+        _track2OffsetBeats.value = (-pxOffset / pixelsPerBeat).toDouble()
+        restartPreviewIfPlaying()
     }
 
     fun setScreenWidth(widthPx: Float) {
@@ -200,13 +228,20 @@ class TransitionEditorViewModel @Inject constructor(
     // --- Playback Control ---
 
     fun togglePlayback() {
-        if (isPlaying.value) {
-            preview.stop()
-        } else {
-            val plan = calculateCurrentPlan() ?: return
-            // Modes are read live, so changing them while the preview plays is heard immediately.
-            preview.play(plan, config = { _config.value }, gainA = gainA, gainB = gainB)
-        }
+        if (preview.state.value.isPlaying) preview.stop() else startPreview()
+    }
+
+    fun stopPreview() = preview.stop()
+
+    private fun startPreview() {
+        val plan = calculateCurrentPlan() ?: return
+        // Modes are read live, so changing them while the preview plays is heard immediately.
+        preview.play(plan, config = { _config.value }, gainA = gainA, gainB = gainB)
+    }
+
+    /** The plan is fixed for a run, so moving the zone restarts the preview from its lead-in. */
+    private fun restartPreviewIfPlaying() {
+        if (preview.state.value.isPlaying) startPreview()
     }
 
     // --- Save Logic ---

@@ -27,8 +27,9 @@ data class EditorArtifacts(
     val waveformBeatDomain1: List<BeatSample>,
     val waveformBeatDomain2: List<BeatSample>,
 
-    // UI Markers (Beat Grid lines for the UI)
+    // UI Markers (Beat Grid lines for the UI), each in Track A's beats
     val beatMarkers: List<BeatGridMarker>,
+    val beatMarkersB: List<BeatGridMarker>,
 
     // Raw Grids (Double Precision) - Passed here to allow TransitionMath to use them later
     val rawGrid1: List<Double>,

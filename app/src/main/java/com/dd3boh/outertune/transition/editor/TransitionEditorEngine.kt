@@ -46,7 +46,9 @@ class TransitionEditorEngine @Inject constructor(
                 track2 = songB,
                 waveformBeatDomain1 = beatWfA,
                 waveformBeatDomain2 = beatWfB,
-                beatMarkers = generateBeatMarkers(beatWfA, songA.song.timeSignature, songA.song.downbeatOffset),
+                beatMarkers = generateBeatMarkers(gridA.size, 1.0, songA.song.timeSignature, songA.song.downbeatOffset),
+                // B's own bars, drawn where its waveform is (in A's beats), so snapping lands on B's beats.
+                beatMarkersB = generateBeatMarkers(gridB.size, scalarB, songB.song.timeSignature, songB.song.downbeatOffset),
                 rawGrid1 = gridA,
                 rawGrid2 = gridB,
                 durationSec1 = durA,
@@ -101,18 +103,18 @@ class TransitionEditorEngine @Inject constructor(
         return out
     }
 
+    /** One marker per beat of a [beatCount]-beat grid, at `beat × scalar` in Track A's beats. */
     private fun generateBeatMarkers(
-        samples: List<BeatSample>,
+        beatCount: Int,
+        scalar: Double,
         timeSignature: Int,
         downbeatOffset: Int
     ): List<BeatGridMarker> {
-        if (samples.isEmpty()) return emptyList()
-
-        val maxBeat = samples.last().beatIndex
-        return (0..maxBeat.toInt()).map { index ->
+        val beatsPerBar = timeSignature.coerceAtLeast(1)
+        return List(beatCount) { index ->
             BeatGridMarker(
-                beatIndex = index.toFloat(),
-                isDownbeat = (index % timeSignature) == downbeatOffset,
+                beatIndex = (index * scalar).toFloat(),
+                isDownbeat = (index % beatsPerBar) == downbeatOffset,
                 isGhost = false
             )
         }

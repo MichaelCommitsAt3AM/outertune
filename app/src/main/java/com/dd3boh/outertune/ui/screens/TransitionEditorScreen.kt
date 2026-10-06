@@ -21,6 +21,10 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithCache
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
@@ -39,7 +43,6 @@ import com.dd3boh.outertune.transition.editor.BeatSample
 import com.dd3boh.outertune.ui.component.BeatMarkerPosition
 import com.dd3boh.outertune.ui.component.WaveformView
 import com.dd3boh.outertune.R
-import com.dd3boh.outertune.transition.engine.DeckState
 import com.dd3boh.outertune.transition.engine.TransitionMixer
 import com.dd3boh.outertune.transition.model.Deck
 import com.dd3boh.outertune.transition.model.EffectMode
@@ -72,12 +75,14 @@ fun TransitionEditorScreen(
     val waveformData2 by viewModel.waveformBeatDomain2.collectAsState()
 
     val beatMarkers by viewModel.beatMarkers.collectAsState()
+    val beatMarkersB by viewModel.beatMarkersB.collectAsState()
+    val maxCenterBeatA by viewModel.maxCenterBeatA.collectAsState()
 
     val pixelsPerBeat by viewModel.pixelsPerBeatBase.collectAsState()
 
-    // 0.0 to 1.0 (scrolling beat position) is confusing?
-    // Actually, playbackBeatMarker from ViewModel is "Current Beat Index on A"
-    val playbackBeatMarker by viewModel.playbackBeatMarker.collectAsState()
+    // Current beat on A, updated every tick while previewing. Only read while drawing the
+    // playhead, so a tick redraws one line instead of recomposing the screen.
+    val playheadBeat = viewModel.playbackBeatMarker.collectAsState()
 
     val track1OffsetBeats by viewModel.track1OffsetBeats.collectAsState()
     val track2OffsetBeats by viewModel.track2OffsetBeats.collectAsState()
@@ -93,6 +98,9 @@ fun TransitionEditorScreen(
     val isPlaying by viewModel.isPlaying.collectAsState()
     val decksReady by viewModel.areDecksReady.collectAsState()
     val loadingError by viewModel.loadingError.collectAsState()
+
+    // Don't keep previewing (and holding audio focus) once the editor is no longer visible.
+    LifecycleEventEffect(Lifecycle.Event.ON_STOP) { viewModel.stopPreview() }
 
     // UI VISIBILITY STATE
     var controlsVisible by remember { mutableStateOf(true) }
@@ -147,6 +155,8 @@ fun TransitionEditorScreen(
                 waveformData1 = waveformData1,
                 waveformData2 = waveformData2,
                 beatMarkers = beatMarkers,
+                beatMarkersB = beatMarkersB,
+                maxCenterBeatA = maxCenterBeatA,
                 pixelsPerBeat = pixelsPerBeat,
                 transitionWidthFraction = transitionWidthFraction,
                 barsCount = barsCount,
@@ -154,7 +164,7 @@ fun TransitionEditorScreen(
                 showControls = controlsVisible,
                 decksReady = decksReady,
                 loadingError = loadingError,
-                playbackBeatMarker = playbackBeatMarker?.toFloat(),
+                playheadBeat = { playheadBeat.value },
                 track1OffsetPixels = track1OffsetPixels,
                 track2OffsetPixels = track2OffsetPixels,
                 track1OffsetBeats = track1OffsetBeats,
@@ -200,6 +210,8 @@ fun WaveformsSection(
     waveformData1: List<BeatSample>,
     waveformData2: List<BeatSample>,
     beatMarkers: List<BeatGridMarker>,
+    beatMarkersB: List<BeatGridMarker>,
+    maxCenterBeatA: Float,
     pixelsPerBeat: Float,
     transitionWidthFraction: Float,
     barsCount: Int,
@@ -207,7 +219,7 @@ fun WaveformsSection(
     showControls: Boolean,
     decksReady: Boolean,
     loadingError: String?,
-    playbackBeatMarker: Float?,
+    playheadBeat: () -> Float?,
     track1OffsetPixels: Float,
     track2OffsetPixels: Float,
     track1OffsetBeats: Float, // Needed for playhead alignment
@@ -229,6 +241,7 @@ fun WaveformsSection(
                     pixelsPerBeat = pixelsPerBeat,
                     beatOffsetBeats = 0f,
                     initialOffset = track1OffsetPixels,
+                    maxCenterBeat = maxCenterBeatA,
                     onOffsetChanged = onTrack1OffsetChanged,
                     modifier = Modifier.fillMaxWidth().height(150.dp)
                 )
@@ -237,7 +250,7 @@ fun WaveformsSection(
             key(barsCount, pixelsPerBeat) {
                 WaveformView(
                     waveformData = waveformData2,
-                    beatMarkers = beatMarkers,
+                    beatMarkers = beatMarkersB,
                     markerPosition = BeatMarkerPosition.TOP,
                     pixelsPerBeat = pixelsPerBeat,
                     beatOffsetBeats = 0f,
@@ -266,39 +279,20 @@ fun WaveformsSection(
                         .border(2.dp, Color(0xFF4CAF50).copy(alpha = 0.6f), RoundedCornerShape(12.dp))
                 )
 
-                // Visualization Curves
-                Canvas(modifier = Modifier.fillMaxSize().padding(horizontal = 4.dp)) {
-                    val w = size.width
-                    val h = size.height
-                    val steps = 50
-                    val pathAVol = Path()
-                    val pathBVol = Path()
-                    // Reusable vars
-                    var stateA: DeckState
-                    var stateB: DeckState
-
-                    for (i in 0..steps) {
-                        val p = i / steps.toFloat()
-                        val x = p * w
-
-                        stateA = TransitionMixer.getMixState(Deck.A, p, overlapMode, eqMode, effectMode)
-                        stateB = TransitionMixer.getMixState(Deck.B, p, overlapMode, eqMode, effectMode)
-
-                        val yVolA = h - (stateA.volume * h)
-                        val yVolB = h - (stateB.volume * h)
-
-                        if (i == 0) {
-                            pathAVol.moveTo(x, yVolA)
-                            pathBVol.moveTo(x, yVolB)
-                        } else {
-                            pathAVol.lineTo(x, yVolA)
-                            pathBVol.lineTo(x, yVolB)
+                // Visualization Curves: the paths are rebuilt only when the size or a mode changes.
+                Spacer(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(horizontal = 4.dp)
+                        .drawWithCache {
+                            val (pathAVol, pathBVol) = volumeCurves(size.width, size.height, barsCount * 4, overlapMode, eqMode, effectMode)
+                            val stroke = Stroke(width = 3.dp.toPx())
+                            onDrawBehind {
+                                drawPath(pathAVol, Color.White.copy(alpha = 0.7f), style = stroke)
+                                drawPath(pathBVol, Color.Cyan.copy(alpha = 0.7f), style = stroke)
+                            }
                         }
-                    }
-
-                    drawPath(pathAVol, Color.White.copy(alpha = 0.7f), style = androidx.compose.ui.graphics.drawscope.Stroke(width = 3.dp.toPx()))
-                    drawPath(pathBVol, Color.Cyan.copy(alpha = 0.7f), style = androidx.compose.ui.graphics.drawscope.Stroke(width = 3.dp.toPx()))
-                }
+                )
 
                 // Play/Pause Button
                 AnimatedVisibility(
@@ -356,25 +350,58 @@ fun WaveformsSection(
             }
         }
 
-        // Green Playhead Line
-        // Calculation:
-        // playbackBeatMarker is the current Beat Index on Track A.
-        // track1OffsetPixels is the current visual scroll of Track A.
-        // xPosition = (beatIndex * ppb) + scrollOffset
-        if (playbackBeatMarker != null && pixelsPerBeat > 0) {
-            val xPosition = (playbackBeatMarker * pixelsPerBeat) + track1OffsetPixels
-
-            Canvas(modifier = Modifier.fillMaxSize()) {
-                drawLine(
-                    color = Color.Green,
-                    start = Offset(xPosition, 0f),
-                    end = Offset(xPosition, size.height),
-                    strokeWidth = 4.dp.toPx(),
-                    cap = StrokeCap.Round
-                )
-            }
+        // Green Playhead Line at A's current beat: x = beat * ppb + A's scroll offset. The beat is
+        // read here, in the draw phase, so each tick only redraws this canvas.
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            val beat = playheadBeat() ?: return@Canvas
+            if (pixelsPerBeat <= 0) return@Canvas
+            val xPosition = beat * pixelsPerBeat + track1OffsetPixels
+            drawLine(
+                color = Color.Green,
+                start = Offset(xPosition, 0f),
+                end = Offset(xPosition, size.height),
+                strokeWidth = 4.dp.toPx(),
+                cap = StrokeCap.Round
+            )
         }
     }
+}
+
+/**
+ * Both decks' volume across the zone, as paths filling [width] x [height]. Sidechain ducking is
+ * drawn on an idealised grid of one beat per `width / beats`, where both songs' beats coincide.
+ */
+private fun volumeCurves(
+    width: Float,
+    height: Float,
+    beats: Int,
+    overlapMode: OverlapMode,
+    eqMode: EqMode,
+    effectMode: EffectMode,
+): Pair<Path, Path> {
+    val sidechain = overlapMode == OverlapMode.DYNAMIC_SIDECHAIN
+    // One "second" per beat. Ducks are a fraction of a beat, so the sidechain needs fine steps.
+    val grid = if (sidechain) List(beats + 1) { it.toDouble() } else null
+    val steps = if (sidechain) (beats * 32).coerceAtLeast(50) else 50
+    val pathA = Path()
+    val pathB = Path()
+    for (i in 0..steps) {
+        val p = i / steps.toFloat()
+        val position = (p * beats).toDouble()
+        val stateA = TransitionMixer.getMixState(Deck.A, p, overlapMode, eqMode, effectMode, position, position, grid, grid)
+        val stateB = TransitionMixer.getMixState(Deck.B, p, overlapMode, eqMode, effectMode, position, position, grid, grid)
+        val x = p * width
+        val yA = height - stateA.volume * height
+        val yB = height - stateB.volume * height
+        if (i == 0) {
+            pathA.moveTo(x, yA)
+            pathB.moveTo(x, yB)
+        } else {
+            pathA.lineTo(x, yA)
+            pathB.lineTo(x, yB)
+        }
+    }
+    return pathA to pathB
 }
 
 @Composable
