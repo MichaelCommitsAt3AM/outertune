@@ -28,7 +28,7 @@ adb install -r app/build/outputs/apk/core/debug/OuterTune-*-core-arm64-v8a-debug
 ```
 
 - Flavors `core` / `full` × build types `debug` / `userdebug`. Use `core` (`full` needs extra FFmpeg setup). There is no bare `testDebugUnitTest`.
-- Keep `--max-workers=2`: full builds have crashed the development laptop.
+- **Always limit Gradle to 2 workers** (`--max-workers=2`) on every Gradle run: compiles, tests and APK builds. The development machine has limited memory, and builds with more workers have crashed it. Don't run two Gradle builds at once.
 - `debug` installs as `com.dd3boh.outertune.debug`; `userdebug` (profileable, used for profiling) as `com.dd3boh.outertune`. They are separate apps with separate data. The author uses the **debug** build day to day.
 - `adb install -r` force-stops the running app. Tell the user before reinstalling, because to them it looks like a crash.
 - Logs: `adb logcat -s SyncUtils TransitionRenderer MixPlaybackEngine AnalysisWorker`. One `TransitionRenderer` line per transition reports beatmatch quality.
