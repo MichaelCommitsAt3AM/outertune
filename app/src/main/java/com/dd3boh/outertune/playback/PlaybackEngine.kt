@@ -33,6 +33,15 @@ interface PlaybackEngine {
     fun destroy()
 
     /**
+     * Position (ms) within the song the user sees. In mix mode this is the incoming song once a
+     * transition has passed its midpoint. Read on demand by the UI while it's visible.
+     */
+    fun logicalPositionMs(): Long
+
+    /** Duration (ms) of the song the user sees; in mix mode, a song ends at its exit point. */
+    fun logicalDurationMs(): Long
+
+    /**
      * Seek to a position.
      * Engines may override this to handle logic (like canceling transitions).
      */

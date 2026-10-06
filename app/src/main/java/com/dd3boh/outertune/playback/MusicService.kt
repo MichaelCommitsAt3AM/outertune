@@ -254,7 +254,6 @@ class MusicService : MediaLibraryService(),
     private var isAudioEffectSessionOpened = false
 
     var consecutivePlaybackErr = 0
-    private val isActivePlayerPlaying = MutableStateFlow(false)
     private var skipSilenceEnabled = false
 
     override fun onCreate() {
@@ -284,17 +283,6 @@ class MusicService : MediaLibraryService(),
                     onActivePlayerChanged(previous, newPlayer, isDeckSwap)
                 }
         }
-
-        // Normal playback has no engine poller, so tick the logical position while playing.
-        combine(engineFlow, isActivePlayerPlaying) { engine, playing -> engine !is MixPlaybackEngine && playing }
-            .distinctUntilChanged()
-            .collectLatest(scope) { tick ->
-                publishSimpleLogicalState()
-                while (tick) {
-                    delay(LOGICAL_POSITION_TICK_MS)
-                    publishSimpleLogicalState()
-                }
-            }
 
         mediaLibrarySessionCallback.apply {
             service = this@MusicService
@@ -472,7 +460,6 @@ class MusicService : MediaLibraryService(),
         if (previous != null && previous !== newPlayer) {
             newPlayer.repeatMode = previous.repeatMode
         }
-        isActivePlayerPlaying.value = newPlayer.isPlaying
         sleepTimer.bind(newPlayer)
         // A deck swap is the end of the outgoing song.
         if (isDeckSwap) sleepTimer.onSongEnded()
@@ -1237,7 +1224,6 @@ class MusicService : MediaLibraryService(),
 
     override fun onEvents(player: Player, events: Player.Events) {
         if (player != playbackEngine?.activePlayer?.value) return
-        isActivePlayerPlaying.value = player.isPlaying
 
         if (events.containsAny(Player.EVENT_PLAYBACK_STATE_CHANGED, Player.EVENT_PLAY_WHEN_READY_CHANGED)) {
             val isBufferingOrReady =
@@ -1313,9 +1299,13 @@ class MusicService : MediaLibraryService(),
 
     /** Seeks relative to the position the user sees (which, mid-transition, may be the incoming song). */
     fun seekByLogical(deltaMs: Long) {
-        val base = if (playbackEngine is MixPlaybackEngine) _logicalState.value.currentPositionMs else player.currentPosition
-        seekToLogical((base + deltaMs).coerceAtLeast(0))
+        seekToLogical((logicalPositionMs() + deltaMs).coerceAtLeast(0))
     }
+
+    /** Position in the song the user sees; read by the UI on demand while it's visible. */
+    fun logicalPositionMs(): Long = playbackEngine?.logicalPositionMs() ?: player.currentPosition
+
+    fun logicalDurationMs(): Long = playbackEngine?.logicalDurationMs() ?: player.duration
 
     override fun onRepeatModeChanged(repeatMode: Int) {
         updateNotification()
@@ -1377,8 +1367,6 @@ class MusicService : MediaLibraryService(),
     }
 
     companion object {
-        /** How often normal playback refreshes the position shown in the full player. */
-        private const val LOGICAL_POSITION_TICK_MS = 500L
         const val ROOT = "root"
         const val SONG = "song"
         const val ARTIST = "artist"

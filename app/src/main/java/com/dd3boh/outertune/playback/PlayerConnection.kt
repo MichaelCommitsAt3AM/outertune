@@ -154,6 +154,11 @@ class PlayerConnection(
         service.seekByLogical(deltaMs)
     }
 
+    /** Position in the song the user sees. Cheap; poll it while the player UI is visible. */
+    fun logicalPositionMs(): Long = service.logicalPositionMs()
+
+    fun logicalDurationMs(): Long = service.logicalDurationMs()
+
     /**
      * Add item to queue, right after current playing item
      */

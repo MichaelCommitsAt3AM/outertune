@@ -28,6 +28,10 @@ object MixTuning {
     /** Playlist: build the plan this long before the exit point. */
     const val ARM_LEAD_MS = 15_000L
 
+    /** Playlist: shortest and longest sleep of the mix state machine between checks. */
+    const val POLLER_MIN_WAKE_MS = 20L
+    const val POLLER_MAX_SLEEP_MS = 5_000L
+
     /** Playlist: crossfade progress at which the UI switches to the incoming song. */
     const val UI_SWITCH_PROGRESS = 0.5f
 
