@@ -1,8 +1,19 @@
 package com.dd3boh.outertune.playback
 
-import com.dd3boh.outertune.utils.DebugLog as Log
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
+import com.dd3boh.outertune.db.MusicDatabase
+import com.dd3boh.outertune.db.daos.TransitionDao
+import com.dd3boh.outertune.db.entities.SongEntity
+import com.dd3boh.outertune.db.entities.TransitionEntity
+import com.dd3boh.outertune.extensions.currentMetadata
+import com.dd3boh.outertune.extensions.toMediaItem
+import com.dd3boh.outertune.models.LogicalPlayerState
+import com.dd3boh.outertune.models.MediaMetadata
+import com.dd3boh.outertune.transition.math.TransitionMath
+import com.dd3boh.outertune.transition.model.TransitionConfig
+import com.dd3boh.outertune.transition.model.TransitionPlan
+import com.dd3boh.outertune.utils.analysis.AudioDecoder
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -10,41 +21,36 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.firstOrNull
-import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import com.dd3boh.outertune.db.MusicDatabase
-import com.dd3boh.outertune.db.daos.TransitionDao
-import com.dd3boh.outertune.db.entities.SongEntity
-import com.dd3boh.outertune.db.entities.TransitionEntity
-import com.dd3boh.outertune.transition.model.TransitionConfig
-import com.dd3boh.outertune.transition.model.TransitionPlan
-import com.dd3boh.outertune.transition.math.TransitionMath
-import com.dd3boh.outertune.extensions.toMediaItem
-import com.dd3boh.outertune.extensions.currentMetadata
-import com.dd3boh.outertune.models.MediaMetadata
-import com.dd3boh.outertune.utils.analysis.AudioDecoder
 import java.io.File
 import kotlin.math.min
-import kotlin.math.pow
-import com.dd3boh.outertune.models.LogicalPlayerState // Import LogicalPlayerState
+import com.dd3boh.outertune.utils.DebugLog as Log
 
+/**
+ * Playback engine for mix-mode playlists: plays the queue on [DeckManager]'s active deck and,
+ * for each (current -> next) pair with a saved [TransitionEntity], beatmatches the next song in.
+ *
+ * Runs entirely on [scope], which must be confined to the main thread (the players' looper).
+ */
 class MixPlaybackEngine(
-    val deckManager: DeckManager, // Owns DeckManager
-    private val scope: CoroutineScope, // Service scope for background tasks
+    val deckManager: DeckManager,
+    private val scope: CoroutineScope,
     private val database: MusicDatabase,
     private val transitionDao: TransitionDao,
-    private val queueBoard: QueueBoard, // Needs access to queue for next/prev
-    private val updateLogicalStateCallback: (LogicalPlayerState) -> Unit // Callback to update service state
+    private val queueBoard: QueueBoard,
+    /** Final volume for a song when it becomes the active one (normalization × user volume). */
+    private val targetGainFor: suspend (songId: String) -> Float,
+    private val updateLogicalStateCallback: (LogicalPlayerState) -> Unit,
 ) : PlaybackEngine {
 
     private val TAG = "MixPlaybackEngine"
 
     private val _activePlayer = MutableStateFlow(deckManager.activeDeck)
     override val activePlayer: StateFlow<ExoPlayer> = _activePlayer.asStateFlow()
-    
+
     override val isCrossfading: StateFlow<Boolean> = deckManager.isCrossfading
 
     private var pollerJob: Job? = null
@@ -55,29 +61,33 @@ class MixPlaybackEngine(
      *
      * IDLE ──(transition row found + standby pre-warmed)──▶ PREFETCH
      * PREFETCH ──(plan built, ~15s before exit)──▶ ARMED
-     * ARMED ──(PLL fired ~3s before exit)──▶ CROSSFADING   (UI switches to the incoming song here)
+     * ARMED ──(PLL fired ~3s before exit)──▶ CROSSFADING   (UI switches to the incoming song at the midpoint)
      * CROSSFADING ──(DeckManager.completeTransition → onActiveDeckChanged)──▶ IDLE
      *
      * Any state ──(seek / manual track change / queue change / repeat-one)──▶ IDLE via [resetMixState].
      */
     private enum class MixPhase { IDLE, PREFETCH, ARMED, CROSSFADING }
 
-    // Mix State
-    @Volatile private var phase = MixPhase.IDLE
+    private var phase = MixPhase.IDLE
     private var currentTransitionCache: TransitionEntity? = null
     private var currentTransitionPlan: TransitionPlan? = null
     private var currentTransitionConfig: TransitionConfig? = null
+    private var incomingGain = 1f
+
+    /** The song being brought in, and the queue position it was brought in from. */
+    private var crossfadeTarget: MediaMetadata? = null
+    private var crossfadeFromQueuePos: Int? = null
+    /** Whether the UI already shows [crossfadeTarget]. */
+    private var switchedToNext = false
 
     private companion object {
         const val LAZY_LOAD_LEAD_MS = 15_000L
-        const val PLL_LEAD_MS = 3_000L
+        val PLL_LEAD_MS = (DeckManager.PREROLL_SECONDS * 1000).toLong()
+        /** Crossfade progress at which the UI switches to the incoming song. */
+        const val UI_SWITCH_PROGRESS = 0.5f
     }
 
-    // Initialize logical state locally
     private var localLogicalState = LogicalPlayerState()
-
-    // DeckManager is constructed in MusicService.playQueue() and handed to this engine.
-    // Its onActiveDeckChanged callback is wired to forward into onActiveDeckChanged() below.
 
     override fun start() {
         Log.i(TAG, "Starting MixPlaybackEngine Poller")
@@ -92,14 +102,19 @@ class MixPlaybackEngine(
     }
 
     override fun seekTo(positionMs: Long) {
-        val state = localLogicalState
-        val logicalDuration = state.durationMs
-
-        val clampedPosition = if (logicalDuration > 0) {
-            positionMs.coerceIn(0L, logicalDuration)
-        } else {
-            positionMs
+        if (phase == MixPhase.CROSSFADING && switchedToNext) {
+            // The UI already shows the incoming song, so this is a seek within it: finish the
+            // transition now (onActiveDeckChanged re-arms) and seek the new active deck.
+            deckManager.finishTransitionNow()
+            val player = activePlayer.value
+            val duration = player.duration.takeIf { it > 0 }
+            player.seekTo(if (duration != null) positionMs.coerceIn(0L, duration) else positionMs)
+            publishLogicalState(player)
+            return
         }
+
+        val state = localLogicalState
+        val clampedPosition = if (state.durationMs > 0) positionMs.coerceIn(0L, state.durationMs) else positionMs
 
         // A seek invalidates any armed / in-flight transition. Tear it down before moving.
         resetMixState()
@@ -124,15 +139,20 @@ class MixPlaybackEngine(
         currentTransitionCache = null
         currentTransitionPlan = null
         currentTransitionConfig = null
+        crossfadeTarget = null
+        crossfadeFromQueuePos = null
+        switchedToNext = false
         phase = MixPhase.IDLE
         lastMixCheckTime = 0L
     }
 
     private fun switchLogicalToNext(nextSong: MediaMetadata) {
+        switchedToNext = true
+        val standby = deckManager.standbyDeck
         localLogicalState = LogicalPlayerState(
             activeMetadata = nextSong,
-            currentPositionMs = 0L,
-            durationMs = nextSong.duration * 1000L,
+            currentPositionMs = standby.currentPosition,
+            durationMs = standby.duration.takeIf { it > 0 } ?: (nextSong.duration * 1000L),
             isTransitionActive = true,
         )
         updateLogicalStateCallback(localLogicalState)
@@ -140,46 +160,57 @@ class MixPlaybackEngine(
 
     /** Called by DeckManager once the crossfade is complete and the decks have physically swapped. */
     fun onActiveDeckChanged(newPlayer: ExoPlayer) {
-        Log.i(TAG, "Active Deck Changed to: ${if (newPlayer == deckManager.playerA) "A" else "B"}")
+        Log.i(TAG, "Active Deck Changed to: ${if (newPlayer === deckManager.playerA) "A" else "B"}")
+        val fromQueuePos = crossfadeFromQueuePos
         _activePlayer.value = newPlayer
 
         // The transition that just completed is done with; anything armed is stale.
         resetMixState()
 
-        // Advance the queue by exactly one (queue-position based, not deck media-item index).
+        // Advance the queue by exactly one from where the transition started. Using the recorded
+        // position keeps this idempotent if the outgoing deck already auto-advanced on its own.
         queueBoard.getCurrentQueue()?.let { q ->
-            val nextIndex = q.queuePos + 1
-            Log.d(TAG, "Advancing queue ${q.queuePos} -> $nextIndex")
+            // Find the incoming song after the position the transition started from (normally
+            // the very next item, unless the queue was edited mid-transition).
+            val items = q.getCurrentQueueShuffled()
+            val from = (fromQueuePos ?: q.getQueuePosShuffled()) + 1
+            val songId = newPlayer.currentMediaItem?.mediaId
+            val nextIndex = (from until items.size).firstOrNull { items[it].id == songId }
+            if (nextIndex == null) {
+                Log.w(TAG, "Incoming song $songId is not in the queue after $from; leaving the queue as is")
+                return@let
+            }
+            Log.d(TAG, "Advancing queue to $nextIndex")
             queueBoard.setCurrQueuePosIndex(nextIndex)
+            // The incoming deck was loaded with just this one song; give it the rest of the queue
+            // (seamlessly, around the playing item) so songs without a transition still advance.
+            queueBoard.setCurrQueue()
         }
 
-        // Finalise the logical state on the now-active (incoming) song.
-        newPlayer.currentMetadata?.let { newMetadata ->
-            localLogicalState = LogicalPlayerState(
-                activeMetadata = newMetadata,
-                currentPositionMs = newPlayer.currentPosition,
-                durationMs = newPlayer.duration,
-                isTransitionActive = false,
-            )
-            updateLogicalStateCallback(localLogicalState)
-        }
+        publishLogicalState(newPlayer)
 
         // Pre-warm the transition for the new (current -> next) pair.
         refreshTransition(newPlayer.currentMediaItem?.mediaId)
     }
-    
-    // --- Logic Moved from MusicService ---
+
+    private fun publishLogicalState(player: ExoPlayer) {
+        player.currentMetadata?.let { metadata ->
+            localLogicalState = LogicalPlayerState(
+                activeMetadata = metadata,
+                currentPositionMs = player.currentPosition,
+                durationMs = player.duration,
+                isTransitionActive = false,
+            )
+            updateLogicalStateCallback(localLogicalState)
+        }
+    }
 
     private fun startMixPoller() {
         pollerJob = scope.launch {
             while (isActive) {
                 if (activePlayer.value.isPlaying) {
-                    // Player reads + DeckManager calls are confined to the deck (main) thread.
-                    // TODO(phase-later): move decks to a dedicated audio looper and drop this hop.
-                    withContext(Dispatchers.Main) {
-                        updateLogicalState()
-                        checkMixStatus()
-                    }
+                    updateLogicalState()
+                    checkMixStatus()
                 }
                 delay(50)
             }
@@ -189,46 +220,42 @@ class MixPlaybackEngine(
     private fun updateLogicalState() {
         val player = activePlayer.value
         val currentMeta = player.currentMetadata ?: return
-        val realPos = player.currentPosition
-        val realDur = player.duration
 
-        // 1. Determine Logical Duration
-        val logicalDuration = currentTransitionCache?.exitPointMs ?: realDur
-
-        // 2. Determine Logical Position
-        val logicalPos = min(realPos, logicalDuration)
-
-        // 3. Update State
-        if (localLogicalState.activeMetadata?.id == currentMeta.id) {
-            localLogicalState = localLogicalState.copy(
-                currentPositionMs = logicalPos,
-                durationMs = logicalDuration,
-                isTransitionActive = false
-            )
-        } else if (localLogicalState.isTransitionActive) {
-             // In Transition -> Show Standby Position
-            val standbyPos = deckManager.standbyDeck.currentPosition
-            val standbyDur = deckManager.standbyDeck.duration
-            localLogicalState = localLogicalState.copy(
-                currentPositionMs = standbyPos,
-                durationMs = if (standbyDur > 0) standbyDur else localLogicalState.durationMs
-            )
-        } else {
-             // Normal Playback (Metadata changed manually)
-             localLogicalState = LogicalPlayerState(
-                activeMetadata = currentMeta,
-                currentPositionMs = logicalPos,
-                durationMs = logicalDuration,
-                isTransitionActive = false
-            )
+        if (phase == MixPhase.CROSSFADING) {
+            val target = crossfadeTarget
+            if (!switchedToNext && target != null &&
+                deckManager.crossfadeProgress.value >= UI_SWITCH_PROGRESS
+            ) {
+                switchLogicalToNext(target)
+                return
+            }
+            if (switchedToNext) {
+                // Show the incoming deck's real position.
+                val standby = deckManager.standbyDeck
+                localLogicalState = localLogicalState.copy(
+                    currentPositionMs = standby.currentPosition,
+                    durationMs = standby.duration.takeIf { it > 0 } ?: localLogicalState.durationMs,
+                )
+                updateLogicalStateCallback(localLogicalState)
+                return
+            }
         }
+
+        // The outgoing song's logical end is the exit point.
+        val logicalDuration = currentTransitionCache?.exitPointMs ?: player.duration
+        localLogicalState = LogicalPlayerState(
+            activeMetadata = currentMeta,
+            currentPositionMs = min(player.currentPosition, logicalDuration),
+            durationMs = logicalDuration,
+            isTransitionActive = false,
+        )
         updateLogicalStateCallback(localLogicalState)
     }
 
     private var lastMixCheckTime = 0L
 
     /**
-     * Runs on the deck (main) thread every ~50ms while the active deck is playing.
+     * Runs on the main thread every ~50ms while the active deck is playing.
      * Advances the transition state machine; DeckManager owns the audio once CROSSFADING.
      */
     private suspend fun checkMixStatus() {
@@ -266,26 +293,25 @@ class MixPlaybackEngine(
             return
         }
 
-        // PREFETCH -> ARMED: build the plan ~15s before the exit point.
-        if (phase == MixPhase.PREFETCH &&
-            transition.exitPointMs > LAZY_LOAD_LEAD_MS &&
-            currentPosition >= transition.exitPointMs - LAZY_LOAD_LEAD_MS
-        ) {
+        // PREFETCH -> ARMED: build the plan ~15s before the exit point (immediately for early exits).
+        if (phase == MixPhase.PREFETCH && currentPosition >= transition.exitPointMs - LAZY_LOAD_LEAD_MS) {
             performLazyLoading(transition, nextSong.id) // -> ARMED on success, IDLE on failure
         }
 
-        // ARMED -> CROSSFADING: fire the PLL ~3s before the exit point and switch the UI early.
+        // ARMED -> CROSSFADING: fire the PLL ~3s before the exit point.
         if (phase == MixPhase.ARMED && currentPosition >= transition.exitPointMs - PLL_LEAD_MS) {
             val plan = currentTransitionPlan
             val config = currentTransitionConfig
             if (plan != null && config != null) {
-                deckManager.startPllTransition(plan, transition.durationMs, config)
-                if (deckManager.isCrossfading.value) {
+                val fromQueuePos = queueBoard.getCurrentQueue()?.getQueuePosShuffled()
+                if (deckManager.startPllTransition(plan, config, incomingGain)) {
                     phase = MixPhase.CROSSFADING
-                    switchLogicalToNext(nextSong)
+                    crossfadeTarget = nextSong
+                    crossfadeFromQueuePos = fromQueuePos
+                    switchedToNext = false
                 } else {
-                    // Plan was rejected (missing grids / invalid anchors). Let the song play through
-                    // to its natural end rather than leaving the UI inconsistent with the audio.
+                    // Plan was rejected. Let the song play through to its natural end rather than
+                    // leaving the UI inconsistent with the audio.
                     Log.w(TAG, "PLL rejected the plan; skipping this transition.")
                     phase = MixPhase.IDLE
                 }
@@ -294,95 +320,72 @@ class MixPlaybackEngine(
     }
 
     private suspend fun performLazyLoading(transition: TransitionEntity, nextId: String) {
-        val currentId = activePlayer.value.currentMediaItem?.mediaId
-        
-        if (currentId != null) {
-            val songA = database.song(currentId).firstOrNull()?.song
-            val songB = database.song(nextId).firstOrNull()?.song
-            
-            if (songA != null && songB != null) {
-                 val exitSec = transition.exitPointMs / 1000.0
-                 val entrySec = transition.entryPointMs / 1000.0
-                 val durSec = transition.durationMs / 1000.0
-                 val preroll = 5.0
-                 
-                 // Load Partial Grids
-                 // Grid A: Exit - 10s to Exit + Duration + 5s
-                 val startA = ((exitSec - 10.0).coerceAtLeast(0.0) * 1000).toLong()
-                 val endA = ((exitSec + durSec + preroll) * 1000).toLong()
-                 
-                 // Grid B: Entry - 5s to Entry + Duration + 10s
-                 val startB = ((entrySec - preroll).coerceAtLeast(0.0) * 1000).toLong()
-                 val endB = ((entrySec + durSec + 10.0) * 1000).toLong()
-            
-                 val (gridA, gridB) = withContext(Dispatchers.IO) {
-                     val gA = loadGrid(songA, startA, endA)
-                     val gB = loadGrid(songB, startB, endB)
-                     gA to gB
-                 }
-
-                 // A seek / track change while we were loading invalidates this work.
-                 if (phase != MixPhase.PREFETCH) return
-
-                 val bpmA = songA.displayBpm ?: 0f
-                 val bpmB = songB.displayBpm ?: 0f
-
-                 if (gridA != null && gridB != null && bpmA > 0 && bpmB > 0) {
-                     currentTransitionConfig = TransitionConfig(
-                         overlapMode = transition.overlapMode,
-                         eqMode = transition.eqMode,
-                         effectMode = transition.effectMode,
-                         barsCount = (transition.durationBeats ?: 32) / 4
-                     )
-                     
-                     // Anchor beats are grid-window dependent, so derive them from the persisted
-                     // absolute exit/entry timestamps against whatever grid slice we just loaded.
-                     val exitBeatA = TransitionMath.getBeatForTimestamp(gridA, exitSec)
-                     val entryBeatB = TransitionMath.getBeatForTimestamp(gridB, entrySec)
-
-                     // Plan v1+: trust the editor's synchronisation contract instead of re-deriving it
-                     // from BPM (which ignored interval-match and could disagree with the preview).
-                     val hasPlan = transition.planVersion != null
-                     val legacySpeedB = (if (transition.syncTempo && bpmB > 0) bpmA / bpmB else 1f).toDouble()
-
-                     currentTransitionPlan = TransitionPlan(
-                         initialSpeedB = transition.initialSpeedB ?: legacySpeedB,
-                         gridScalarB = transition.gridScalarB ?: 1.0,
-                         anchorBeatA = exitBeatA,
-                         anchorBeatB = entryBeatB,
-                         transitionDurationBeats = transition.transitionDurationBeats
-                             ?: (durSec * (bpmA / 60.0)),
-                         exitPointMs = transition.exitPointMs,
-                         entryPointMs = transition.entryPointMs,
-                         durationMs = transition.durationMs,
-                         gridA = gridA,
-                         gridB = gridB
-                     )
-                     phase = MixPhase.ARMED
-                     Log.d(TAG, "Transition armed (persisted=$hasPlan).")
-                 } else {
-                     // Missing grids / BPM — give up on this pair rather than retrying every tick.
-                     Log.w(TAG, "Lazy loading failed (missing grids or BPM); transition skipped.")
-                     phase = MixPhase.IDLE
-                 }
-            }
+        val currentId = activePlayer.value.currentMediaItem?.mediaId ?: return
+        val songA = database.song(currentId).firstOrNull()?.song
+        val songB = database.song(nextId).firstOrNull()?.song
+        if (songA == null || songB == null) {
+            phase = MixPhase.IDLE
+            return
         }
+
+        val exitSec = transition.exitPointMs / 1000.0
+        val entrySec = transition.entryPointMs / 1000.0
+        val durSec = transition.durationMs / 1000.0
+
+        // Full grids: a few hundred beats each, and absolute beat indices avoid window edge cases.
+        val (gridA, gridB) = withContext(Dispatchers.IO) { loadGrid(songA) to loadGrid(songB) }
+        val gain = targetGainFor(nextId)
+
+        // A seek / track change while we were loading invalidates this work.
+        if (phase != MixPhase.PREFETCH) return
+
+        val bpmA = songA.displayBpm ?: 0f
+        val bpmB = songB.displayBpm ?: 0f
+
+        if (gridA == null || gridB == null || bpmA <= 0 || bpmB <= 0) {
+            // Missing grids / BPM — give up on this pair rather than retrying every tick.
+            Log.w(TAG, "Lazy loading failed (missing grids or BPM); transition skipped.")
+            phase = MixPhase.IDLE
+            return
+        }
+
+        currentTransitionConfig = TransitionConfig(
+            overlapMode = transition.overlapMode,
+            eqMode = transition.eqMode,
+            effectMode = transition.effectMode,
+            barsCount = (transition.durationBeats ?: 32) / 4
+        )
+
+        // Plan v1+: trust the editor's synchronisation contract instead of re-deriving it from BPM.
+        val legacySpeedB = (if (transition.syncTempo) bpmA / bpmB else 1f).toDouble()
+
+        currentTransitionPlan = TransitionPlan(
+            initialSpeedB = transition.initialSpeedB ?: legacySpeedB,
+            gridScalarB = transition.gridScalarB ?: 1.0,
+            anchorBeatA = TransitionMath.getBeatForTimestamp(gridA, exitSec),
+            anchorBeatB = TransitionMath.getBeatForTimestamp(gridB, entrySec),
+            transitionDurationBeats = transition.transitionDurationBeats
+                ?: transition.durationBeats?.toDouble()
+                ?: (durSec * (bpmA / 60.0)),
+            exitPointMs = transition.exitPointMs,
+            entryPointMs = transition.entryPointMs,
+            durationMs = transition.durationMs,
+            gridA = gridA,
+            gridB = gridB
+        )
+        incomingGain = gain
+        phase = MixPhase.ARMED
+        Log.d(TAG, "Transition armed (persisted=${transition.planVersion != null}).")
     }
 
     /**
      * Called by MusicService on track change (and internally after a deck swap / seek).
      * Loads the transition row for the (currentId -> next) pair and pre-warms the standby deck.
-     *
-     * Per-song loudness normalisation for mix mode flows: [loadTransitionOnce] computes the
-     * incoming song's factor and hands it to [DeckManager.setStandbyVolumeMultiplier]; the deck
-     * swap in DeckManager.completeTransition carries it to the active deck; from then on
-     * MusicService's normalizeFactor flow owns the active player's gain.
      */
     fun refreshTransition(currentId: String?) {
         if (currentId == null) return
         scope.launch {
-            val nextSong = queueBoard.peekNext()
-            loadTransitionOnce(currentId, nextSong?.id)
+            loadTransitionOnce(currentId, queueBoard.peekNext()?.id)
         }
     }
 
@@ -399,96 +402,54 @@ class MixPlaybackEngine(
         if (nextId == null) return
 
         loadJob = scope.launch {
-             val transition = transitionDao.getTransition(currentId, nextId)
-             currentTransitionCache = transition
+            val transition = transitionDao.getTransition(currentId, nextId) ?: return@launch
+            Log.d(TAG, "Transition found: exit=${transition.exitPointMs}, dur=${transition.durationMs}")
 
-             if (transition != null) {
-                 // Pre-warm logic
-                 // ...
-                     Log.d(TAG, "Transition Found! Exit=${transition.exitPointMs}, Dur=${transition.durationMs}")
+            val nextSong = queueBoard.peekNext()
+            if (nextSong == null || nextSong.id != nextId) return@launch
 
-                     // --- CHECK FILE EXISTENCE (Lightweight) ---
-                     val songA = database.song(currentId).firstOrNull()?.song
-                     val songB = database.song(nextId).firstOrNull()?.song
-                     
-                     if (songA != null && songB != null) {
-                          val hasGridA = songA.beatGridPath != null && java.io.File(songA.beatGridPath).exists()
-                          val hasGridB = songB.beatGridPath != null && java.io.File(songB.beatGridPath).exists()
-                          
-                          if (!hasGridA || !hasGridB) {
-                               // Try Simple Grid?
-                               if (songA.displayBpm == null || songB.displayBpm == null) {
-                                   Log.w(TAG, "Transition exists but missing BeatGrids/BPM. Optimistic monitoring.")
-                               }
-                          }
-                     }
-     
-                     // Pre-warm the secondary deck (player only, no beats yet)
-                     val nextSong = queueBoard.peekNext() 
-                     
-                     if (nextSong != null && nextSong.id == nextId) {
-                         val bpmA = songA?.displayBpm ?: 120f 
-                         val bpmB = songB?.displayBpm ?: 120f
-                         val speedRatio = if (transition.syncTempo && bpmB > 0) bpmA / bpmB else null
-                         
-                         // Incoming-song loudness normalisation for the crossfade.
-                         val nextFormat = database.format(nextId).firstOrNull()
-                         val nextNorm = if (nextFormat?.loudnessDb != null) {
-                             min(10f.pow(-nextFormat.loudnessDb.toFloat() / 20), 1f)
-                         } else 1f
+            val songA = database.song(currentId).firstOrNull()?.song
+            val songB = database.song(nextId).firstOrNull()?.song
+            val bpmA = songA?.displayBpm
+            val bpmB = songB?.displayBpm
+            val speedRatio = if (transition.syncTempo && bpmA != null && bpmB != null && bpmB > 0) {
+                transition.initialSpeedB?.toFloat() ?: (bpmA / bpmB)
+            } else null
 
-                         val mediaItem = nextSong.toMediaItem()
-                         
-                         // Approximate start time (Entry Point - 3s) since we don't have accurate grid yet
-                         val startMs = (transition.entryPointMs - 3000).coerceAtLeast(0)
-     
-                         withContext(Dispatchers.Main) {
-                             if (!deckManager.standbyDeck.isPlaying) {
-                                 deckManager.prepareNext(mediaItem, startMs, speedRatio)
-                                 deckManager.setStandbyVolumeMultiplier(nextNorm)
-                             }
-                         }
+            // Load the standby deck a few seconds before the entry point, paused, so the
+            // transition starts from buffered audio.
+            val startMs = (transition.entryPointMs - PLL_LEAD_MS).coerceAtLeast(0)
+            if (deckManager.standbyDeck.isPlaying) return@launch
+            deckManager.prepareNext(nextSong.toMediaItem(), startMs, speedRatio)
 
-                         // Standby deck warmed; the state machine can now arm on approach.
-                         if (phase == MixPhase.IDLE) phase = MixPhase.PREFETCH
-                     }
-             }
+            currentTransitionCache = transition
+            phase = MixPhase.PREFETCH
         }
     }
-    
-    // Copied from MusicService
-    private fun loadGrid(song: SongEntity, rangeStart: Long? = null, rangeEnd: Long? = null): List<Double>? {
-         if (song.beatGridPath != null) {
-             try {
-                 val loaded = AudioDecoder.loadBeatGrid(File(song.beatGridPath), rangeStart, rangeEnd)
-                 return loaded?.map { it.toDouble() / 1000.0 }
-             } catch (e: Exception) { return null }
-         }
-         return generateSimpleGrid(song)
+
+    private fun loadGrid(song: SongEntity): List<Double>? {
+        if (song.beatGridPath != null) {
+            try {
+                return AudioDecoder.loadBeatGrid(File(song.beatGridPath))?.map { it.toDouble() / 1000.0 }
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to load beat grid for ${song.id}", e)
+                return null
+            }
+        }
+        return generateSimpleGrid(song)
     }
 
     private fun generateSimpleGrid(song: SongEntity): List<Double>? {
-        val bpm = song.displayBpm ?: 0f
-        val firstBeat = (song.firstBeatMs ?: 0L) / 1000.0
+        val bpm = song.displayBpm ?: return null
+        if (bpm <= 0.1f || song.duration <= 0) return null
+
         val beatDur = 60.0 / bpm
-
-        if (bpm <= 0.1f) return null
-
-        val dbDuration = if (song.duration > 0) song.duration.toDouble() else 0.0
-        
-        if (dbDuration <= 0.1) return null
-
         val grid = mutableListOf<Double>()
-        var t = firstBeat
-        if (beatDur <= 0.0) return null
-
-        while (t < dbDuration) {
+        var t = (song.firstBeatMs ?: 0L) / 1000.0
+        while (t < song.duration) {
             grid.add(t)
             t += beatDur
         }
-        
-        if (grid.isEmpty()) return null
-        
-        return grid
+        return grid.ifEmpty { null }
     }
 }

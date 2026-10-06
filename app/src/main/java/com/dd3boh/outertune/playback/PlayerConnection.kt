@@ -83,7 +83,6 @@ class PlayerConnection(
         }
     }
 
-    private val currentMediaItemIndex = MutableStateFlow(-1)
 
     val queueWindows = MutableStateFlow<List<Timeline.Window>>(emptyList())
 
@@ -120,24 +119,15 @@ class PlayerConnection(
                     
                     // Queue info
                     queueWindows.value = newPlayer.getQueueWindows()
-                    // currentMediaItemIndex.value = newPlayer.currentMediaItemIndex // DON'T USE PLAYER INDEX (Decks = 0)
                     currentWindowIndex.value = newPlayer.getCurrentQueueIndex()
                     
                     error.value = newPlayer.playerError
                 }
             }
         }
-        
-        // Bind logical index
-        scope.launch {
-            service.logicalIndex.collect {
-                currentMediaItemIndex.value = it
-            }
-        }
     
         // Initial sync 
          queuePlaylistId.value = service.queuePlaylistId
-         currentMediaItemIndex.value = service.queueBoard.getCurrentQueue()?.queuePos ?: 0
     }
 
     fun playQueue(
@@ -160,6 +150,10 @@ class PlayerConnection(
 
     fun seekToLogical(positionMs: Long) {
         service.seekToLogical(positionMs)
+    }
+
+    fun seekByLogical(deltaMs: Long) {
+        service.seekByLogical(deltaMs)
     }
 
     /**
@@ -205,7 +199,6 @@ class PlayerConnection(
 
     override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
         mediaMetadata.value = mediaItem?.metadata
-        // currentMediaItemIndex.value = player.currentMediaItemIndex // Controlled by service.logicalIndex
         currentWindowIndex.value = player.getCurrentQueueIndex()
         updateCanSkipPreviousAndNext()
     }
@@ -213,7 +206,6 @@ class PlayerConnection(
     override fun onTimelineChanged(timeline: Timeline, reason: Int) {
         queueWindows.value = player.getQueueWindows()
         queuePlaylistId.value = service.queuePlaylistId
-        // currentMediaItemIndex.value = player.currentMediaItemIndex // Controlled by service.logicalIndex
         currentWindowIndex.value = player.getCurrentQueueIndex()
         updateCanSkipPreviousAndNext()
     }

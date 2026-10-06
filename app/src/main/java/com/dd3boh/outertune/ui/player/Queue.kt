@@ -1018,7 +1018,7 @@ fun BoxScope.QueueContent(
                                     .size(32.dp)
                                     .align(Alignment.Center),
                                 onClick = {
-                                    playerConnection.player.seekTo(playerConnection.player.currentPosition - seekIncrement.millisec)
+                                    playerConnection.seekByLogical(-seekIncrement.millisec.toLong())
                                 }
                             )
                         }
@@ -1057,7 +1057,7 @@ fun BoxScope.QueueContent(
                                     .size(32.dp)
                                     .align(Alignment.Center),
                                 onClick = {
-                                    playerConnection.player.seekTo(playerConnection.player.currentPosition + seekIncrement.millisec)
+                                    playerConnection.seekByLogical(seekIncrement.millisec.toLong())
                                 }
                             )
                         }

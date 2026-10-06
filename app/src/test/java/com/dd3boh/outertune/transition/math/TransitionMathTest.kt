@@ -51,6 +51,34 @@ class TransitionMathTest {
     }
 
     @Test
+    fun `duplicate beats never produce NaN`() {
+        val grid = listOf(0.0, 0.5, 0.5, 1.0, 1.5)
+        for (t in listOf(0.5, 0.6, -1.0, 3.0)) {
+            val beat = TransitionMath.getBeatForTimestamp(grid, t)
+            assertTrue("t=$t gave $beat", beat.isFinite())
+        }
+        val flatEnd = listOf(0.0, 0.5, 1.0, 1.0)
+        assertTrue(TransitionMath.getBeatForTimestamp(flatEnd, 2.0).isFinite())
+    }
+
+    @Test
+    fun `duration is measured on the grid at the anchor, not from the first interval`() {
+        // 120 BPM for the first 32 beats, then 128 BPM.
+        val slow = List(32) { it * 0.5 }
+        val fastInterval = 60.0 / 128.0
+        val gridA = slow + List(96) { slow.last() + (it + 1) * fastInterval }
+        val gridB = List(128) { it * 0.5 }
+
+        val plan = TransitionMath.calculatePlan(
+            gridA, gridB, 128f, 128f,
+            offsetBeatsA = 40.0, offsetBeatsB = 8.0,
+            config = TransitionConfig(barsCount = 4, widthFraction = 1.0f)
+        )!!
+
+        assertEquals((16 * fastInterval * 1000).toLong(), plan.durationMs)
+    }
+
+    @Test
     fun `empty grid helpers are total`() {
         assertEquals(0.0, TransitionMath.getBeatForTimestamp(emptyList(), 5.0), 0.0)
         assertEquals(0.0, TransitionMath.getTimestampForBeat(emptyList(), 5.0), 0.0)

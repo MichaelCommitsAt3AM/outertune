@@ -75,9 +75,10 @@ object TransitionMath {
         val entryPointMs = (getTimestampForBeat(gridB, internalBeatB) * 1000).toLong()
 
         // 5. Calculate Duration
-        // Duration is derived from Track A's grid speed at the transition point to ensure alignment.
-        val intervalA = if (gridA.size > 1) gridA[1] - gridA[0] else 0.5
-        val durationMs = (beatsInZone * intervalA * 1000).toLong()
+        // The wall-clock length of the zone on Track A, measured on A's grid from the anchor.
+        // Using the local grid (not the first interval of the file) keeps it right when tempo varies.
+        val durationMs = ((getTimestampForBeat(gridA, anchorBeatA + beatsInZone) -
+                getTimestampForBeat(gridA, anchorBeatA)) * 1000).toLong()
 
         return TransitionPlan(
             initialSpeedB = syncParams.speedMultiplier,
@@ -178,18 +179,20 @@ object TransitionMath {
 
         // Extrapolate before start
         if (idx < 0) {
-            val step = if (grid.size > 1) grid[1] - grid[0] else 0.5
+            val step = (if (grid.size > 1) grid[1] - grid[0] else 0.5).takeIf { it > 0 } ?: 0.5
             return (time - grid[0]) / step
         }
         // Extrapolate after end
         if (idx >= grid.size - 1) {
-            val step = if (grid.size > 1) grid[grid.size - 1] - grid[grid.size - 2] else 0.5
+            val step = (if (grid.size > 1) grid[grid.size - 1] - grid[grid.size - 2] else 0.5).takeIf { it > 0 } ?: 0.5
             return (grid.size - 1) + (time - grid.last()) / step
         }
 
-        // Interpolate inside grid
+        // Interpolate inside grid. A zero-length interval (duplicate beat) would divide by zero
+        // and push NaN into the player's speed, so treat it as landing on the beat.
         val t1 = grid[idx]
         val t2 = grid[idx + 1]
+        if (t2 <= t1) return idx.toDouble()
         val fraction = (time - t1) / (t2 - t1)
         return idx + fraction
     }

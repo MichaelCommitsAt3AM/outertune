@@ -114,6 +114,7 @@ import com.dd3boh.outertune.playback.queues.ListQueue
 import com.dd3boh.outertune.playback.queues.Queue
 import com.dd3boh.outertune.playback.queues.YouTubeQueue
 import com.dd3boh.outertune.utils.CoilBitmapLoader
+import com.dd3boh.outertune.utils.LoudnessNormalization
 import com.dd3boh.outertune.utils.NetworkConnectivityObserver
 import com.dd3boh.outertune.utils.SyncUtils
 import com.dd3boh.outertune.utils.YTPlayerUtils
@@ -156,7 +157,6 @@ import javax.inject.Inject
 import kotlin.math.min
 import kotlin.math.pow
 
-import androidx.compose.runtime.snapshotFlow
 import kotlinx.coroutines.flow.filterNotNull
 
 @OptIn(ExperimentalCoroutinesApi::class, FlowPreview::class)
@@ -228,12 +228,6 @@ class MusicService : MediaLibraryService(),
     private val _activePlayer = MutableStateFlow<ExoPlayer?>(null)
     val activePlayer = _activePlayer.asStateFlow()
 
-    private val _logicalIndex = MutableStateFlow(0)
-    val logicalIndex = _logicalIndex.asStateFlow()
-
-    // Cache the transition for the CURRENT song to avoid DB hits every tick
-    private var currentTransitionCache: TransitionEntity? = null
-
     private val currentSong = currentMediaMetadata.flatMapLatest { mediaMetadata ->
         database.song(mediaMetadata?.id)
     }.stateIn(offloadScope, SharingStarted.Lazily, null)
@@ -242,9 +236,13 @@ class MusicService : MediaLibraryService(),
         database.format(mediaMetadata?.id)
     }
 
-    private val normalizeFactor = MutableStateFlow(1f)
+    /** Loudness-normalization gain, tagged with the song it was computed for. */
+    private val normalizeFactor = MutableStateFlow<Pair<String?, Float>>(null to 1f)
 
-    private var playbackEngine: PlaybackEngine? = null
+    /** The engine in use. A flow so the media session, volume and listeners follow engine switches. */
+    private val engineFlow = MutableStateFlow<PlaybackEngine?>(null)
+    private val playbackEngine: PlaybackEngine?
+        get() = engineFlow.value
 
     private val audioDecoder = dataStore.get(AudioDecoderKey, DefaultRenderersFactory.EXTENSION_RENDERER_MODE_OFF)
     private val isGaplessOffloadAllowed = dataStore.get(AudioGaplessOffloadKey, false)
@@ -253,7 +251,8 @@ class MusicService : MediaLibraryService(),
     private var isAudioEffectSessionOpened = false
 
     var consecutivePlaybackErr = 0
-    @Volatile private var isActiveDeckPlaying = false
+    private val isActivePlayerPlaying = MutableStateFlow(false)
+    private var skipSilenceEnabled = false
 
     override fun onCreate() {
         Log.i(TAG, "Starting MusicService")
@@ -264,66 +263,36 @@ class MusicService : MediaLibraryService(),
         fakePlayer = createExoPlayer() // Temporary for initialization
         Log.i(TAG, "MusicService: createExoPlayer took ${System.currentTimeMillis() - t0}ms")
 
-        val t1 = System.currentTimeMillis()
-        playbackEngine = SimplePlaybackEngine(fakePlayer!!)
+        engineFlow.value = SimplePlaybackEngine(fakePlayer!!)
         _activePlayer.value = fakePlayer
-        Log.i(TAG, "MusicService: SimplePlaybackEngine init took ${System.currentTimeMillis() - t1}ms")
+        sleepTimer = SleepTimer(scope, fakePlayer!!)
 
-        // Listen to active player changes
+        // Everything bound to "the player the user hears" follows the active player, whether it
+        // changes because the engine was switched or because the mix engine swapped decks.
         scope.launch {
-             snapshotFlow { playbackEngine }
+            var lastEngine: PlaybackEngine? = null
+            engineFlow
                 .filterNotNull()
-                .flatMapLatest { it.activePlayer }
-                .collect { player ->
-                    _activePlayer.value = player
-                    mediaSession.player = player
-
-                    // Note: Queue advancement and Metadata updates for MIX mode are handled by MixPlaybackEngine
-                    // But for Simple Mode, we need to ensure things are synced.
-                    // Actually, simple flow:
-                    // Engine updates ActivePlayer -> Service updates Session.
-                    // Metadata update:
-                    currentMediaMetadata.value = player.currentMetadata
+                .flatMapLatest { engine -> engine.activePlayer.map { engine to it } }
+                .collect { (engine, newPlayer) ->
+                    val previous = _activePlayer.value
+                    val isDeckSwap = engine === lastEngine && previous != null && previous !== newPlayer
+                    lastEngine = engine
+                    onActivePlayerChanged(previous, newPlayer, isDeckSwap)
                 }
         }
 
-        // Attach listeners (Moved from DeckManager/Player init)
-        // Note: SimplePlaybackEngine's player needs listeners.
-        // We really should attach listeners inside the engines or have a common setup.
-        // For now, let's attach to the *active* player whenever it changes?
-        // Or better: Use the PlaybackEngine to manage listeners?
-        // SimplePlaybackEngine wraps a player.
-        // Let's add listeners to the initial player.
-        fakePlayer!!.addListener(this)
+        // Normal playback has no engine poller, so tick the logical position while playing.
+        combine(engineFlow, isActivePlayerPlaying) { engine, playing -> engine !is MixPlaybackEngine && playing }
+            .distinctUntilChanged()
+            .collectLatest(scope) { tick ->
+                publishSimpleLogicalState()
+                while (tick) {
+                    delay(LOGICAL_POSITION_TICK_MS)
+                    publishSimpleLogicalState()
+                }
+            }
 
-        sleepTimer = SleepTimer(scope, player)
-        // deckManager.addListener(sleepTimer) // TODO: Handle SleepTimer across engines
-
-//        player = ExoPlayer.Builder(this)
-//            .setMediaSourceFactory(DefaultMediaSourceFactory(createDataSourceFactory()))
-//            .setRenderersFactory(createRenderersFactory(isGaplessOffloadAllowed))
-//            .setHandleAudioBecomingNoisy(true)
-//            .setWakeMode(C.WAKE_MODE_NETWORK)
-//            .setAudioAttributes(
-//                AudioAttributes.Builder()
-//                    .setUsage(C.USAGE_MEDIA)
-//                    .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
-//                    .build(), true
-//            )
-//            .setSeekBackIncrementMs(5000)
-//            .setSeekForwardIncrementMs(5000)
-//            .build()
-//            .apply {
-//                // listeners
-//                addListener(this@MusicService)
-//                sleepTimer = SleepTimer(scope, this)
-//                addListener(sleepTimer)
-//                addAnalyticsListener(PlaybackStatsListener(false, this@MusicService))
-//
-//                // misc
-//                setOffloadEnabled(dataStore.get(AudioOffloadKey, false))
-//            }
-//
         mediaLibrarySessionCallback.apply {
             service = this@MusicService
             toggleLike = ::toggleLike
@@ -380,12 +349,20 @@ class MusicService : MediaLibraryService(),
             }
             Log.i(TAG, "MusicService: initQueue (bg) took ${System.currentTimeMillis() - t3}ms")
 
-            combine(playerVolume, normalizeFactor, playbackEngine!!.isCrossfading) { playerVolume, normalizeFactor, isCrossing ->
+            combine(
+                playerVolume,
+                normalizeFactor,
+                engineFlow.filterNotNull().flatMapLatest { it.isCrossfading },
+                activePlayer,
+            ) { playerVolume, normalizeFactor, isCrossing, _ ->
                 Triple(playerVolume, normalizeFactor, isCrossing)
             }.collectLatest(scope) { (playerVolume, normalizeFactor, isCrossing) ->
                 withContext(Dispatchers.Main) {
-                    if (!isCrossing) {
-                        player.volume = playerVolume * normalizeFactor
+                    val (songId, factor) = normalizeFactor
+                    // During a crossfade the mix engine owns both decks' volumes. Right after a
+                    // song change the factor may still be the previous song's; wait for its own.
+                    if (!isCrossing && songId == player.currentMediaItem?.mediaId) {
+                        player.volume = playerVolume * factor
                     }
                 }
             }
@@ -401,6 +378,7 @@ class MusicService : MediaLibraryService(),
                 .distinctUntilChanged()
                 .collectLatest(scope) {
                     withContext(Dispatchers.Main) {
+                        skipSilenceEnabled = it
                         player.skipSilenceEnabled = it
                     }
                 }
@@ -409,16 +387,17 @@ class MusicService : MediaLibraryService(),
                 currentFormat,
                 dataStore.data
                     .map { it[AudioNormalizationKey] ?: true }
-                    .distinctUntilChanged()
-            ) { format, normalizeAudio ->
-                format to normalizeAudio
-            }.collectLatest(scope) { (format, normalizeAudio) ->
-                normalizeFactor.value = if (normalizeAudio && format?.loudnessDb != null) {
-                    min(10f.pow(-format.loudnessDb.toFloat() / 20), 1f)
-                } else {
-                    // Safe default: 0.5f (-6dB) to prevent volume bursts while loading format
-                    0.5f
-                }
+                    .distinctUntilChanged(),
+                currentMediaMetadata,
+            ) { format, normalizeAudio, metadata ->
+                metadata?.id to LoudnessNormalization.factor(
+                    enabled = normalizeAudio,
+                    formatKnown = format?.id == metadata?.id && format != null,
+                    loudnessDb = format?.loudnessDb?.takeIf { format.id == metadata?.id },
+                    isLocal = metadata?.isLocal == true,
+                )
+            }.collectLatest(scope) { factor ->
+                normalizeFactor.value = factor
             }
 
 
@@ -460,16 +439,107 @@ class MusicService : MediaLibraryService(),
                 AudioAttributes.Builder()
                     .setUsage(C.USAGE_MEDIA)
                     .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
-                    .build(), false
+                    .build(), true
             )
             .setSeekBackIncrementMs(5000)
             .setSeekForwardIncrementMs(5000)
             .build()
             .apply {
-                // Note: We don't add listeners here anymore,
-                // we add them to DeckManager in onCreate
                 setOffloadEnabled(dataStore.get(AudioOffloadKey, false))
+                configurePlayer(this)
             }
+    }
+
+    /** Attaches the service's listeners to a newly built player (normal player or mix deck). */
+    private fun configurePlayer(player: ExoPlayer) {
+        player.addListener(this)
+        player.addAnalyticsListener(PlaybackStatsListener(false, this))
+    }
+
+    /**
+     * Rebinds everything that follows the player the user hears. [isDeckSwap] is true when the
+     * mix engine handed over to its other deck at the end of a transition.
+     */
+    private fun onActivePlayerChanged(previous: ExoPlayer?, newPlayer: ExoPlayer, isDeckSwap: Boolean) {
+        _activePlayer.value = newPlayer
+        if (::mediaSession.isInitialized && mediaSession.player !== newPlayer) {
+            mediaSession.player = newPlayer
+        }
+        currentMediaMetadata.value = newPlayer.currentMetadata
+        newPlayer.skipSilenceEnabled = skipSilenceEnabled
+        if (previous != null && previous !== newPlayer) {
+            newPlayer.repeatMode = previous.repeatMode
+        }
+        isActivePlayerPlaying.value = newPlayer.isPlaying
+        sleepTimer.bind(newPlayer)
+        // A deck swap is the end of the outgoing song.
+        if (isDeckSwap) sleepTimer.onSongEnded()
+    }
+
+    /**
+     * Replaces the playback engine. The new player is handed to the media session before the old
+     * one is released, so the session never points at a released player.
+     */
+    private fun switchEngine(mix: Boolean) {
+        Log.i(TAG, "Switching Playback Engine: MixMode=$mix")
+        val old = playbackEngine
+        val oldPlayer = old?.activePlayer?.value
+
+        val newEngine: PlaybackEngine = if (mix) {
+            var mixEngine: MixPlaybackEngine? = null
+            val deckManager = DeckManager(
+                context = this,
+                dataSourceFactoryProvider = ::createDataSourceFactory,
+                extensionRendererMode = audioDecoder,
+                onPlayerCreated = ::configurePlayer,
+                onActiveDeckChanged = { player -> mixEngine?.onActiveDeckChanged(player) },
+            )
+            MixPlaybackEngine(
+                deckManager,
+                scope,
+                database,
+                transitionDao,
+                queueBoard,
+                targetGainFor = ::targetGainFor,
+            ) { state -> _logicalState.value = state }.also { mixEngine = it }
+        } else {
+            SimplePlaybackEngine(createExoPlayer())
+        }
+
+        val newPlayer = newEngine.activePlayer.value
+        oldPlayer?.let { newPlayer.repeatMode = it.repeatMode }
+        onActivePlayerChanged(oldPlayer, newPlayer, isDeckSwap = false)
+        engineFlow.value = newEngine
+        newEngine.start()
+
+        try {
+            old?.destroy()
+        } catch (e: Exception) {
+            reportException(e)
+        }
+    }
+
+    /** Logical state for normal playback, where it simply mirrors the player. */
+    private fun publishSimpleLogicalState() {
+        if (playbackEngine is MixPlaybackEngine) return
+        val p = player
+        p.currentMetadata?.let { metadata ->
+            _logicalState.value = LogicalPlayerState(
+                activeMetadata = metadata,
+                currentPositionMs = p.currentPosition,
+                durationMs = p.duration,
+                isTransitionActive = false
+            )
+        }
+    }
+
+    /** Volume a song should play at once it's the active one: normalization × user volume. */
+    private suspend fun targetGainFor(songId: String): Float {
+        val normalize = dataStore.data.map { it[AudioNormalizationKey] ?: true }.first()
+        val format = database.format(songId).first()
+        val isLocal = database.song(songId).first()?.song?.isLocal == true
+        return LoudnessNormalization.factor(normalize, format != null, format?.loudnessDb, isLocal) *
+                playerVolume.value
     }
 
     private suspend fun recoverSong(mediaId: String, playbackData: YTPlayerUtils.PlaybackData? = null) {
@@ -559,50 +629,7 @@ class MusicService : MediaLibraryService(),
             }
         }
 
-        // --- Engine Switching Logic (Hard Reset) ---
-        val targetEngineIsMix = isMixMode
-        val currentEngineIsMix = playbackEngine is MixPlaybackEngine
-
-        if (targetEngineIsMix != currentEngineIsMix) {
-            Log.i(TAG, "Switching Playback Engine: MixMode=$targetEngineIsMix")
-            // Destroy current
-            try {
-                playbackEngine?.destroy()
-            } catch (e: Exception) { e.printStackTrace() }
-
-            // Create new
-            if (targetEngineIsMix) {
-                 var mixEngine: MixPlaybackEngine? = null
-                 val deckManager = DeckManager(this, ::createDataSourceFactory) { player ->
-                    mixEngine?.onActiveDeckChanged(player)
-                 }
-                 deckManager.addListener(this) // Attach service as listener too? Or rely on ActivePlayer flow?
-                 // Service needs events like playbackStateChanged.
-                 // DeckManager forwards events.
-
-                 mixEngine = MixPlaybackEngine(
-                    deckManager,
-                    scope,
-                    database,
-                    transitionDao,
-                    queueBoard
-                 ) { state -> _logicalState.value = state }
-
-                 playbackEngine = mixEngine
-            } else {
-                val newPlayer = createExoPlayer()
-                newPlayer.addListener(this)
-                playbackEngine = SimplePlaybackEngine(newPlayer)
-            }
-            playbackEngine?.start()
-
-            // Force update flows
-            _activePlayer.value = playbackEngine?.activePlayer?.value
-            // Restore SleepTimer listener if needed?
-            // SleepTimer takes `player` which is now new.
-            // TODO: SleepTimer logic might need update.
-        }
-        // -------------------------------------------
+        if (isMixMode != (playbackEngine is MixPlaybackEngine)) switchEngine(isMixMode)
 
         var queueTitle = title
         queuePlaylistId = queue.playlistId
@@ -806,8 +833,10 @@ class MusicService : MediaLibraryService(),
      *  (non-empty only for a yt-dlp-sourced stream — see YtDlpStreamResolver). */
     private data class CachedStreamUrl(val url: String, val expiresAt: Long, val headers: Map<String, String>)
 
+    /** Shared by every player (both mix decks too), and written from their loader threads. */
+    private val songUrlCache = java.util.concurrent.ConcurrentHashMap<String, CachedStreamUrl>()
+
     fun createDataSourceFactory(): DataSource.Factory {
-        val songUrlCache = HashMap<String, CachedStreamUrl>()
         return ResolvingDataSource.Factory(createCacheDataSource()) { dataSpec ->
             val mediaId = dataSpec.key ?: error("No media id")
             Log.d(TAG, "PLAYING: song id = $mediaId")
@@ -1219,7 +1248,7 @@ class MusicService : MediaLibraryService(),
 
     override fun onEvents(player: Player, events: Player.Events) {
         if (player != playbackEngine?.activePlayer?.value) return
-        isActiveDeckPlaying = player.isPlaying
+        isActivePlayerPlaying.value = player.isPlaying
 
         if (events.containsAny(Player.EVENT_PLAYBACK_STATE_CHANGED, Player.EVENT_PLAY_WHEN_READY_CHANGED)) {
             val isBufferingOrReady =
@@ -1235,18 +1264,8 @@ class MusicService : MediaLibraryService(),
         }
         if (events.containsAny(EVENT_TIMELINE_CHANGED, EVENT_POSITION_DISCONTINUITY)) {
             currentMediaMetadata.value = player.currentMetadata
-            
-            // Update logical state for Simple mode (Mix mode handles its own state)
-            if (playbackEngine !is MixPlaybackEngine) {
-                player.currentMetadata?.let { metadata ->
-                    _logicalState.value = LogicalPlayerState(
-                        activeMetadata = metadata,
-                        currentPositionMs = player.currentPosition,
-                        durationMs = player.duration,
-                        isTransitionActive = false
-                    )
-                }
-            }
+            // Mix mode publishes its own logical state.
+            publishSimpleLogicalState()
         }
     }
 
@@ -1303,6 +1322,12 @@ class MusicService : MediaLibraryService(),
         playbackEngine?.seekTo(newPositionMs)
     }
 
+    /** Seeks relative to the position the user sees (which, mid-transition, may be the incoming song). */
+    fun seekByLogical(deltaMs: Long) {
+        val base = if (playbackEngine is MixPlaybackEngine) _logicalState.value.currentPositionMs else player.currentPosition
+        seekToLogical((base + deltaMs).coerceAtLeast(0))
+    }
+
     override fun onRepeatModeChanged(repeatMode: Int) {
         updateNotification()
         offloadScope.launch {
@@ -1336,8 +1361,7 @@ class MusicService : MediaLibraryService(),
 
         mediaSession.player.stop()
         mediaSession.release()
-        mediaSession.player.release()
-        // deckManager.release() // Removed
+        // The engine owns (and releases) every player, including the session's.
         playbackEngine?.destroy()
         super.onDestroy()
         Log.i(TAG, "Terminated MusicService.")
@@ -1364,6 +1388,8 @@ class MusicService : MediaLibraryService(),
     }
 
     companion object {
+        /** How often normal playback refreshes the position shown in the full player. */
+        private const val LOGICAL_POSITION_TICK_MS = 500L
         const val ROOT = "root"
         const val SONG = "song"
         const val ARTIST = "artist"

@@ -51,13 +51,13 @@ sealed class TransitionState {
             return if (seconds % 1.0 == 0.0) {
                 "${seconds.toInt()}s"
             } else {
-                String.format("%.1fs", seconds)
+                String.format(java.util.Locale.ROOT, "%.1fs", seconds)
             }
         }
 
         /**
          * Returns true if this is a manually created transition.
          */
-        fun isManual(): Boolean = type == 0 // TYPE_MANUAL from TransitionEntity
+        fun isManual(): Boolean = type == com.dd3boh.outertune.db.entities.TransitionEntity.TYPE_MANUAL
     }
 }

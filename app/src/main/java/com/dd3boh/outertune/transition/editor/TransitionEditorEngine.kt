@@ -51,7 +51,10 @@ class TransitionEditorEngine(
             val durB = loadExactDuration(songBId) ?: songB.song.duration.toDouble()
 
             // 3. Load & Normalize Grids
-            val (gridA, gridB, scalarB) = loadAndNormalizeGrids(songA, songB, durA, durB)
+            val (gridA, gridB, scalarB) = loadAndNormalizeGrids(songA, songB, durA, durB) ?: run {
+                Log.w(TAG, "Songs have not been analysed (no BPM)")
+                return@withContext null
+            }
 
             // 4. Load & Process Waveforms
             // We use a fixed density for visualization (64 samples per beat)
@@ -98,7 +101,10 @@ class TransitionEditorEngine(
         songB: Song,
         durA: Double,
         durB: Double
-    ): Triple<List<Double>, List<Double>, Double> {
+    ): Triple<List<Double>, List<Double>, Double>? {
+        val displayBpmA = songA.song.displayBpm ?: return null
+        val displayBpmB = songB.song.displayBpm ?: return null
+
         // Load raw grids from disk
         val rawA = loadBeatGridDouble(songA.song.beatGridPath, songA.id)
         val rawB = loadBeatGridDouble(songB.song.beatGridPath, songB.id)
@@ -106,14 +112,14 @@ class TransitionEditorEngine(
         // Run Normalizer (Fixes missing beats, phase drift, etc)
         val dualA = BeatGridNormalizer.resolveDjGrids(
             detectedGrid = rawA.map { it.toFloat() },
-            analysisBpm = songA.song.bpm!!,
-            displayBpm = songA.song.displayBpm!!,
+            analysisBpm = songA.song.bpm ?: displayBpmA,
+            displayBpm = displayBpmA,
             durationSec = durA.toFloat()
         )
         val dualB = BeatGridNormalizer.resolveDjGrids(
             detectedGrid = rawB.map { it.toFloat() },
-            analysisBpm = songB.song.bpm!!,
-            displayBpm = songB.song.displayBpm!!,
+            analysisBpm = songB.song.bpm ?: displayBpmB,
+            displayBpm = displayBpmB,
             durationSec = durB.toFloat()
         )
 
@@ -122,7 +128,7 @@ class TransitionEditorEngine(
 
         // Determine Scalar for Track B (Interval Match decision)
         // This logic mirrors TransitionMath but is needed here for Waveform Generation
-        val bpmDiff = abs(songA.song.displayBpm - songB.song.displayBpm)
+        val bpmDiff = abs(displayBpmA - displayBpmB)
         val scalarB: Double
 
         if (bpmDiff <= 15f) {

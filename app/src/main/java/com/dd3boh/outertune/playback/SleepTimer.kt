@@ -14,8 +14,31 @@ import kotlin.time.Duration.Companion.minutes
 
 class SleepTimer(
     private val scope: CoroutineScope,
-    val player: Player,
+    player: Player,
 ) : Player.Listener {
+    /** The player the user hears; follows engine switches and mix deck swaps via [bind]. */
+    var player: Player = player
+        private set
+
+    init {
+        player.addListener(this)
+    }
+
+    fun bind(newPlayer: Player) {
+        if (newPlayer === player) return
+        player.removeListener(this)
+        player = newPlayer
+        newPlayer.addListener(this)
+    }
+
+    /** Called when a song ends without a media item transition (a mix deck swap). */
+    fun onSongEnded() {
+        if (pauseWhenSongEnd) {
+            pauseWhenSongEnd = false
+            player.pause()
+        }
+    }
+
     private var sleepTimerJob: Job? = null
     var triggerTime by mutableLongStateOf(-1L)
         private set
@@ -47,10 +70,7 @@ class SleepTimer(
     }
 
     override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
-        if (pauseWhenSongEnd) {
-            pauseWhenSongEnd = false
-            player.pause()
-        }
+        onSongEnded()
     }
 
     override fun onPlaybackStateChanged(@Player.State playbackState: Int) {
