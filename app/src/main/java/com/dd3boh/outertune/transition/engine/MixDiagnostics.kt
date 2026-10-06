@@ -1,6 +1,5 @@
 package com.dd3boh.outertune.transition.engine
 
-import com.dd3boh.outertune.utils.DebugLog
 import kotlin.math.abs
 import kotlin.math.sqrt
 
@@ -37,7 +36,9 @@ class MixDiagnostics(private val tag: String, private val label: String) {
 
     fun finish(outcome: String) {
         val rms = if (crossfadeSamples > 0) sqrt(sumSqCrossfadeError / crossfadeSamples) else 0.0
-        DebugLog.i(
+        // Logged in every build type: one line per transition, and needed to judge beatmatching
+        // on real devices (profile builds included).
+        android.util.Log.i(
             tag,
             "[$label] outcome=$outcome unmuteErr=${unmuteError?.let { "%.3f".format(it) } ?: "n/a"} " +
                     "maxErr=${"%.3f".format(maxCrossfadeError)} rmsErr=${"%.3f".format(rms)} " +

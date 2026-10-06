@@ -175,8 +175,8 @@ fun BottomSheetPlayer(
     val context = LocalContext.current
 
     val playbackState by playerConnection.playbackState.collectAsState()
-    val logicalState by playerConnection.logicalState.collectAsState()
-    val mediaMetadata = logicalState.activeMetadata ?: playerConnection.mediaMetadata.collectAsState().value
+    val mediaMetadata = playerConnection.mediaMetadata.collectAsState().value
+    val seekEvents by playerConnection.seekEvents.collectAsState()
     val isPlaying by playerConnection.isPlaying.collectAsState()
     val repeatMode by playerConnection.repeatMode.collectAsState()
     val currentSong by playerConnection.currentSong.collectAsState(initial = null)
@@ -230,16 +230,16 @@ fun BottomSheetPlayer(
     val showLyrics by rememberPreference(ShowLyricsKey, defaultValue = false)
 
     // The service doesn't push position; read it while this sheet is composed. Restarting on
-    // logicalState refreshes it right after seeks, song changes and the transition midpoint.
-    var position by remember { mutableLongStateOf(playerConnection.logicalPositionMs()) }
-    var duration by remember { mutableLongStateOf(playerConnection.logicalDurationMs()) }
+    // the song or a seek refreshes it at once, even while paused.
+    var position by remember { mutableLongStateOf(playerConnection.player.currentPosition) }
+    var duration by remember { mutableLongStateOf(playerConnection.player.duration) }
     // Only while the app is on screen: the sheet stays composed in the background.
     val lifecycleOwner = LocalLifecycleOwner.current
-    LaunchedEffect(isPlaying, logicalState, lifecycleOwner) {
+    LaunchedEffect(isPlaying, mediaMetadata, seekEvents, lifecycleOwner) {
         lifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
             do {
-                position = playerConnection.logicalPositionMs()
-                duration = playerConnection.logicalDurationMs()
+                position = playerConnection.player.currentPosition
+                duration = playerConnection.player.duration
                 if (isPlaying) delay(POSITION_POLL_MS)
             } while (isPlaying)
         }
@@ -516,7 +516,7 @@ fun BottomSheetPlayer(
                     },
                     onValueChangeFinished = {
                         sliderPosition?.let { targetMs ->
-                            playerConnection.seekToLogical(targetMs)
+                            playerConnection.player.seekTo(targetMs)
                         }
                         sliderPosition = null
                         haptic.performHapticFeedback(HapticFeedbackType.Confirm)
@@ -609,7 +609,7 @@ fun BottomSheetPlayer(
                                 color = onBackgroundColor,
                                 enabled = playerConnection.player.currentMediaItem != null,
                                 onClick = {
-                                    playerConnection.seekByLogical(-seekIncrement.millisec.toLong())
+                                    playerConnection.seekBy(-seekIncrement.millisec.toLong())
                                 }
                             )
                         }
@@ -661,7 +661,7 @@ fun BottomSheetPlayer(
                                 onClick = {
                                     //ExoPlayer seek increment can only be set in builder
                                     //playerConnection.player.seekForward()
-                                    playerConnection.seekByLogical(seekIncrement.millisec.toLong())
+                                    playerConnection.seekBy(seekIncrement.millisec.toLong())
                                 }
                             )
                         }

@@ -95,6 +95,8 @@ android {
 //            isDebuggable = true
             isProfileable = true
             matchingFallbacks += listOf("release")
+            // Without a release keystore, sign with the debug key so local builds still install.
+            if (keystoreProperties.isEmpty) signingConfig = signingConfigs.getByName("debug")
         }
     }
 
@@ -316,6 +318,8 @@ dependencies {
 
     // Unit tests (pure-Kotlin logic: transition math, beat-grid normalizer, mixer curves)
     testImplementation(libs.junit)
+    testImplementation(libs.robolectric)
+    testImplementation(libs.androidx.test.core)
 }
 
 afterEvaluate {

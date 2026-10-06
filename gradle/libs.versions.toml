@@ -87,6 +87,8 @@ brotli = { group = "org.brotli", name = "dec", version = "0.1.2" }
 desugaring = { group = "com.android.tools", name = "desugar_jdk_libs", version = "2.1.5" }
 
 junit = { group = "junit", name = "junit", version = "4.13.2" }
+robolectric = { group = "org.robolectric", name = "robolectric", version = "4.17" }
+androidx-test-core = { group = "androidx.test", name = "core", version = "1.7.0" }
 
 # NOTE: upstream pin was commit 4368f2b9bb7ee5b0340a0bc25375e44fe23ab105, GC'd from JitPack.
 # Bumped past upstream OuterTune's v0.25.1 to the latest release to pick up current YouTube
