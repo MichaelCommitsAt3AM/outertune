@@ -42,6 +42,9 @@ class DeckAudioProcessor : BaseAudioProcessor() {
     private var toneMode: EffectMode = EffectMode.NONE
     private var gain = 1f
 
+    /** One block of zeros, for silent blocks. */
+    private var silence = ByteArray(0)
+
     /** The sink is about to hand over a buffer whose first frame is at [presentationTimeUs]. */
     fun onInputBufferStart(presentationTimeUs: Long) {
         anchorUs = presentationTimeUs
@@ -58,6 +61,7 @@ class DeckAudioProcessor : BaseAudioProcessor() {
         sampleRate = inputAudioFormat.sampleRate
         channels = inputAudioFormat.channelCount
         isFloat = inputAudioFormat.encoding == C.ENCODING_PCM_FLOAT
+        silence = ByteArray(BLOCK_FRAMES * (if (isFloat) 4 else 2) * channels)
         bassFilter = Biquad(channels)
         toneFilter = Biquad(channels)
         bassGainDb = 0.0
@@ -83,9 +87,25 @@ class DeckAudioProcessor : BaseAudioProcessor() {
             var done = 0
             while (done < frames) {
                 val block = minOf(BLOCK_FRAMES, frames - done)
+                val bytes = block * bytesPerFrame
                 val state = stateAt(auto, done)
-                updateFilters(state, auto?.effectMode ?: EffectMode.NONE)
-                processBlock(inputBuffer, output, block, gain, state.volume)
+                if (state.volume == 0f && gain == 0f) {
+                    // Silent (B before the zone, A after it): skip the filters, which catch up
+                    // when the gain ramps up again.
+                    inputBuffer.position(inputBuffer.position() + bytes)
+                    output.put(silence, 0, bytes)
+                } else {
+                    updateFilters(state, auto?.effectMode ?: EffectMode.NONE)
+                    if (gain == 1f && state.volume == 1f && bassGainDb == 0.0 && toneMode == EffectMode.NONE) {
+                        // Untouched: copy the block as is.
+                        val limit = inputBuffer.limit()
+                        inputBuffer.limit(inputBuffer.position() + bytes)
+                        output.put(inputBuffer)
+                        inputBuffer.limit(limit)
+                    } else {
+                        processBlock(inputBuffer, output, block, gain, state.volume)
+                    }
+                }
                 gain = state.volume
                 done += block
             }

@@ -16,6 +16,9 @@ object MixTuning {
     /** How far ahead B is seeked, to cover the time the seek itself takes. */
     const val SEEK_LEAD_MS = 50L
 
+    /** B is not re-seeked at the start of a transition if it is already this close to its target. */
+    const val START_SEEK_TOLERANCE_MS = 80L
+
     /** Wait after the initial seek before the first tick reads B's position. */
     const val SEEK_SETTLE_MS = 50L
 
@@ -40,6 +43,9 @@ object MixTuning {
 
     /** Editor preview: Track A starts this long before the preroll, so it is settled when the engine takes over. */
     const val PREVIEW_LEAD_IN_SECONDS = 1.0
+
+    /** Editor preview: Track B plays on alone this long after the zone, so the result can be heard. */
+    const val PREVIEW_TAIL_SECONDS = 4.0
 
     // --- Phase lock (see PhaseController) ---
 

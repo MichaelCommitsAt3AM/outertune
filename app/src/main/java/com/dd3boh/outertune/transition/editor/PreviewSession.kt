@@ -3,10 +3,13 @@ package com.dd3boh.outertune.transition.editor
 import android.content.Context
 import android.net.Uri
 import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
+import androidx.media3.common.Player
 import androidx.media3.datasource.DefaultDataSource
 import com.dd3boh.outertune.R
 import com.dd3boh.outertune.transition.engine.DeckFactory
 import com.dd3boh.outertune.transition.engine.DeckPair
+import com.dd3boh.outertune.transition.engine.MixController
 import com.dd3boh.outertune.transition.engine.ProcessorDeckEffects
 import com.dd3boh.outertune.transition.engine.MixTuning
 import com.dd3boh.outertune.transition.engine.TransitionRenderer
@@ -21,6 +24,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import java.io.File
+import com.dd3boh.outertune.utils.DebugLog as Log
 
 /**
  * Plays a transition preview in the editor with the same [TransitionRenderer] that playlist
@@ -63,7 +67,11 @@ class PreviewSession(
         _ready.value = false
         _error.value = null
 
-        val pair = decks ?: DeckPair(factory).also { decks = it }
+        val pair = decks ?: DeckPair(factory).also { pair ->
+            decks = pair
+            pair.active.addListener(errorListener)
+            pair.standby.addListener(errorListener)
+        }
         pair.active.apply {
             stop()
             setMediaItem(mediaItemFor(pathA))
@@ -102,18 +110,36 @@ class PreviewSession(
                 a.seekTo((prerollStartMs - (MixTuning.PREVIEW_LEAD_IN_SECONDS * 1000).toLong()).coerceAtLeast(0))
                 a.play()
 
+                // Park B where the renderer will want it, as a playlist does when it prepares the
+                // standby deck, so the transition starts from buffered audio instead of a cold seek.
+                val startTarget = MixController(plan, plan.initialSpeedB)
+                    .targetPositionBMs(prerollStartMs.coerceAtLeast(0) + MixTuning.SEEK_LEAD_MS)
+                b.volume = 0f
+                b.playWhenReady = false
+                b.setPlaybackSpeed(plan.initialSpeedB.toFloat())
+                b.seekTo(startTarget)
+
                 // Lead-in: A plays alone until the point where a playlist would start the renderer.
                 while (a.currentPosition < prerollStartMs) {
-                    _state.value = State(
-                        isPlaying = true,
-                        beatA = TransitionMath.getBeatForTimestamp(plan.gridA, a.currentPosition / 1000.0)
-                    )
+                    // A zone past A's end (or a failed deck) would otherwise never reach the preroll.
+                    if (a.playbackState == Player.STATE_ENDED || a.playerError != null) return@launch
+                    publishBeatA(plan, a)
                     delay(MixTuning.TICK_MS)
                 }
+                pair.awaitReady(b, timeoutMs = B_READY_TIMEOUT_MS)
 
                 pair.linked = true
-                renderer.run(a, b, plan, config, { gainA }, { gainB }, "preview") { frame ->
+                val result = renderer.run(a, b, plan, config, { gainA }, { gainB }, "preview") { frame ->
                     _state.value = State(isPlaying = true, beatA = frame.beatA, phaseErrorBeats = frame.phaseErrorBeats)
+                }
+
+                // Let B play on alone for a moment; A is silent but keeps moving the playhead.
+                if (result == TransitionRenderer.Result.COMPLETED) {
+                    val tailEnd = System.currentTimeMillis() + (MixTuning.PREVIEW_TAIL_SECONDS * 1000).toLong()
+                    while (System.currentTimeMillis() < tailEnd && b.playbackState != Player.STATE_ENDED) {
+                        publishBeatA(plan, a)
+                        delay(MixTuning.TICK_MS)
+                    }
                 }
             } finally {
                 pair.linked = false
@@ -137,6 +163,28 @@ class PreviewSession(
         decks = null
     }
 
+    private fun publishBeatA(plan: TransitionPlan, a: Player) {
+        _state.value = State(
+            isPlaying = true,
+            beatA = TransitionMath.getBeatForTimestamp(plan.gridA, a.currentPosition / 1000.0)
+        )
+    }
+
+    private val errorListener = object : Player.Listener {
+        override fun onPlayerError(error: PlaybackException) {
+            Log.w(TAG, "Preview deck failed", error)
+            _error.value = context.getString(R.string.mix_editor_error_preview)
+            stop()
+        }
+    }
+
     private fun mediaItemFor(path: String): MediaItem =
         MediaItem.fromUri(if (path.startsWith("content://")) Uri.parse(path) else Uri.fromFile(File(path)))
+
+    private companion object {
+        const val TAG = "PreviewSession"
+
+        /** B was parked during the lead-in, so it is normally ready long before this. */
+        const val B_READY_TIMEOUT_MS = 2_000L
+    }
 }

@@ -81,4 +81,38 @@ class MixControllerTest {
         assertEquals(MixController.Stage.CROSSFADE, frame.stage)
         assert(frame.speedB!! > 1.0)
     }
+
+    /** B enters on its first beat, which comes 0.2 s into the song. */
+    private fun planEnteringAtStartOfB() = plan().copy(
+        anchorBeatB = 0.0,
+        entryPointMs = 200,
+        gridB = grid(120.0).map { it + 0.2 },
+    )
+
+    @Test
+    fun `B entering near its start waits until A reaches that point`() {
+        val c = MixController(planEnteringAtStartOfB(), 1.0)
+        // B's time 0 is 0.4 beats before its first beat, so it starts 0.2 s before A's anchor (16 s).
+        assert(c.isBeforeStartOfB(13_000))
+        assert(c.isBeforeStartOfB(15_700))
+        assert(!c.isBeforeStartOfB(15_900))
+        assertEquals(0, c.targetPositionBMs(13_000))
+        assertEquals(200, c.targetPositionBMs(16_000))
+    }
+
+    @Test
+    fun `B entering mid-song never waits`() {
+        val c = MixController(plan(), 1.0)
+        assert(!c.isBeforeStartOfB(13_000))
+    }
+
+    @Test
+    fun `a waiting B is not corrected`() {
+        val c = MixController(planEnteringAtStartOfB(), 1.0)
+        val frame = c.step(0, positionAMs = 13_000, positionBMs = 0, incomingPlaying = false, incomingStarted = false)
+        assertEquals(MixController.Stage.PREROLL, frame.stage)
+        assertNull(frame.reseekBMs)
+        assertNull(frame.speedB)
+        assertEquals(0.0, frame.phaseErrorBeats, 0.0)
+    }
 }

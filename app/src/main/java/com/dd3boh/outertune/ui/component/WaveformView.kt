@@ -50,6 +50,8 @@ fun WaveformView(
     pixelsPerBeat: Float = 48f,
     beatOffsetBeats: Float = 0f,
     initialOffset: Float,
+    /** The furthest beat that may be snapped to the centre line. */
+    maxCenterBeat: Float = Float.POSITIVE_INFINITY,
     onOffsetChanged: (Float) -> Unit = {}
 ) {
     val scope = rememberCoroutineScope()
@@ -57,6 +59,7 @@ fun WaveformView(
     val snapAnimation = remember { Animatable(initialOffset) }
     val currentOnOffsetChanged by rememberUpdatedState(onOffsetChanged)
     val currentMarkers by rememberUpdatedState(beatMarkers)
+    val currentMaxCenterBeat by rememberUpdatedState(maxCenterBeat)
     val waveformPath = remember { Path() }
 
     // Follow external changes (e.g. a restored transition) unless we're mid-snap.
@@ -72,7 +75,8 @@ fun WaveformView(
                     val viewCenter = size.width / 2f
                     val shiftPixels = beatOffsetBeats * pixelsPerBeat
                     val beatAtCenter = (viewCenter - offset - shiftPixels) / pixelsPerBeat
-                    val nearestBeat = nearestMarkerBeat(currentMarkers, beatAtCenter)
+                    val nearestBeat = nearestMarkerBeat(currentMarkers, beatAtCenter.coerceAtMost(currentMaxCenterBeat))
+                        .coerceAtMost(currentMaxCenterBeat)
                     val target = viewCenter - nearestBeat * pixelsPerBeat - shiftPixels
 
                     scope.launch {
@@ -99,16 +103,28 @@ fun WaveformView(
         val startVisibleBeat = -totalShift / pixelsPerBeat - 1f
         val endVisibleBeat = (width - totalShift) / pixelsPerBeat + 1f
 
-        // Waveform: one vertical stroke per sample, all in a single path
+        // Waveform: one vertical stroke per group of samples, all in a single path. Zoomed out,
+        // several samples share a pixel; each group (about a pixel wide) draws its peak once.
         waveformPath.rewind()
-        val first = lowerBound(waveformData.size) { waveformData[it].beatIndex >= startVisibleBeat }
-        for (i in first until waveformData.size) {
+        val count = waveformData.size
+        val stride = if (count >= 2) {
+            val beatsPerSample = waveformData[1].beatIndex - waveformData[0].beatIndex
+            if (beatsPerSample > 0f) (1f / (beatsPerSample * pixelsPerBeat)).toInt().coerceAtLeast(1) else 1
+        } else 1
+        val firstVisible = lowerBound(count) { waveformData[it].beatIndex >= startVisibleBeat }
+        // Groups start on multiples of the stride so they don't shift (and shimmer) while scrolling.
+        var i = firstVisible - firstVisible % stride
+        while (i < count) {
             val sample = waveformData[i]
             if (sample.beatIndex > endVisibleBeat) break
+            val groupEnd = minOf(i + stride, count)
+            var peak = sample.amplitude
+            for (k in i + 1 until groupEnd) peak = maxOf(peak, waveformData[k].amplitude)
             val x = sample.beatIndex * pixelsPerBeat + totalShift
-            val amplitude = sample.amplitude.coerceIn(0f, 1f) * maxAmplitude
+            val amplitude = peak.coerceIn(0f, 1f) * maxAmplitude
             waveformPath.moveTo(x, centerY - amplitude)
             waveformPath.lineTo(x, centerY + amplitude)
+            i = groupEnd
         }
         drawPath(waveformPath, Color.LightGray, style = Stroke(width = 2f))
 

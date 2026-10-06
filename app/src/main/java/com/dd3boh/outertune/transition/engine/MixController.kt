@@ -41,11 +41,25 @@ class MixController(
     /** B's current target speed. */
     val appliedSpeed: Double get() = phase.appliedSpeed
 
-    /** Where B should be (ms) when A is at [positionAMs]. */
+    /** B's beat at the very start of its song (negative when its first beat comes later). */
+    private val startBeatB = TransitionMath.getBeatForTimestamp(plan.gridB, 0.0)
+
+    /** Where B should be (ms) when A is at [positionAMs]; 0 while that is before B's start. */
     fun targetPositionBMs(positionAMs: Long): Long {
-        val elapsedBeatsA = TransitionMath.getBeatForTimestamp(plan.gridA, positionAMs / 1000.0) - plan.anchorBeatA
-        val timeB = TransitionMath.getTimestampForBeat(plan.gridB, plan.anchorBeatB + elapsedBeatsA / gridScalar)
+        val timeB = TransitionMath.getTimestampForBeat(plan.gridB, targetBeatB(positionAMs))
         return (timeB * 1000).toLong().coerceAtLeast(0)
+    }
+
+    /**
+     * Whether B's target is still before the start of its song when A is at [positionAMs]: B
+     * enters so close to its start that the preroll begins before it. B must then wait, paused
+     * at 0, rather than start early.
+     */
+    fun isBeforeStartOfB(positionAMs: Long): Boolean = targetBeatB(positionAMs) < startBeatB
+
+    private fun targetBeatB(positionAMs: Long): Double {
+        val elapsedBeatsA = TransitionMath.getBeatForTimestamp(plan.gridA, positionAMs / 1000.0) - plan.anchorBeatA
+        return plan.anchorBeatB + elapsedBeatsA / gridScalar
     }
 
     /** Wall-clock length (ms) of the zone plus preroll on A at [speedA]. */
@@ -59,8 +73,16 @@ class MixController(
      * @param positionAMs A's current position
      * @param positionBMs B's current position
      * @param incomingPlaying whether B is actually playing (re-seeks only make sense then)
+     * @param incomingStarted false while B waits for its start ([isBeforeStartOfB]): no
+     *  corrections are made, since B's position means nothing yet
      */
-    fun step(nowMs: Long, positionAMs: Long, positionBMs: Long, incomingPlaying: Boolean): Frame {
+    fun step(
+        nowMs: Long,
+        positionAMs: Long,
+        positionBMs: Long,
+        incomingPlaying: Boolean,
+        incomingStarted: Boolean = true,
+    ): Frame {
         val posA = positionAMs / 1000.0
         val posB = positionBMs / 1000.0
         val beatA = TransitionMath.getBeatForTimestamp(plan.gridA, posA)
@@ -77,7 +99,7 @@ class MixController(
 
         var speed: Double? = null
         var reseek: Long? = null
-        when (stage) {
+        if (incomingStarted) when (stage) {
             Stage.PREROLL ->
                 if (incomingPlaying && phase.shouldReseek(rawError, -elapsedBeatsA, nowMs)) {
                     reseek = targetPositionBMs(positionAMs + MixTuning.SEEK_LEAD_MS)
@@ -93,7 +115,11 @@ class MixController(
             progress = progress,
             beatA = beatA,
             beatB = beatB,
-            phaseErrorBeats = if (stage == Stage.PREROLL) rawError else PhaseController.wrapToNearestBeat(rawError),
+            phaseErrorBeats = when {
+                !incomingStarted -> 0.0
+                stage == Stage.PREROLL -> rawError
+                else -> PhaseController.wrapToNearestBeat(rawError)
+            },
             speedB = speed,
             reseekBMs = reseek,
         )
