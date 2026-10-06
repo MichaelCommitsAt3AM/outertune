@@ -10,7 +10,9 @@ suspend fun Result<PlaylistPage>.completed(): Result<PlaylistPage> = runCatching
     val page = getOrThrow()
     val songs = page.songs.toMutableList()
     var continuation = page.songsContinuation
-    while (continuation != null) {
+    val seen = HashSet<String>()
+    // A repeated token would otherwise loop forever.
+    while (continuation != null && seen.add(continuation)) {
         val continuationPage = YouTube.playlistContinuation(continuation).getOrThrow()
         songs += continuationPage.songs
         continuation = continuationPage.continuation
@@ -28,7 +30,9 @@ suspend fun Result<LibraryPage>.completed(): Result<LibraryPage> = runCatching {
     val page = getOrThrow()
     val items = page.items.toMutableList()
     var continuation = page.continuation
-    while (continuation != null) {
+    val seen = HashSet<String>()
+    // A repeated token would otherwise loop forever.
+    while (continuation != null && seen.add(continuation)) {
         val continuationPage = YouTube.libraryContinuation(continuation).getOrThrow()
         items += continuationPage.items
         continuation = continuationPage.continuation
