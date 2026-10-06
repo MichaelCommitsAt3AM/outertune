@@ -63,7 +63,8 @@ data class BrowseResponse(
 
         @Serializable
         data class GridContinuation(
-            val items: List<GridRenderer.Item>,
+            // YouTube can end a list with a continuation page that has no items at all.
+            val items: List<GridRenderer.Item> = emptyList(),
             val continuations: List<Continuation>?,
         )
     }
