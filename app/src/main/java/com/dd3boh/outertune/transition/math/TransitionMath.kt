@@ -37,7 +37,7 @@ object TransitionMath {
         if (gridA.isEmpty() || gridB.isEmpty()) return null
 
         // 1. Calculate Synchronization (Tempo vs Interval Match)
-        val syncParams = calculateSyncParameters(gridA, gridB, bpmA, bpmB)
+        val syncParams = syncParameters(gridA, gridB, bpmA, bpmB)
 
         // 2. Calculate Transition Zone Geometry
         // The "Transition Zone" (Green Box) is defined by barsCount.
@@ -96,9 +96,18 @@ object TransitionMath {
 
     // --- Synchronization Logic ---
 
-    private data class SyncParams(val speedMultiplier: Double, val gridScalar: Double)
+    /**
+     * How Track B is made to keep pace with Track A.
+     * @property speedMultiplier playback speed for B
+     * @property gridScalar visual beats of B per internal beat (1.0 = strict tempo match)
+     */
+    data class SyncParams(val speedMultiplier: Double, val gridScalar: Double)
 
-    private fun calculateSyncParameters(
+    /**
+     * Within 15 BPM the tempos are matched directly; beyond that B's grid is matched by
+     * interval (e.g. 70 vs 140 BPM plays one B beat per two A beats).
+     */
+    fun syncParameters(
         gridA: List<Double>,
         gridB: List<Double>,
         bpmA: Float,

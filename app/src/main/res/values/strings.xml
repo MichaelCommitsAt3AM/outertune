@@ -337,4 +337,33 @@ We recycle translations from upstream, they are pulled periodically. -->
     <string name="new_version_available">New version available</string>
     <string name="translation_models">Translation Models</string>
     <string name="clear_translation_models">Clear translation models</string>
+
+    <!-- Transitions (mix mode) -->
+    <string name="mix_none">None</string>
+    <string name="mix_overlap_overlap">Overlap</string>
+    <string name="mix_overlap_crossfade">Crossfade</string>
+    <string name="mix_overlap_cut">Cut</string>
+    <string name="mix_overlap_cut_in_fade_out">Cut in, fade out</string>
+    <string name="mix_overlap_dynamic_sidechain">Dynamic sidechain</string>
+    <string name="mix_eq_centre_bass_swap">Centre bass swap</string>
+    <string name="mix_eq_end_bass_swap">End bass swap</string>
+    <string name="mix_eq_onset_bass_swap">Onset bass swap</string>
+    <string name="mix_effect_low_pass_in">Low-pass in</string>
+    <string name="mix_effect_low_pass_out">Low-pass out</string>
+    <string name="mix_effect_high_pass_in">High-pass in</string>
+    <string name="mix_effect_high_pass_out">High-pass out</string>
+    <string name="mix_editor_title">Edit transition</string>
+    <string name="mix_editor_zone">Transition zone</string>
+    <string name="mix_editor_volume">Volume</string>
+    <string name="mix_editor_eq">EQ</string>
+    <string name="mix_editor_effect">Effect</string>
+    <string name="mix_editor_overlap_mode">Overlap mode</string>
+    <string name="mix_editor_eq_mode">EQ mode</string>
+    <string name="mix_editor_effect_mode">Effect mode</string>
+    <string name="mix_editor_bars">%d bars</string>
+    <string name="mix_editor_bpm">%d BPM</string>
+    <string name="mix_editor_detected_bpm">detected: %d BPM</string>
+    <string name="mix_editor_error_not_analysed">Both songs need to be downloaded and analysed before creating a transition</string>
+    <string name="mix_editor_error_not_downloaded">Both songs must be downloaded to preview the transition</string>
+    <string name="mix_editor_error_preview">Couldn\'t prepare the preview</string>
 </resources>

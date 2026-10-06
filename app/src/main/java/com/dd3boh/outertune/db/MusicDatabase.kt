@@ -76,7 +76,7 @@ class MusicDatabase(
     fun close() = delegate.close()
 
     companion object {
-        const val MUSIC_DATABASE_VERSION = 27
+        const val MUSIC_DATABASE_VERSION = 28
     }
 }
 
@@ -155,6 +155,7 @@ abstract class InternalDatabase : RoomDatabase() {
                     .addMigrations(MIGRATION_24_25) // New Bar Detection Migration
                     .addMigrations(MIGRATION_25_26)
                     .addMigrations(MIGRATION_26_27) // Persist TransitionPlan, drop redundant index, filesDir move
+                    .addMigrations(MIGRATION_27_28) // Transition modes as enums, length in beats only
                     .build()
             )
 
@@ -172,6 +173,7 @@ abstract class InternalDatabase : RoomDatabase() {
                     .addMigrations(MIGRATION_24_25) // New Bar Detection Migration
                     .addMigrations(MIGRATION_25_26)
                     .addMigrations(MIGRATION_26_27) // Persist TransitionPlan, drop redundant index, filesDir move
+                    .addMigrations(MIGRATION_27_28) // Transition modes as enums, length in beats only
                     .build()
             )
     }
@@ -225,6 +227,53 @@ val MIGRATION_26_27 = object : Migration(26, 27) {
             "UPDATE song SET waveform_path = REPLACE(waveform_path, '/cache/analysis_data/', '/files/analysis_data/') " +
                 "WHERE waveform_path LIKE '%/cache/analysis_data/%'"
         )
+    }
+}
+
+/**
+ * Transitions Phase 2:
+ *  - Overlap/EQ/effect modes are stored as enum names (they were free-form, inconsistently cased
+ *    labels); unknown values fall back to the defaults.
+ *  - The zone length is stored once, in beats: transitionDurationBeats becomes non-null
+ *    (backfilled from durationBeats, else 16) and durationMs/durationBeats are dropped.
+ * SQLite can't drop columns on older Android versions, so the table is rebuilt.
+ */
+val MIGRATION_27_28 = object : Migration(27, 28) {
+    private fun normalized(column: String, allowed: List<String>, fallback: String): String {
+        val key = "UPPER(REPLACE(TRIM(`$column`), ' ', '_'))"
+        return "CASE WHEN $key IN (${allowed.joinToString { "'$it'" }}) THEN $key ELSE '$fallback' END"
+    }
+
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL(
+            "CREATE TABLE IF NOT EXISTS `transitions_new` (" +
+                "`fromSongId` TEXT NOT NULL, `toSongId` TEXT NOT NULL, " +
+                "`exitPointMs` INTEGER NOT NULL, `entryPointMs` INTEGER NOT NULL, " +
+                "`transitionDurationBeats` REAL NOT NULL, " +
+                "`syncTempo` INTEGER NOT NULL, `type` INTEGER NOT NULL, " +
+                "`overlapMode` TEXT NOT NULL, `eqMode` TEXT NOT NULL, `effectMode` TEXT NOT NULL, " +
+                "`planVersion` INTEGER, `initialSpeedB` REAL, `gridScalarB` REAL, " +
+                "`offsetBeatsA` REAL, `offsetBeatsB` REAL, " +
+                "PRIMARY KEY(`fromSongId`, `toSongId`))"
+        )
+        val overlap = normalized(
+            "overlapMode", listOf("OVERLAP", "CROSSFADE", "CUT", "CUT_IN_FADE_OUT", "DYNAMIC_SIDECHAIN"), "OVERLAP"
+        )
+        val eq = normalized("eqMode", listOf("NONE", "CENTRE_BASS_SWAP", "END_BASS_SWAP", "ONSET_BASS_SWAP"), "NONE")
+        val effect = normalized(
+            "effectMode", listOf("NONE", "LOW_PASS_IN", "LOW_PASS_OUT", "HIGH_PASS_IN", "HIGH_PASS_OUT"), "NONE"
+        )
+        db.execSQL(
+            "INSERT INTO `transitions_new` (fromSongId, toSongId, exitPointMs, entryPointMs, " +
+                "transitionDurationBeats, syncTempo, type, overlapMode, eqMode, effectMode, " +
+                "planVersion, initialSpeedB, gridScalarB, offsetBeatsA, offsetBeatsB) " +
+                "SELECT fromSongId, toSongId, exitPointMs, entryPointMs, " +
+                "COALESCE(transitionDurationBeats, durationBeats, 16.0), syncTempo, type, " +
+                "$overlap, $eq, $effect, " +
+                "planVersion, initialSpeedB, gridScalarB, offsetBeatsA, offsetBeatsB FROM `transitions`"
+        )
+        db.execSQL("DROP TABLE `transitions`")
+        db.execSQL("ALTER TABLE `transitions_new` RENAME TO `transitions`")
     }
 }
 

@@ -6,6 +6,7 @@ import androidx.hilt.work.HiltWorker
 import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
 import com.dd3boh.outertune.db.MusicDatabase
+import com.dd3boh.outertune.transition.engine.BeatGridRepository
 import dagger.assisted.Assisted
 import dagger.assisted.AssistedInject
 import kotlinx.coroutines.flow.first
@@ -13,13 +14,15 @@ import linc.com.amplituda.Amplituda
 import linc.com.amplituda.Compress
 import java.io.File
 import kotlin.math.abs
+import kotlin.math.roundToInt
 import kotlin.math.roundToLong
 
 @HiltWorker
 class AnalysisWorker @AssistedInject constructor(
     @Assisted context: Context,
     @Assisted params: WorkerParameters,
-    private val database: MusicDatabase
+    private val database: MusicDatabase,
+    private val beatGridRepository: BeatGridRepository,
 ) : CoroutineWorker(context, params) {
 
     private val amplituda = Amplituda(context)
@@ -137,6 +140,10 @@ class AnalysisWorker @AssistedInject constructor(
 
             metadataFile.writeText(preciseDurationString)
             waveformFile.writeText(normalizedWaveform.joinToString(","))
+            BinaryArtifacts.writeWaveform(
+                AnalysisStorage.file(applicationContext, songId, AnalysisStorage.Kind.WAVEFORM_BIN),
+                normalizedWaveform.toFloatArray()
+            )
             beatGridFile.writeText(snappedGrid.joinToString(","))
 
             // 8. Update DB
@@ -146,12 +153,15 @@ class AnalysisWorker @AssistedInject constructor(
                 bpm = correctedBpm,
                 displayBpm = correctedBpm,
                 firstBeatMs = if (snappedGrid.isNotEmpty()) snappedGrid[0] else 0L,
-                duration = exactDurationSeconds.toInt(),
+                duration = exactDurationSeconds.roundToInt(),
                 // New Bar Detection Fields
                 timeSignature = 4,
                 downbeatOffset = barResult.downbeatOffset
             )
             database.update(updated)
+
+            // Build the canonical mixing grid now rather than on first use.
+            beatGridRepository.rebuild(updated)
 
             Result.success()
 

@@ -28,17 +28,23 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
-import androidx.media3.common.util.Log
 import coil3.compose.AsyncImage
 import com.dd3boh.outertune.db.entities.Song
 import com.dd3boh.outertune.transition.editor.BeatSample
 import com.dd3boh.outertune.ui.component.BeatMarkerPosition
 import com.dd3boh.outertune.ui.component.WaveformView
-import com.dd3boh.outertune.utils.TransitionMixer
+import com.dd3boh.outertune.R
+import com.dd3boh.outertune.transition.engine.DeckState
+import com.dd3boh.outertune.transition.engine.TransitionMixer
+import com.dd3boh.outertune.transition.model.Deck
+import com.dd3boh.outertune.transition.model.EffectMode
+import com.dd3boh.outertune.transition.model.EqMode
+import com.dd3boh.outertune.transition.model.OverlapMode
 import com.dd3boh.outertune.utils.makeTimeString
 import com.dd3boh.outertune.viewmodels.TransitionEditorViewModel
 import com.dd3boh.outertune.ui.component.BeatGridMarker
@@ -87,11 +93,6 @@ fun TransitionEditorScreen(
     val isPlaying by viewModel.isPlaying.collectAsState()
     val decksReady by viewModel.areDecksReady.collectAsState()
     val loadingError by viewModel.loadingError.collectAsState()
-
-    // Debug: Log state changes
-    LaunchedEffect(decksReady, loadingError) {
-        Log.d("TransitionEditorScreen", "UI State - decksReady: $decksReady, loadingError: $loadingError")
-    }
 
     // UI VISIBILITY STATE
     var controlsVisible by remember { mutableStateOf(true) }
@@ -210,9 +211,9 @@ fun WaveformsSection(
     track1OffsetPixels: Float,
     track2OffsetPixels: Float,
     track1OffsetBeats: Float, // Needed for playhead alignment
-    overlapMode: String,
-    eqMode: String,
-    effectMode: String,
+    overlapMode: OverlapMode,
+    eqMode: EqMode,
+    effectMode: EffectMode,
     onTrack1OffsetChanged: (Float) -> Unit,
     onTrack2OffsetChanged: (Float) -> Unit,
     onPlayPauseClick: () -> Unit
@@ -273,15 +274,15 @@ fun WaveformsSection(
                     val pathAVol = Path()
                     val pathBVol = Path()
                     // Reusable vars
-                    var stateA: com.dd3boh.outertune.utils.DeckState
-                    var stateB: com.dd3boh.outertune.utils.DeckState
+                    var stateA: DeckState
+                    var stateB: DeckState
 
                     for (i in 0..steps) {
                         val p = i / steps.toFloat()
                         val x = p * w
 
-                        stateA = TransitionMixer.getMixState("A", p, overlapMode, eqMode, effectMode)
-                        stateB = TransitionMixer.getMixState("B", p, overlapMode, eqMode, effectMode)
+                        stateA = TransitionMixer.getMixState(Deck.A, p, overlapMode, eqMode, effectMode)
+                        stateB = TransitionMixer.getMixState(Deck.B, p, overlapMode, eqMode, effectMode)
 
                         val yVolA = h - (stateA.volume * h)
                         val yVolB = h - (stateB.volume * h)
@@ -346,7 +347,7 @@ fun WaveformsSection(
                     shape = RoundedCornerShape(16.dp),
                     color = Color(0xFF4CAF50).copy(alpha = 0.9f)
                 ) {
-                    Text("Transition Zone", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp))
+                    Text(stringResource(R.string.mix_editor_zone), color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp))
                 }
 
                 // Vertical Guide Lines
@@ -392,7 +393,7 @@ fun TopBar(
     ) {
         TextButton(onClick = onCancel) {
             Text(
-                text = "Cancel",
+                text = stringResource(android.R.string.cancel),
                 color = Color.White,
                 fontSize = 16.sp
             )
@@ -402,7 +403,7 @@ fun TopBar(
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             Text(
-                text = "Edit transition",
+                text = stringResource(R.string.mix_editor_title),
                 color = Color.White,
                 fontSize = 18.sp,
                 fontWeight = FontWeight.Bold
@@ -430,7 +431,7 @@ fun TopBar(
                 enabled = isEnabled
             ) {
                 Text(
-                    text = "Save",
+                    text = stringResource(R.string.save),
                     color = if (isEnabled) Color(0xFF4CAF50) else Color.Gray,
                     fontSize = 16.sp
                 )
@@ -481,14 +482,14 @@ fun TransitionTrackInfo(
 
         Column(horizontalAlignment = Alignment.End) {
             Text(
-                text = "${displayBpm.toInt()} BPM",
+                text = stringResource(R.string.mix_editor_bpm, displayBpm.toInt()),
                 color = Color.White,
                 fontSize = 12.sp
             )
 
             if (displayBpm != analysisBpm) {
                 Text(
-                    text = "detected: ${analysisBpm.toInt()} BPM",
+                    text = stringResource(R.string.mix_editor_detected_bpm, analysisBpm.toInt()),
                     color = Color(0xFFAAAAAA),
                     fontSize = 11.sp
                 )
@@ -537,7 +538,7 @@ fun BarsDropdown(
             onClick = { expanded = !expanded }
         ) {
             Text(
-                text = "$selectedBars bars ⌄",
+                text = stringResource(R.string.mix_editor_bars, selectedBars) + " ⌄",
                 color = Color.White,
                 fontSize = 14.sp,
                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
@@ -550,7 +551,7 @@ fun BarsDropdown(
         ) {
             barsOptions.forEach { bars ->
                 DropdownMenuItem(
-                    text = { Text("$bars bars") },
+                    text = { Text(stringResource(R.string.mix_editor_bars, bars)) },
                     onClick = {
                         onBarsSelected(bars)
                         expanded = false
@@ -566,12 +567,12 @@ fun BarsDropdown(
 fun ControlPanel(
     selectedTab: Int,
     onTabSelected: (Int) -> Unit,
-    overlapMode: String,
-    onOverlapModeChanged: (String) -> Unit,
-    eqMode: String,
-    onEqModeChanged: (String) -> Unit,
-    effectMode: String,
-    onEffectModeChanged: (String) -> Unit,
+    overlapMode: OverlapMode,
+    onOverlapModeChanged: (OverlapMode) -> Unit,
+    eqMode: EqMode,
+    onEqModeChanged: (EqMode) -> Unit,
+    effectMode: EffectMode,
+    onEffectModeChanged: (EffectMode) -> Unit,
     modifier: Modifier = Modifier
 ) {
     var showBottomSheet by remember { mutableStateOf(false) }
@@ -591,8 +592,8 @@ fun ControlPanel(
             horizontalArrangement = Arrangement.SpaceEvenly
         ) {
             ControlSelector(
-                title = "Volume",
-                value = overlapMode,
+                title = stringResource(R.string.mix_editor_volume),
+                value = stringResource(overlapMode.label),
                 onClick = {
                     onTabSelected(0)
                     showBottomSheet = true
@@ -602,8 +603,8 @@ fun ControlPanel(
 
 
             ControlSelector(
-                title = "EQ",
-                value = displayEqLabel(eqMode),
+                title = stringResource(R.string.mix_editor_eq),
+                value = stringResource(eqMode.label),
                 onClick = {
                     onTabSelected(1)
                     showBottomSheet = true
@@ -612,8 +613,8 @@ fun ControlPanel(
             )
 
             ControlSelector(
-                title = "Effect",
-                value = displayEffectLabel(effectMode),
+                title = stringResource(R.string.mix_editor_effect),
+                value = stringResource(effectMode.label),
                 onClick = {
                     onTabSelected(2)
                     showBottomSheet = true
@@ -673,12 +674,12 @@ fun ControlPanel(
 @Composable
 fun BottomSheetContent(
     selectedTab: Int,
-    overlapMode: String,
-    onOverlapModeChanged: (String) -> Unit,
-    eqMode: String,
-    onEqModeChanged: (String) -> Unit,
-    effectMode: String,
-    onEffectModeChanged: (String) -> Unit
+    overlapMode: OverlapMode,
+    onOverlapModeChanged: (OverlapMode) -> Unit,
+    eqMode: EqMode,
+    onEqModeChanged: (EqMode) -> Unit,
+    effectMode: EffectMode,
+    onEffectModeChanged: (EffectMode) -> Unit
 ) {
     Column(
         modifier = Modifier
@@ -686,11 +687,13 @@ fun BottomSheetContent(
             .padding(bottom = 20.dp)
     ) {
         // Title based on selected tab
-        val title = when (selectedTab) {
-            0 -> "Overlap Mode"
-            1 -> "EQ Mode"
-            else -> "Effect Mode"
-        }
+        val title = stringResource(
+            when (selectedTab) {
+                0 -> R.string.mix_editor_overlap_mode
+                1 -> R.string.mix_editor_eq_mode
+                else -> R.string.mix_editor_effect_mode
+            }
+        )
 
         Text(
             text = title,
@@ -704,52 +707,29 @@ fun BottomSheetContent(
 
         // Options based on tab
         when (selectedTab) {
-            0 -> {
-                listOf("Overlap", "Crossfade", "Cut", "Dynamic Sidechain").forEach { option ->
-                    ModernOptionItem(
-                        text = option,
-                        selected = option == overlapMode,
-                        onClick = { onOverlapModeChanged(option) },
-                        icon = when (option) {
-                            "Overlap" -> "○○"
-                            "Crossfade" -> "◐◑"
-                            "Dynamic Sidechain" -> "⚡"
-                            else -> "●○"
-                        }
-                    )
-                }
+            0 -> OverlapMode.entries.forEach { option ->
+                ModernOptionItem(
+                    text = stringResource(option.label),
+                    selected = option == overlapMode,
+                    onClick = { onOverlapModeChanged(option) },
+                    icon = option.icon()
+                )
             }
-            1 -> {
-                listOf("None", "Centre Bass swap", "End Bass Swap", "Onset Bass Swap").forEach { option ->
-                    ModernOptionItem(
-                        text = option,
-                        selected = option == eqMode,
-                        onClick = { onEqModeChanged(option) },
-                        icon = when (option) {
-                            "None" -> "─"
-                            "Low pass" -> "⌄"
-                            "High pass" -> "⌃"
-                            else -> "◇"
-                        }
-                    )
-                }
+            1 -> EqMode.entries.forEach { option ->
+                ModernOptionItem(
+                    text = stringResource(option.label),
+                    selected = option == eqMode,
+                    onClick = { onEqModeChanged(option) },
+                    icon = option.icon()
+                )
             }
-            2 -> {
-                listOf("None", "Low pass in", "Low Pass out", "High Pass in", "High Pass Out").forEach { option ->
-                    ModernOptionItem(
-                        text = option,
-                        selected = option == effectMode,
-                        onClick = { onEffectModeChanged(option) },
-                        icon = when (option) {
-                            "None" -> "─"
-                            "Low pass in" -> "x"
-                            "Low Pass out" -> "y"
-                            "High Pass in" -> "z"
-                            "High Pass Out" -> "d"
-                            else -> "∿"
-                        }
-                    )
-                }
+            2 -> EffectMode.entries.forEach { option ->
+                ModernOptionItem(
+                    text = stringResource(option.label),
+                    selected = option == effectMode,
+                    onClick = { onEffectModeChanged(option) },
+                    icon = option.icon()
+                )
             }
         }
 
@@ -890,19 +870,25 @@ fun ControlSelector(
     }
 }
 
-private fun displayEqLabel(mode: String): String =
-    when (mode) {
-        "Centre Bass swap" -> "Centre bass"
-        "End Bass Swap" -> "End Bass"
-        "Onset Bass Swap" -> "Onset Bass"
-        else -> mode
-    }
+private fun OverlapMode.icon(): String = when (this) {
+    OverlapMode.OVERLAP -> "○○"
+    OverlapMode.CROSSFADE -> "◐◑"
+    OverlapMode.CUT -> "●○"
+    OverlapMode.CUT_IN_FADE_OUT -> "●◑"
+    OverlapMode.DYNAMIC_SIDECHAIN -> "⚡"
+}
 
-private fun displayEffectLabel(mode: String): String =
-    when (mode) {
-        "Low pass in" -> "LP in"
-        "Low Pass out" -> "LP out"
-        "High Pass in" -> "HP in"
-        "High Pass Out" -> "HP out"
-        else -> mode
-    }
+private fun EqMode.icon(): String = when (this) {
+    EqMode.NONE -> "─"
+    EqMode.CENTRE_BASS_SWAP -> "⇄"
+    EqMode.END_BASS_SWAP -> "⇥"
+    EqMode.ONSET_BASS_SWAP -> "⇤"
+}
+
+private fun EffectMode.icon(): String = when (this) {
+    EffectMode.NONE -> "─"
+    EffectMode.LOW_PASS_IN -> "LP↑"
+    EffectMode.LOW_PASS_OUT -> "LP↓"
+    EffectMode.HIGH_PASS_IN -> "HP↑"
+    EffectMode.HIGH_PASS_OUT -> "HP↓"
+}

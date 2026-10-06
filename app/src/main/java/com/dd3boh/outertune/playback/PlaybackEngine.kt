@@ -6,7 +6,7 @@ import kotlinx.coroutines.flow.StateFlow
 /**
  * Abstraction for different playback implementations.
  * - SimplePlaybackEngine: Standard single-player playback.
- * - MixPlaybackEngine: Dual-player with transitions (DeckManager).
+ * - MixPlaybackEngine: Dual-player with transitions (DeckPair + TransitionRenderer).
  */
 interface PlaybackEngine {
     /**
