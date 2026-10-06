@@ -12,7 +12,7 @@ import com.dd3boh.outertune.models.MediaMetadata
 import com.dd3boh.outertune.transition.engine.BeatGridRepository
 import com.dd3boh.outertune.transition.engine.DeckFactory
 import com.dd3boh.outertune.transition.engine.DeckPair
-import com.dd3boh.outertune.transition.engine.EqualizerDeckEffects
+import com.dd3boh.outertune.transition.engine.ProcessorDeckEffects
 import com.dd3boh.outertune.transition.engine.MixTuning
 import com.dd3boh.outertune.transition.engine.TransitionRenderer
 import com.dd3boh.outertune.transition.math.TransitionMath
@@ -53,8 +53,7 @@ class MixPlaybackEngine(
     private val TAG = "MixPlaybackEngine"
 
     private val decks = DeckPair(deckFactory)
-    private val effects = EqualizerDeckEffects()
-    private val renderer = TransitionRenderer(effects)
+    private val renderer = TransitionRenderer(ProcessorDeckEffects(deckFactory))
 
     private val _activePlayer = MutableStateFlow(decks.active)
     override val activePlayer: StateFlow<ExoPlayer> = _activePlayer.asStateFlow()
@@ -108,7 +107,6 @@ class MixPlaybackEngine(
         pollerJob?.cancel()
         loadJob?.cancel()
         crossfadeJob?.cancel()
-        effects.releaseAll()
         decks.release()
     }
 

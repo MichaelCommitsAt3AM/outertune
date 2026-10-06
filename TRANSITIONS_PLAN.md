@@ -9,7 +9,7 @@
 | 0, 1 | Done; needs the manual test matrix on a device | `fix/phase-0-1-playback` |
 | 2 | Done except 2.8 (on-device parity check); needs the manual test matrix | `feature/unified-mix-engine` |
 | 3 | Done; needs the manual test matrix | `chore/phase-3-cleanup` |
-| 4 | Not started | |
+| 4 | 4.1 and 4.2 done; 4.3 not built (see TRANSITIONS_REVIEW.md) | `feature/phase-4-audio` |
 
 Where Phase 2 as built differs from the steps below:
 

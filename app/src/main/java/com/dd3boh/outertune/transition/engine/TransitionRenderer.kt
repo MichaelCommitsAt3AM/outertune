@@ -2,6 +2,7 @@ package com.dd3boh.outertune.transition.engine
 
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
+import com.dd3boh.outertune.transition.model.Deck
 import com.dd3boh.outertune.transition.model.TransitionConfig
 import com.dd3boh.outertune.transition.model.TransitionPlan
 import kotlinx.coroutines.currentCoroutineContext
@@ -9,9 +10,10 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 
 /**
- * Plays one transition on two players: starts the incoming deck, phase-locks it to the outgoing
- * deck and runs the volume/EQ automation, all decided by [MixController]. This is the single
- * implementation used by both the editor preview and playlist playback.
+ * Plays one transition on two players: starts the incoming deck and phase-locks it to the
+ * outgoing deck ([MixController]), while each deck's [DeckAutomation] shapes its sound inside its
+ * own audio pipeline, sample-accurately. This is the single implementation used by both the
+ * editor preview and playlist playback.
  *
  * It owns no state beyond one run: what happens afterwards (swapping decks, looping the preview)
  * is up to the caller. Must run on the main thread. Cancelling the coroutine stops the run; the
@@ -57,6 +59,12 @@ class TransitionRenderer(private val effects: DeckEffects) {
         incoming.playWhenReady = true
         incoming.play()
 
+        // Shape both decks from inside their audio pipelines; rebuilt if the config changes.
+        var installedConfig = config()
+        effects.setAutomation(outgoing, DeckAutomation(plan, installedConfig, Deck.A))
+        effects.setAutomation(incoming, DeckAutomation(plan, installedConfig, Deck.B))
+        outgoing.volume = outgoingGain
+
         val startMediaId = outgoing.currentMediaItem?.mediaId
         // Counts only time A is actually playing, so pausing mid-transition is fine.
         val budgetMs = controller.expectedDurationMs(speedA) + MixTuning.BUDGET_SLACK_MS
@@ -77,12 +85,18 @@ class TransitionRenderer(private val effects: DeckEffects) {
                 }
                 if (playingMs > budgetMs) return Result.TIMED_OUT.also { diagnostics.finish(it.name) }
 
+                val currentConfig = config()
+                if (currentConfig != installedConfig) {
+                    installedConfig = currentConfig
+                    effects.setAutomation(outgoing, DeckAutomation(plan, currentConfig, Deck.A))
+                    effects.setAutomation(incoming, DeckAutomation(plan, currentConfig, Deck.B))
+                }
+
                 val frame = controller.step(
                     nowMs = now,
                     positionAMs = outgoing.currentPosition,
                     positionBMs = incoming.currentPosition,
                     incomingPlaying = incoming.isPlaying,
-                    config = config(),
                 )
                 onFrame(frame)
 
@@ -106,21 +120,19 @@ class TransitionRenderer(private val effects: DeckEffects) {
                     if (!unmuted) {
                         unmuted = true
                         diagnostics.onUnmute(frame.phaseErrorBeats)
+                        // The automation already silences B before the zone; the player volume
+                        // stays at 0 until here as well, in case the processor is bypassed.
+                        incoming.volume = incomingGain
                     }
                     diagnostics.onCrossfadeSample(frame.phaseErrorBeats)
-                    val effectMode = config().effectMode
-                    effects.apply(outgoing, frame.stateA, effectMode)
-                    effects.apply(incoming, frame.stateB, effectMode)
                 }
-                outgoing.volume = frame.volumeA * outgoingGain
-                incoming.volume = frame.volumeB * incomingGain
 
                 delay(MixTuning.TICK_MS)
             }
             return Result.TIMED_OUT
         } finally {
-            effects.reset(outgoing)
-            effects.reset(incoming)
+            effects.setAutomation(outgoing, null)
+            effects.setAutomation(incoming, null)
         }
     }
 
